@@ -3,6 +3,40 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
+## [2026-08-09b]
+
+### Critical Fix
+- **Indeed `datePosted='1'` parameter is IGNORED by the API** — same bug as Glassdoor's `fromAge=1`. Audit of 5 runs (102 jobs) found 11 stale jobs (10.8%) leaking through, including jobs **526 days old** (B&L Real Estate, posted Feb 2025) and 513 days old (Helios Kliniken, posted Mar 2025). The `datePosted` parameter is sent to the actor but Indeed's API silently ignores it, returning unfiltered results. Fixed by adding a post-filter on `datePublished` in `fetch_indeed_jobs()` that rejects any job older than `FRESHNESS_HOURS` (24h).
+
+### Added
+- **LinkedIn safety-net post-filter** in `fetch_linkedin_jobs()`. LinkedIn's `f_TPR=r86400` server-side filter was verified working (727/727 jobs within 24h across 5 runs), but the post-filter provides defense-in-depth against future regressions. Date-only `postedAt` timestamps (LinkedIn's format: `YYYY-MM-DD`) are treated as end-of-day (`23:59:59`) to avoid false rejections of jobs posted late on the previous day.
+- **Naive datetime fix** — `datetime.fromisoformat("2026-08-08")` returns a timezone-naive datetime that causes `TypeError` when compared with the timezone-aware `cutoff`. Both `fetch_linkedin_jobs()` and `fetch_indeed_jobs()` now add `tzinfo=timezone.utc` when `fromisoformat` returns a naive datetime.
+
+### Freshness Audit Summary
+- **Arbeitnow**: ✅ Clean — API `created_at` timestamps, all 10 jobs 0.9–21h old.
+- **Startup.jobs**: ✅ Clean — SSR `timestamp` attribute, real UTC timestamps, 24h post-filter works.
+- **Xing**: ✅ Clean — `<time dateTime>` ISO timestamps, sponsored listings (no timestamp) correctly skipped.
+- **Stepstone**: ✅ Clean — `ag=age_1` server-side filter verified working (changes results), German timeago strings genuine.
+- **LinkedIn**: ✅ Clean — `f_TPR=r86400` server-side filter verified (727/727 within 24h), safety-net post-filter added.
+- **Indeed**: ❌→✅ Fixed — `datePosted='1'` ignored by API, 10.8% stale jobs. Post-filter now enforces 24h.
+- **Glassdoor**: ✅ Fixed (prior) — `fromAge=1` ignored by SSR, `ageInDays==0` filter added.
+
+## [2026-08-09]
+
+### Added
+- **Glassdoor platform** — free HTML scraping via `cloudscraper` with chrome emulation. Glassdoor SSR embeds job listings as JSON-LD `<script type="application/ld+json">` ItemList tags (30 jobs/page). Company names extracted from URL slugs using `_KE{start},{end}` character offsets (Glassdoor's KO/KE encoding). `ageInDays` extracted from Next.js RSC payload (`self.__next_f.push`) and used for server-side freshness filtering. No login required. Cloudflare blocks ~60% of requests; each page fetch retries up to 8 times with fresh scraper instances (~98% reliability). 3 pages per role × 10 roles.
+
+### Critical Fix
+- **Glassdoor `fromAge=1` URL parameter is IGNORED by SSR.** Glassdoor is a React SPA that applies date filtering client-side after hydration. The SSR HTML always returns unfiltered results (jobs 30-165 days old). Without `ageInDays` filtering, all jobs appeared as "posted today" (`posted_at = now()`), delivering stale postings labeled as fresh. Fixed by extracting `ageInDays` from the RSC payload, matching via `listingId` ↔ `jl` ID, and filtering to `ageInDays == 0` only. Jobs with unverified age (`ageInDays = None`) are skipped.
+
+### Changed
+- Pipeline now fetches 7 platforms (was 6). Execution steps updated from `[1/6]`–`[6/6]` to `[1/7]`–`[7/7]`.
+- `main()` print statements and cost estimate updated to reflect 7-platform pipeline.
+- Script header docstring updated with Glassdoor documentation.
+
+### Note
+- Glassdoor's SSR returns predominantly stale jobs (age distribution: 1-165 days). In testing, 0 out of 269 raw listings across 10 roles had `ageInDays == 0`. Glassdoor may still produce fresh jobs on days when employers actively post, but the yield is expected to be very low compared to other platforms.
+
 ## [2026-08-07]
 
 ### Added

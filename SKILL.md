@@ -1,7 +1,7 @@
 ---
 name: Jobscraper
 description: >-
-  Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Startup.jobs, Xing, and Stepstone for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "startup.jobs", "arbeitnow", "xing jobs", "stepstone jobs", "apify jobs", "job pipeline", "run job search".
+  Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "startup.jobs", "arbeitnow", "xing jobs", "stepstone jobs", "glassdoor jobs", "apify jobs", "job pipeline", "run job search".
 dependencies: python>=3.10, cloudscraper, openpyxl
 ---
 
@@ -9,7 +9,7 @@ dependencies: python>=3.10, cloudscraper, openpyxl
 
 > **Instructions for Oh My Pi (OMP) Session:**
 > When this skill is invoked, execute the automated job search pipeline below.
-> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Startup.jobs**, **Xing**, and **Stepstone** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp.
+> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Startup.jobs**, **Xing**, **Stepstone**, and **Glassdoor** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp.
 
 ## Execution
 
@@ -19,7 +19,7 @@ Run the pipeline script:
 cd /home/sagar/Skills/Jobscraper && python3 apify_job_search.py
 ```
 
-Dependencies: `cloudscraper` (for startup.jobs, Xing, and Stepstone HTML scraping), `openpyxl` (for XLSX export).
+Dependencies: `cloudscraper` (for startup.jobs, Xing, Stepstone, and Glassdoor HTML scraping), `openpyxl` (for XLSX export).
 Install: `pip install cloudscraper openpyxl`
 
 ## Context
@@ -43,6 +43,7 @@ Install: `pip install cloudscraper openpyxl`
    - **Startup.jobs** (free HTML scraping via cloudscraper, no Apify)
    - **Xing** (free HTML scraping via cloudscraper, no Apify)
    - **Stepstone** (free HTML scraping via cloudscraper, no Apify)
+   - **Glassdoor** (free HTML scraping via cloudscraper, JSON-LD parsing, no Apify)
 3. **Title Relevance Filter:** Universal post-filter `is_relevant_title()` rejects any job whose title doesn't contain at least one data/analytics/AI/SQL/Python keyword.
 4. **Role Types & Location Constraints:**
    - **Full-Time / Part-Time / Entry-Level / Junior (0–2 yrs exp):** Germany-wide.
@@ -67,4 +68,4 @@ Files written to `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`:
 
 ## Cost
 
-~$0.55/run Apify (LinkedIn ~$0.50 + Indeed ~$0.05). Arbeitnow, Startup.jobs, Xing, and Stepstone are free. See `apify_job_search.md` Section 5 for the full cost breakdown.
+~$0.55/run Apify (LinkedIn ~$0.50 + Indeed ~$0.05). Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor are free. See `apify_job_search.md` Section 5 for the full cost breakdown.

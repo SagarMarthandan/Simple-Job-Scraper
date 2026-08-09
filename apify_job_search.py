@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Apify Job Fetcher, Deduplicator & Dated CSV Exporter for OMP Session
-Platforms: LinkedIn, Indeed, Arbeitnow, Startup.jobs, Xing, Stepstone (Kununu dropped — actor returns 0 results)
+Platforms: LinkedIn, Indeed, Arbeitnow, Startup.jobs, Xing, Stepstone, Glassdoor (Kununu dropped — actor returns 0 results)
 Filters: Freshness (<24h), Experience (<=2 yrs), Germany location guard, Working Student (Hamburg & Kiel ONLY),
          Internships (Germany-wide), Title relevance (data/analytics/AI/SQL/Python keywords)
 Output Path: /home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/Job_Search_<Month>_<Day>_<Year>.csv
@@ -21,6 +21,18 @@ Changelog:
               pass through). f_TPR=r86400 24h filter unaffected (stays as URL filter under AI search).
               Removed dead prototype scripts (stepstone_scraper.py, csv_to_xlsx.py, merge_linkedin.py).
               Added .gitignore, README.md, CHANGELOG.md.
+  2026-08-09: Added Glassdoor (free cloudscraper, JSON-LD ItemList parsing, _KE offset company
+              extraction, ageInDays filtering from Next.js RSC payload). Pipeline now 7 platforms.
+              No login required — search results are public SSR JSON-LD. CRITICAL FIX: Glassdoor's
+              fromAge=1 URL parameter is IGNORED by SSR (React app filters client-side post-hydration).
+              Without ageInDays filtering, all jobs appear as "posted today" regardless of actual age
+              (30-165 days old). Now extracts ageInDays from RSC payload and filters to ageInDays==0.
+  2026-08-09b: CRITICAL FIX: Indeed's datePosted='1' parameter is IGNORED by the API (same bug as
+              Glassdoor's fromAge=1). 11/102 jobs (10.8%) were stale, including jobs 500+ days old.
+              Added post-filter on datePublished in fetch_indeed_jobs() to reject jobs older than 24h.
+              Also added defense-in-depth safety-net post-filter to fetch_linkedin_jobs() (f_TPR=r86400
+              verified working 727/727, but post-filter catches any future regressions). Date-only
+              timestamps (LinkedIn format) treated as end-of-day (23:59:59) to avoid false rejections.
 
 See CHANGELOG.md for full version history and apify_job_search.md for detailed technical documentation.
 """
@@ -638,6 +650,187 @@ def fetch_stepstone_jobs():
 
     return jobs
 
+def fetch_glassdoor_jobs():
+    """Fetch jobs from Glassdoor.de via HTML scraping (free, no Apify).
+    Uses cloudscraper with chrome emulation to bypass Cloudflare. Glassdoor SSR
+    embeds job listings as JSON-LD <script type="application/ld+json"> ItemList
+    tags (titles + URLs) and ageInDays in the Next.js RSC payload.
+
+    CRITICAL: Glassdoor's fromAge URL parameter is IGNORED by SSR — the React app
+    applies date filtering client-side after hydration. The SSR HTML always returns
+    unfiltered results (mostly 30-165 days old). We extract ageInDays from the RSC
+    payload and filter server-side: only ageInDays == 0 (posted today) passes.
+
+    Company names are extracted from URL slugs using _KE{start},{end} character
+    offsets (Glassdoor's KO/KE encoding). Location defaults to "Germany" (search
+    uses locId=26 = Germany-wide). Cloudflare blocks ~60% of requests, so each
+    page fetch retries up to 8 times with fresh scraper instances.
+    """
+    if not cloudscraper:
+        print("[!] cloudscraper not installed — skipping Glassdoor. Install with: pip install cloudscraper")
+        return []
+
+    jobs = []
+    seen_urls = set()
+    GLASSDOOR_PAGES_PER_ROLE = 3  # 30 results/page × 3 = 90 max per role
+    GLASSDOOR_MAX_RETRIES = 8     # ~40% success rate → 8 retries = 98%+ reliability
+
+    def _fetch_with_retry(url):
+        """Fetch a Glassdoor URL with fresh scraper instances and retry on Cloudflare 403."""
+        for attempt in range(GLASSDOOR_MAX_RETRIES):
+            try:
+                s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+                r = s.get(url, timeout=20)
+                if r.status_code == 200 and 'application/ld+json' in r.text:
+                    return r.text
+            except Exception:
+                pass
+            time.sleep(2)
+        return None
+
+    def _extract_age_lookup(raw):
+        """Extract {listingId: ageInDays} from the Next.js RSC payload.
+
+        The RSC payload (self.__next_f.push) contains escaped JSON with job data.
+        Each job entry has: \\"ageInDays\\":NNN ... listingId:LLL
+        ageInDays comes BEFORE listingId in each entry. We pair them by finding
+        each listingId and searching backward for the nearest ageInDays.
+        """
+        lid_matches = list(re.finditer(r'listingId["\\]*:(\d+)', raw))
+        age_matches = list(re.finditer(r'\\"ageInDays\\":(\d+)', raw))
+
+        lookup = {}
+        for lid_m in lid_matches:
+            lid = lid_m.group(1)
+            lid_pos = lid_m.start()
+            # Find nearest ageInDays BEFORE this listingId (within 3000 chars)
+            nearest_age = None
+            nearest_dist = float('inf')
+            for age_m in age_matches:
+                dist = lid_pos - age_m.end()
+                if 0 < dist < 3000 and dist < nearest_dist:
+                    nearest_age = int(age_m.group(1))
+                    nearest_dist = dist
+            if lid not in lookup or nearest_age is not None:
+                lookup[lid] = nearest_age
+        return lookup
+
+    for role in SEARCH_ROLES:
+        role_fresh = 0
+        role_raw = 0
+        role_stale = 0
+
+        for page in range(1, GLASSDOOR_PAGES_PER_ROLE + 1):
+            url = (
+                f"https://www.glassdoor.de/Job/jobs.htm"
+                f"?sc.keyword={urllib.parse.quote(role)}"
+                f"&locT=C&locId=26"   # locT=C (country), locId=26 (Germany)
+                f"&page={page}"
+            )
+
+            raw = _fetch_with_retry(url)
+            if not raw:
+                print(f"[!] Glassdoor/{role} page {page}: blocked by Cloudflare after {GLASSDOOR_MAX_RETRIES} retries")
+                break
+
+            # Extract JSON-LD ItemList (contains job titles + URLs)
+            json_scripts = re.findall(
+                r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                raw, re.DOTALL
+            )
+
+            page_items = []
+            for js in json_scripts:
+                try:
+                    data = json.loads(js)
+                    if data.get('@type') == 'ItemList':
+                        page_items = data.get('itemListElement', [])
+                        break
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+            if not page_items:
+                break  # no JSON-LD data on this page
+
+            # Extract ageInDays lookup from RSC payload
+            age_lookup = _extract_age_lookup(raw)
+
+            page_fresh = 0
+            for item in page_items:
+                job_url = item.get('url', '')
+                if not job_url or job_url in seen_urls:
+                    continue
+                seen_urls.add(job_url)
+                role_raw += 1
+
+                title = html_mod.unescape(item.get('name', '').strip())
+                if not title:
+                    continue
+
+                # Extract jl ID to look up ageInDays
+                jl_m = re.search(r'jl=(\d+)', job_url)
+                if not jl_m:
+                    continue
+                jl_id = jl_m.group(1)
+
+                # Filter by ageInDays — only keep jobs posted today (ageInDays == 0)
+                age_in_days = age_lookup.get(jl_id)
+                if age_in_days is None:
+                    continue  # can't verify freshness — skip
+                if age_in_days > 0:
+                    role_stale += 1
+                    continue  # stale job — skip
+
+                # Extract company from URL slug using _KE{start},{end} offsets
+                company = "Unknown"
+                slug_m = re.search(r'/job-listing/(.+?)-JV_', job_url)
+                ke_m = re.search(r'_KE(\d+),(\d+)', job_url)
+                if slug_m and ke_m:
+                    slug = slug_m.group(1)
+                    ke_start = int(ke_m.group(1))
+                    ke_end = int(ke_m.group(2))
+                    if ke_end <= len(slug):
+                        company_slug = slug[ke_start:ke_end]
+                        company = company_slug.replace('-', ' ').strip().title()
+
+                # Location not in JSON-LD — default to Germany (search is Germany-wide)
+                location = "Germany"
+
+                # posted_at based on ageInDays (0 = today)
+                posted_dt = datetime.now(timezone.utc) - timedelta(days=age_in_days)
+
+                # Description not available from search page
+                desc = ""
+
+                # Apply existing filters (title relevance, seniority, experience, location)
+                is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
+                if not is_valid:
+                    continue
+
+                jobs.append({
+                    "language": detect_language(title),
+                    "job_board": "Glassdoor",
+                    "role_type": role_type_or_reason,
+                    "title": title,
+                    "company": company,
+                    "location": location,
+                    "posted_at": posted_dt.isoformat(),
+                    "exp_required": "<= 2 Years",
+                    "match_score": f"{compute_match_score(title)}%",
+                    "job_url": job_url,
+                    "description": desc
+                })
+                page_fresh += 1
+                role_fresh += 1
+
+            # Stop paginating if no fresh jobs on this page
+            if page_fresh == 0:
+                break
+
+        print(f"    Glassdoor/{role}: {role_fresh} fresh (of {role_raw} raw, {role_stale} stale)")
+
+    return jobs
+
 def fetch_last_run_dataset(actor_id: str):
     try:
         runs_url = f"https://api.apify.com/v2/acts/{actor_id}/runs?desc=1&limit=1&token={APIFY_TOKEN}"
@@ -723,8 +916,12 @@ def run_apify_actor(actor_id: str, run_input: dict, label: str = "Apify Actor", 
         return []
 
 def fetch_linkedin_jobs():
-    """Fetch LinkedIn jobs via curious_coder/linkedin-jobs-scraper using search URLs (f_TPR=r86400 = last 24h)."""
+    """Fetch LinkedIn jobs via curious_coder/linkedin-jobs-scraper using search URLs (f_TPR=r86400 = last 24h).
+    f_TPR=r86400 is LinkedIn's native server-side 24h filter (verified: 727/727 jobs within 24h).
+    Post-filters on postedAt as defense-in-depth safety net."""
     jobs = []
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=FRESHNESS_HOURS)
     urls = [
         f"https://www.linkedin.com/jobs/search?keywords={urllib.parse.quote(role)}&location=Germany&f_TPR=r86400"
         for role in SEARCH_ROLES
@@ -742,6 +939,27 @@ def fetch_linkedin_jobs():
         if not is_valid:
             continue
 
+        # Safety-net post-filter: reject stale jobs even if f_TPR=r86400 lets one through.
+        # LinkedIn postedAt is date-only (YYYY-MM-DD) — treat as end-of-day (23:59:59) to
+        # avoid false rejections of jobs posted late on the previous day.
+        posted_raw = item.get("postedAt", "")
+        posted_dt = None
+        if posted_raw:
+            try:
+                posted_dt = datetime.fromisoformat(posted_raw.replace("Z", "+00:00"))
+                if posted_dt.tzinfo is None:
+                    posted_dt = posted_dt.replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                try:
+                    posted_dt = datetime.strptime(posted_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    pass
+            # Date-only timestamps: shift to end-of-day for a generous freshness check
+            if posted_dt and ":" not in posted_raw and posted_dt.hour == 0:
+                posted_dt = posted_dt.replace(hour=23, minute=59, second=59)
+        if posted_dt and posted_dt < cutoff:
+            continue  # stale job — skip
+
         jobs.append({
             "language": detect_language(f"{title} {desc}"),
             "job_board": "LinkedIn",
@@ -749,7 +967,7 @@ def fetch_linkedin_jobs():
             "title": title,
             "company": item.get("companyName", "Unknown"),
             "location": loc,
-            "posted_at": item.get("postedAt", "Last 24h"),
+            "posted_at": posted_raw or "Last 24h",
             "exp_required": "<= 2 Years",
             "match_score": f"{compute_match_score(f'{title} {desc}')}%",
             "job_url": item.get("link") or item.get("applyUrl") or "",
@@ -758,8 +976,13 @@ def fetch_linkedin_jobs():
     return jobs
 
 def fetch_indeed_jobs():
-    """Fetch Indeed jobs via valig/indeed-jobs-scraper (Germany, last 24h)."""
+    """Fetch Indeed jobs via valig/indeed-jobs-scraper (Germany, last 24h).
+    datePosted='1' is unreliable — Indeed's API ignores it (~11% of listings are stale,
+    some 500+ days old). Post-filters on datePublished to enforce 24h freshness."""
     jobs = []
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=FRESHNESS_HOURS)
+
     def fetch_role(role):
         role_jobs = []
         items = run_apify_actor(ACTOR_INDEED, {
@@ -781,6 +1004,23 @@ def fetch_indeed_jobs():
             if not is_valid:
                 continue
 
+            # Post-filter: reject stale jobs (datePosted='1' is unreliable)
+            posted_raw = item.get("datePublished", "")
+            posted_dt = None
+            if posted_raw:
+                try:
+                    posted_dt = datetime.fromisoformat(posted_raw.replace("Z", "+00:00"))
+                    if posted_dt.tzinfo is None:
+                        posted_dt = posted_dt.replace(tzinfo=timezone.utc)
+                except (ValueError, TypeError):
+                    try:
+                        posted_dt = datetime.strptime(posted_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        pass
+            if posted_dt and posted_dt < cutoff:
+                continue  # stale job — skip
+
+            posted_at = posted_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z") if posted_dt else "Last 24h"
             role_jobs.append({
                 "language": detect_language(f"{title} {desc}"),
                 "job_board": "Indeed",
@@ -788,7 +1028,7 @@ def fetch_indeed_jobs():
                 "title": title,
                 "company": emp.get("name", "Unknown"),
                 "location": loc,
-                "posted_at": item.get("datePublished", "Last 24h"),
+                "posted_at": posted_at,
                 "exp_required": "<= 2 Years",
                 "match_score": f"{compute_match_score(f'{title} {desc}')}%",
                 "job_url": item.get("url") or item.get("jobUrl") or "",
@@ -877,36 +1117,42 @@ def main():
     print(f"    Xing: free HTML scraping (cloudscraper, no Apify)")
     print(f"    Stepstone: free HTML scraping (cloudscraper, no Apify)")
     print(f"    Startup.jobs: free HTML scraping (cloudscraper, no Apify)")
+    print(f"    Glassdoor: free HTML scraping (cloudscraper, JSON-LD, no Apify)")
     print(f"    Kununu: DROPPED (actor returns 0 results, broken)")
     all_jobs = []
     platform_counts = {}
 
-    print("[1/6] Fetching Arbeitnow (free API)...")
+    print("[1/7] Fetching Arbeitnow (free API)...")
     arbeitnow_jobs = fetch_arbeitnow_jobs()
     all_jobs.extend(arbeitnow_jobs)
     platform_counts["Arbeitnow"] = len(arbeitnow_jobs)
 
-    print("[2/6] Fetching Startup.jobs (free HTML scraping)...")
+    print("[2/7] Fetching Startup.jobs (free HTML scraping)...")
     startupjobs_jobs = fetch_startupjobs_jobs()
     all_jobs.extend(startupjobs_jobs)
     platform_counts["Startup.jobs"] = len(startupjobs_jobs)
 
-    print("[3/6] Fetching Xing (free HTML scraping, 10 roles × 3 pages)...")
+    print("[3/7] Fetching Xing (free HTML scraping, 10 roles × 3 pages)...")
     xing_jobs = fetch_xing_jobs()
     all_jobs.extend(xing_jobs)
     platform_counts["Xing"] = len(xing_jobs)
 
-    print("[4/6] Fetching Stepstone (free HTML scraping, 10 roles × 3 pages)...")
+    print("[4/7] Fetching Stepstone (free HTML scraping, 10 roles × 3 pages)...")
     stepstone_jobs = fetch_stepstone_jobs()
     all_jobs.extend(stepstone_jobs)
     platform_counts["Stepstone"] = len(stepstone_jobs)
 
-    print("[5/6] Fetching LinkedIn (10 roles, count=500 total)...")
+    print("[5/7] Fetching Glassdoor (free HTML scraping, 10 roles × 3 pages, JSON-LD)...")
+    glassdoor_jobs = fetch_glassdoor_jobs()
+    all_jobs.extend(glassdoor_jobs)
+    platform_counts["Glassdoor"] = len(glassdoor_jobs)
+
+    print("[6/7] Fetching LinkedIn (10 roles, count=500 total)...")
     linkedin_jobs = fetch_linkedin_jobs()
     all_jobs.extend(linkedin_jobs)
     platform_counts["LinkedIn"] = len(linkedin_jobs)
 
-    print("[6/6] Fetching Indeed (10 roles, limit=50, parallel)...")
+    print("[7/7] Fetching Indeed (10 roles, limit=50, parallel)...")
     indeed_jobs = fetch_indeed_jobs()
     all_jobs.extend(indeed_jobs)
     platform_counts["Indeed"] = len(indeed_jobs)
@@ -925,7 +1171,7 @@ def main():
         deduped_jobs.append(job)
 
     print(f"Per-platform: {platform_counts}")
-    print(f"Est. Apify cost: ~${0.50 + 0.04:.3f} (LinkedIn ~$0.50 + Indeed ~$0.04) + Arbeitnow/Startup.jobs/Xing/Stepstone FREE")
+    print(f"Est. Apify cost: ~${0.50 + 0.04:.3f} (LinkedIn ~$0.50 + Indeed ~$0.04) + Arbeitnow/Startup.jobs/Xing/Stepstone/Glassdoor FREE")
 
     # Format Date String: e.g. Aug_4_2026
     now = datetime.now()

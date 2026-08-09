@@ -1,6 +1,6 @@
 # Jobscraper
 
-Automated job search pipeline that fetches fresh postings (< 24 hours old) from six platforms, filters them for entry-level data/analytics/AI roles in Germany, and exports a sortable CSV/XLSX/JSON/MD report.
+Automated job search pipeline that fetches fresh postings (< 24 hours old) from seven platforms, filters them for entry-level data/analytics/AI roles in Germany, and exports a sortable CSV/XLSX/JSON/MD report.
 
 ## Quick Start
 
@@ -14,22 +14,23 @@ Output is written to `Job Search/YYYY-MM-DD/`.
 
 ## What It Does
 
-The pipeline runs six platform fetchers in sequence, applies a multi-stage filter chain, deduplicates, and exports four deliverable files:
+The pipeline runs seven platform fetchers in sequence, applies a multi-stage filter chain, deduplicates, and exports four deliverable files:
 
 ```
-6 platforms → title relevance → seniority/experience → Germany location → working-student city → dedup → export
+7 platforms → title relevance → seniority/experience → Germany location → working-student city → dedup → export
 ```
 
 ### Platforms
 
 | Platform | Source | Cost/run | Method |
 |---|---|---|---|
-| LinkedIn | Apify: `curious_coder/linkedin-jobs-scraper` | ~$0.50 | Apify actor, `count=500`, 10 role URLs, `f_TPR=r86400` (24h filter) |
-| Indeed | Apify: `valig/indeed-jobs-scraper` | ~$0.05 | Apify actor, `limit=50` per role, 10 roles in parallel |
+| LinkedIn | Apify: `curious_coder/linkedin-jobs-scraper` | ~$0.50 | Apify actor, `count=500`, 10 role URLs, `f_TPR=r86400` (24h filter) + safety-net post-filter on `postedAt` |
+| Indeed | Apify: `valig/indeed-jobs-scraper` | ~$0.05 | Apify actor, `limit=50` per role, 10 roles in parallel, `datePosted='1'` (unreliable — post-filter on `datePublished` enforces 24h) |
 | Arbeitnow | Free REST API | $0.00 | `https://www.arbeitnow.com/api/job-board-api` |
 | Startup.jobs | Free HTML scraping | $0.00 | `cloudscraper`, 6 category pages |
 | Xing | Free HTML scraping | $0.00 | `cloudscraper`, 10 roles × 3 pages, `data-testid` attributes |
 | Stepstone | Free HTML scraping | $0.00 | `cloudscraper`, 10 roles × 3 pages, path-based URLs with `ag=age_1` 24h filter |
+| Glassdoor | Free HTML scraping | $0.00 | `cloudscraper` (chrome emulation), 10 roles × 3 pages, JSON-LD ItemList parsing, `_KE` company extraction, `ageInDays` filtering from RSC payload (`fromAge=1` ignored by SSR), 8x retry for Cloudflare |
 | **Total** | | **~$0.55** | |
 
 ### Filter Chain
@@ -81,7 +82,7 @@ Read from (in order of precedence):
 ### Dependencies
 
 - Python >= 3.10
-- `cloudscraper` — bypasses Cloudflare/anti-bot for Startup.jobs, Xing, Stepstone
+- `cloudscraper` — bypasses Cloudflare/anti-bot for Startup.jobs, Xing, Stepstone, Glassdoor
 - `openpyxl` — XLSX export with autofilter and hyperlinks
 
 ```bash
@@ -95,7 +96,7 @@ Jobscraper/
 ├── README.md                # this file
 ├── CHANGELOG.md             # version history
 ├── SKILL.md                 # OMP skill definition (trigger keywords, execution instructions)
-├── apify_job_search.py      # main pipeline script (~980 lines, self-contained)
+├── apify_job_search.py      # main pipeline script (~1230 lines, self-contained)
 ├── apify_job_search.md      # detailed technical documentation (actor schemas, gotchas, cost analysis)
 ├── config.json              # Apify token (gitignored)
 ├── .gitignore
@@ -111,20 +112,22 @@ Jobscraper/
 
 ```mermaid
 graph TD
-    A[main] --> B[1/6 Arbeitnow API]
-    A --> C[2/6 Startup.jobs HTML]
-    A --> D[3/6 Xing HTML]
-    A --> E[4/6 Stepstone HTML]
-    A --> F[5/6 LinkedIn Apify]
-    A --> G[6/6 Indeed Apify]
-    B --> H[check_experience_and_location]
-    C --> H
-    D --> H
-    E --> H
-    F --> H
-    G --> H
-    H --> I[Deduplicate by company::title]
-    I --> J[Export CSV + JSON + MD + XLSX]
+    A[main] --> B[1/7 Arbeitnow API]
+    A --> C[2/7 Startup.jobs HTML]
+    A --> D[3/7 Xing HTML]
+    A --> E[4/7 Stepstone HTML]
+    A --> F[5/7 Glassdoor HTML]
+    A --> G[6/7 LinkedIn Apify]
+    A --> H[7/7 Indeed Apify]
+    B --> I[check_experience_and_location]
+    C --> I
+    D --> I
+    E --> I
+    F --> I
+    G --> I
+    H --> I
+    I --> J[Deduplicate by company::title]
+    J --> K[Export CSV + JSON + MD + XLSX]
 ```
 
 ### Key Functions
@@ -135,8 +138,9 @@ graph TD
 | `fetch_startupjobs_jobs()` | `cloudscraper` HTML parse, `data-post-template-target` attributes |
 | `fetch_xing_jobs()` | `cloudscraper` HTML parse, `data-testid` attributes, `<time dateTime>` ISO timestamps |
 | `fetch_stepstone_jobs()` | `cloudscraper` HTML parse, `data-at` SSR attributes, German relative time parsing |
-| `fetch_linkedin_jobs()` | Apify actor, 10 role URLs with `f_TPR=r86400` 24h filter |
-| `fetch_indeed_jobs()` | Apify actor, 10 roles in parallel via `ThreadPoolExecutor` |
+| `fetch_glassdoor_jobs()` | `cloudscraper` (chrome emulation), JSON-LD ItemList parsing, `_KE` offset company extraction, 8x Cloudflare retry |
+| `fetch_linkedin_jobs()` | Apify actor, 10 role URLs with `f_TPR=r86400` 24h filter + safety-net post-filter on `postedAt` (date-only treated as end-of-day) |
+| `fetch_indeed_jobs()` | Apify actor, 10 roles in parallel via `ThreadPoolExecutor`, post-filter on `datePublished` (`datePosted='1'` unreliable) |
 | `run_apify_actor()` | Starts actor, polls status, fetches dataset, `maxTotalChargeUsd` safety cap |
 | `check_experience_and_location()` | Multi-stage filter: title relevance → seniority → Germany → city |
 | `is_relevant_title()` | Regex check for data/analytics/AI keywords in title |

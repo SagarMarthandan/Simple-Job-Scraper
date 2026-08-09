@@ -2,9 +2,9 @@
 
 > **Instructions for Oh My Pi (OMP) Session:**
 > When this file is uploaded/run in an OMP session, execute the automated job search pipeline below.
-> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Startup.jobs**, **Xing**, and **Stepstone** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp into `/home/sagar/Skills/Jobscraper/Job Search/`.
+> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Startup.jobs**, **Xing**, **Stepstone**, and **Glassdoor** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp into `/home/sagar/Skills/Jobscraper/Job Search/`.
 
-> **Cost-optimized 2026-08-05:** ~$0.55/run Apify (LinkedIn ~$0.50 + Indeed ~$0.05). Arbeitnow, Startup.jobs, Xing, and Stepstone are free. See Section 5 for details.
+> **Cost-optimized 2026-08-05:** ~$0.55/run Apify (LinkedIn ~$0.50 + Indeed ~$0.05). Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor are free. See Section 5 for details.
 
 ---
 
@@ -16,7 +16,7 @@
 - **Portfolio Directory:** `/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/portfolio`
 - **Target Output Directory:** `/home/sagar/Skills/Jobscraper/Job Search`
 - **Apify Token:** read from the `APIFY_TOKEN` environment variable or `config.json` (never hardcode it in this file; the token was previously pasted here and is now rotated)
-- **Dependency:** `cloudscraper` (for startup.jobs, Xing, and Stepstone HTML scraping — bypasses anti-bot). Install: `pip install cloudscraper`
+- **Dependency:** `cloudscraper` (for startup.jobs, Xing, Stepstone, and Glassdoor HTML scraping — bypasses anti-bot). Install: `pip install cloudscraper`
 - **Target Role Profiles (Consolidated 10 core roles — search engines cover variants):**
   1. **Core Data & Pipeline Engineering:** `Data Engineer`, `Analytics Engineer`
   2. **Business Intelligence & Analytics:** `Data Analyst`
@@ -37,6 +37,7 @@
    - **Startup.jobs** (free HTML scraping via cloudscraper, no Apify)
    - **Xing** (free HTML scraping via cloudscraper, no Apify — parses server-rendered job cards using `data-testid` attributes and `<time dateTime>` ISO timestamps; 3 pages per role, sponsored listings skipped)
    - **Stepstone** (free HTML scraping via cloudscraper, no Apify — uses path-based URLs `/jobs/{slug}/in-deutschland?sort=2&ag=age_1`; parses SSR job cards with `data-at` attributes; 3 pages per role, 24h freshness pre-filter via `ag=age_1`)
+   - **Glassdoor** (free HTML scraping via cloudscraper, no Apify — parses JSON-LD `<script type="application/ld+json">` ItemList tags from SSR HTML; company names extracted from URL slugs using `_KE{start},{end}` character offsets; `fromAge=1` pre-filters to last 24h; chrome emulation + 8x retry for Cloudflare bypass; 3 pages per role)
    - ~~Kununu~~ (DROPPED — shahidirfan/kununu-jobs-scraper returns 0 results as of 2026-08-05; all 8 Apify store kununu actors are review scrapers, not job listing scrapers)
 3. **Title Relevance Filter:** Universal post-filter `is_relevant_title()` rejects any job whose title doesn't contain at least one data/analytics/AI/SQL/Python keyword. Catches actor false positives (Indeed returning "Nachtwächter" for "Data Engineer" searches, etc.).
 4. **Role Types & Location Constraints:**
@@ -63,7 +64,7 @@ Run it with:
 cd "/home/sagar/Skills/Jobscraper" && python3 apify_job_search.py
 ```
 
-Dependencies: `cloudscraper` (for startup.jobs, Xing, and Stepstone), `openpyxl` (for XLSX export).
+Dependencies: `cloudscraper` (for startup.jobs, Xing, Stepstone, and Glassdoor), `openpyxl` (for XLSX export).
 Install: `pip install cloudscraper openpyxl`
 
 The full source code is in `apify_job_search.py` — this .md file no longer embeds a duplicate copy to avoid drift between the two.
@@ -99,6 +100,7 @@ When executed, the script automatically creates `/home/sagar/Skills/Jobscraper/J
 | Startup.jobs | Free HTML scraping | $0.00 | `cloudscraper` bypasses Cloudflare. 6 category pages: data-engineer, data-analyst, ai-engineer, data-scientist, business-analyst, analytics-engineer. |
 | Xing | Free HTML scraping | $0.00 | `cloudscraper` bypasses anti-bot. 10 search roles × 3 pages. Parses `data-testid` attributes + `<time dateTime>` ISO timestamps. Sponsored listings (no dateTime) skipped. ~8% of raw results are <24h fresh. |
 | Stepstone | Free HTML scraping | $0.00 | `cloudscraper` bypasses anti-bot. 10 search roles × 3 pages. Path-based URLs `/jobs/{slug}/in-deutschland?sort=2&ag=age_1`. Parses SSR `data-at` attributes + `<time>` relative timestamps. `ag=age_1` pre-filters to last 24h. |
+| Glassdoor | Free HTML scraping | $0.00 | `cloudscraper` with chrome emulation. 10 search roles × 3 pages. Parses JSON-LD ItemList from SSR HTML. Company from URL slug `_KE` offsets. `fromAge=1` = last 24h. Cloudflare blocks ~60% → 8x retry with fresh instances (~98% reliability). |
 | ~~Kununu~~ | DROPPED | $0.00 | `shahidirfan/kununu-jobs-scraper` returns 0 results (broken). All 8 Apify store kununu actors are review scrapers, not job listing scrapers. |
 | **Total** | | **~$0.55** | **Was $1.50-3.00** (82% reduction) |
 
@@ -126,6 +128,7 @@ When executed, the script automatically creates `/home/sagar/Skills/Jobscraper/J
 | Arbeitnow | — | — | Free REST API: `https://www.arbeitnow.com/api/job-board-api` | Free |
 | Xing | — | — | HTML scraping via `cloudscraper`. URL: `xing.com/search/in/jobs?keywords=<role>&location=germany&page=<N>`. Parses `data-testid="job-teaser-list-title"`, `aria-label` on `<img>`, `<time dateTime>` for 24h filter. | Free |
 | Stepstone | — | — | HTML scraping via `cloudscraper`. URL: `stepstone.de/jobs/{slug}/in-deutschland?sort=2&ag=age_1&page=<N>`. Path-based URLs required — query-param `?keyword=` returns generic results. Parses `data-at="job-item-title"`, `data-at="job-item-company-name"`, `data-at="job-item-location"`, `data-at="job-item-timeago"` (`<time>` tag). `ag=age_1` = last 24h filter. | Free |
+| Glassdoor | — | — | HTML scraping via `cloudscraper` (chrome emulation). URL: `glassdoor.de/Job/jobs.htm?sc.keyword=<role>&locT=C&locId=26&fromAge=1&page=<N>`. Parses JSON-LD `<script type="application/ld+json">` ItemList (30 jobs/page). Company extracted from URL slug using `_KE{start},{end}` character offsets. `fromAge=1` = last 24h. `locId=26` = Germany. No posted-date in JSON-LD — `fromAge=1` guarantees freshness. | Free |
 
 ### Notes / Gotchas
 - **Output layout**: each run writes its files into `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`.
@@ -133,6 +136,7 @@ When executed, the script automatically creates `/home/sagar/Skills/Jobscraper/J
 - **Startup.jobs**: uses `cloudscraper` to bypass Cloudflare challenge. Install: `pip install cloudscraper`. Parses `data-post-template-target` attributes from server-rendered HTML.
 - **Xing**: uses `cloudscraper` to bypass anti-bot. Server-rendered HTML with `data-testid` attributes (stable test IDs, not styled-components hashes). Encoding must be forced to UTF-8 (cloudscraper misdetects as ISO-8859-1). No date filter URL parameter — must fetch all results and filter by `<time dateTime>` ISO timestamp post-hoc. Sponsored listings lack `dateTime` and are skipped. ~8% of raw results are <24h fresh. Stops paginating when a page yields 0 fresh jobs.
 - **Stepstone**: uses `cloudscraper` to bypass anti-bot. Server-side rendered HTML (React hydration) with `data-at` attributes. **Critical**: must use path-based URLs (`/jobs/{slug}/in-deutschland`) — the query-param format (`?keyword=...`) returns generic results regardless of the search term. `<style>` and `<svg>` blocks must be stripped before regex parsing (they contain CSS/paths that interfere with `data-at` attribute matching). Company name is nested inside a `<div>` within the TEXT span (unlike location which is plain text). The `ag=age_1` parameter pre-filters to last 24h ('Neuer als 24h'). `sort=2` sorts by date (Datum). Timeago strings are German relative format ('vor 49 Minuten', 'vor 3 Stunden') parsed by `parse_stepstone_timeago()`.
+- **Glassdoor**: uses `cloudscraper` with chrome browser emulation to bypass Cloudflare. Glassdoor is a React SPA but SSR-embeds job listings as JSON-LD `<script type="application/ld+json">` ItemList tags (30 jobs/page) — no React hydration needed for titles/URLs. Company names are extracted from URL slugs using `_KE{start},{end}` character offsets (Glassdoor's KO/KE encoding: KO = keyword offset, KE = employer offset). **CRITICAL: `fromAge=1` URL parameter is IGNORED by SSR** — Glassdoor's React app applies date filtering client-side after hydration. The SSR HTML always returns unfiltered results (jobs 30-165 days old). Without `ageInDays` filtering, all jobs appear as "posted today". Fixed by extracting `ageInDays` from the Next.js RSC payload (`self.__next_f.push`): each job entry has `\"ageInDays\":NNN` paired with `listingId:LLL` (which matches the `jl` parameter in JSON-LD URLs). Only `ageInDays == 0` (posted today) passes the filter. Jobs with unverified age (`None`) are skipped. Location defaults to "Germany" (`locId=26`). Cloudflare blocks ~60% of requests — 8x retry with fresh instances (~98% reliability). No login required. **Yield warning**: in testing, 0/269 raw listings had `ageInDays == 0` — Glassdoor's SSR returns predominantly stale jobs. Fresh yield is expected to be very low compared to other platforms.
 - **Indeed actor**: sometimes returns 0 results for Germany — this is an actor-side issue, not our code. The `title` param does fuzzy search, not exact match, so the `is_relevant_title` post-filter is essential.
 - **LinkedIn AI search (2026-08-07)**: LinkedIn rolled out AI-powered job search, removing most classic URL filters (experience, job type, workplace, salary, sort). The actor's `autoConvertToAiSearch` (default `true`) converts unsupported filters into natural-language search terms appended to keywords. Only date posted (`f_TPR`), company, easy apply, and under-10-applicants remain as URL filters. `location=Germany` is softened to a search hint — the Germany Location Guard in `check_experience_and_location()` catches leakage. To force exact classic URL behavior, set `autoConvertToAiSearch: false` in the actor call (not recommended — LinkedIn forces AI search server-side). To use the pre-AI actor, select `last-v6` build under Run options on Apify.
 - **Token**: read from env var `APIFY_TOKEN` or `config.json`. Rotate if exposed.
