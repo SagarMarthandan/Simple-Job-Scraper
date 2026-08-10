@@ -3,6 +3,20 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
+## [2026-08-10]
+
+### Critical Fix
+- **Stepstone switched from `cloudscraper` to plain `requests`** — Stepstone is behind **Akamai** (not Cloudflare). `cloudscraper`'s challenge-solving mechanism hangs on Akamai, causing `ReadTimeout` on port 443 (read timeout=15s). Plain `requests` with a browser User-Agent works — Stepstone serves SSR HTML without anti-bot challenge. All `data-at` attribute parsing unchanged. 25 job cards/page confirmed parsing correctly.
+- **Xing switched from `cloudscraper` to plain `requests`** — Xing is behind **AWS CloudFront** (not Cloudflare). `cloudscraper` worked but was unnecessary overhead with the same Akamai-style hang risk as Stepstone if cloudscraper updates its challenge handling. Plain `requests` with a browser User-Agent works (Xing serves SSR HTML without anti-bot challenge). All `data-testid` attribute parsing unchanged. 11 jobs confirmed parsing correctly.
+
+### Audit Summary (CDN protection)
+| Platform | CDN | `requests` | `cloudscraper` | Action |
+|---|---|---|---|---|
+| Startup.jobs | Cloudflare | 403 | 200 ✅ | Keep cloudscraper |
+| Xing | AWS CloudFront | 200 ✅ | 200 ✅ | Switch to requests |
+| Stepstone | Akamai | 200 ✅ | ❌ TIMEOUT | Switch to requests |
+| Glassdoor | Cloudflare | 403 | 200 (chrome) ✅ | Keep cloudscraper |
+
 ## [2026-08-09b]
 
 ### Critical Fix

@@ -2,7 +2,7 @@
 name: Jobscraper
 description: >-
   Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "startup.jobs", "arbeitnow", "xing jobs", "stepstone jobs", "glassdoor jobs", "apify jobs", "job pipeline", "run job search".
-dependencies: python>=3.10, cloudscraper, openpyxl
+dependencies: python>=3.10, cloudscraper, requests, openpyxl
 ---
 
 # Jobscraper Pipeline
@@ -19,8 +19,8 @@ Run the pipeline script:
 cd /home/sagar/Skills/Jobscraper && python3 apify_job_search.py
 ```
 
-Dependencies: `cloudscraper` (for startup.jobs, Xing, Stepstone, and Glassdoor HTML scraping), `openpyxl` (for XLSX export).
-Install: `pip install cloudscraper openpyxl`
+Dependencies: `cloudscraper` (for Startup.jobs and Glassdoor — Cloudflare bypass), `requests` (for Xing and Stepstone — no anti-bot), `openpyxl` (for XLSX export).
+Install: `pip install cloudscraper requests openpyxl`
 
 ## Context
 
@@ -41,8 +41,8 @@ Install: `pip install cloudscraper openpyxl`
    - **Indeed** (Apify — valig/indeed-jobs-scraper, ~$0.025/run)
    - **Arbeitnow** (free API, no Apify)
    - **Startup.jobs** (free HTML scraping via cloudscraper, no Apify)
-   - **Xing** (free HTML scraping via cloudscraper, no Apify)
-   - **Stepstone** (free HTML scraping via cloudscraper, no Apify)
+   - **Xing** (free HTML scraping via plain `requests`, no Apify — AWS CloudFront, no anti-bot)
+   - **Stepstone** (free HTML scraping via plain `requests`, no Apify — Akamai CDN, cloudscraper hangs)
    - **Glassdoor** (free HTML scraping via cloudscraper, JSON-LD parsing, no Apify)
 3. **Title Relevance Filter:** Universal post-filter `is_relevant_title()` rejects any job whose title doesn't contain at least one data/analytics/AI/SQL/Python keyword.
 4. **Role Types & Location Constraints:**

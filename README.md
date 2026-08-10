@@ -28,8 +28,8 @@ The pipeline runs seven platform fetchers in sequence, applies a multi-stage fil
 | Indeed | Apify: `valig/indeed-jobs-scraper` | ~$0.05 | Apify actor, `limit=50` per role, 10 roles in parallel, `datePosted='1'` (unreliable — post-filter on `datePublished` enforces 24h) |
 | Arbeitnow | Free REST API | $0.00 | `https://www.arbeitnow.com/api/job-board-api` |
 | Startup.jobs | Free HTML scraping | $0.00 | `cloudscraper`, 6 category pages |
-| Xing | Free HTML scraping | $0.00 | `cloudscraper`, 10 roles × 3 pages, `data-testid` attributes |
-| Stepstone | Free HTML scraping | $0.00 | `cloudscraper`, 10 roles × 3 pages, path-based URLs with `ag=age_1` 24h filter |
+| Xing | Free HTML scraping | $0.00 | `requests`, 10 roles × 3 pages, `data-testid` attributes (AWS CloudFront — no anti-bot) |
+| Stepstone | Free HTML scraping | $0.00 | `requests`, 10 roles × 3 pages, path-based URLs with `ag=age_1` 24h filter (Akamai CDN — cloudscraper hangs, plain requests works) |
 | Glassdoor | Free HTML scraping | $0.00 | `cloudscraper` (chrome emulation), 10 roles × 3 pages, JSON-LD ItemList parsing, `_KE` company extraction, `ageInDays` filtering from RSC payload (`fromAge=1` ignored by SSR), 8x retry for Cloudflare |
 | **Total** | | **~$0.55** | |
 
@@ -82,11 +82,11 @@ Read from (in order of precedence):
 ### Dependencies
 
 - Python >= 3.10
-- `cloudscraper` — bypasses Cloudflare/anti-bot for Startup.jobs, Xing, Stepstone, Glassdoor
+- `cloudscraper` — bypasses Cloudflare for Startup.jobs, Glassdoor
+- `requests` — HTTP client for Xing (AWS CloudFront) and Stepstone (Akamai) — no anti-bot challenge
 - `openpyxl` — XLSX export with autofilter and hyperlinks
 
-```bash
-pip install cloudscraper openpyxl
+pip install cloudscraper requests openpyxl
 ```
 
 ## Project Structure

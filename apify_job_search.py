@@ -33,6 +33,13 @@ Changelog:
               Also added defense-in-depth safety-net post-filter to fetch_linkedin_jobs() (f_TPR=r86400
               verified working 727/727, but post-filter catches any future regressions). Date-only
               timestamps (LinkedIn format) treated as end-of-day (23:59:59) to avoid false rejections.
+  2026-08-10: CRITICAL FIX: Stepstone switched from cloudscraper to plain requests. Stepstone is
+              behind Akamai (not Cloudflare) — cloudscraper's challenge-solving hangs on Akamai,
+              causing read timeouts on port 443. Plain requests with a browser User-Agent works
+              (Stepstone serves SSR HTML without anti-bot challenge). All data-at parsing unchanged.
+              Also switched Xing from cloudscraper to plain requests — Xing is behind AWS CloudFront
+              (not Cloudflare), so cloudscraper was unnecessary overhead with the same hang risk.
+              Startup.jobs and Glassdoor genuinely need cloudscraper (Cloudflare 403 on plain requests).
 
 See CHANGELOG.md for full version history and apify_job_search.md for detailed technical documentation.
 """
@@ -50,6 +57,7 @@ try:
 except ImportError:
     cloudscraper = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -391,19 +399,26 @@ def fetch_startupjobs_jobs():
 
 def fetch_xing_jobs():
     """Fetch jobs from Xing.com via HTML scraping (free, no Apify).
-    Uses cloudscraper to bypass anti-bot. Fetches search result pages for each
-    SEARCH_ROLE and parses job listings from server-rendered HTML.
-    Relies on data-testid attributes (stable test IDs) and <time dateTime> ISO
-    timestamps for 24h freshness filtering. Sponsored listings (no dateTime) are skipped.
+    Uses plain requests — Xing is behind AWS CloudFront (not Cloudflare), so
+    no anti-bot bypass needed. cloudscraper worked but was unnecessary overhead
+    with the same Akamai-style hang risk as Stepstone if cloudscraper updates
+    its challenge handling. Fetches search result pages for each SEARCH_ROLE
+    and parses job listings from server-rendered HTML. Relies on data-testid
+    attributes (stable test IDs) and <time dateTime> ISO timestamps for 24h
+    freshness filtering. Sponsored listings (no dateTime) are skipped.
     """
-    if not cloudscraper:
-        print("[!] cloudscraper not installed — skipping Xing. Install with: pip install cloudscraper")
+    if requests is None:
+        print("[!] requests not installed — skipping Xing. Install with: pip install requests")
         return []
 
     jobs = []
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=FRESHNESS_HOURS)
-    scraper = cloudscraper.create_scraper()
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    })
     seen_urls = set()
     XING_PAGES_PER_ROLE = 3  # 20 results/page × 3 = 60 max per role
 
@@ -414,10 +429,10 @@ def fetch_xing_jobs():
         for page in range(1, XING_PAGES_PER_ROLE + 1):
             url = f"https://www.xing.com/search/in/jobs?keywords={urllib.parse.quote(role)}&location=germany&page={page}"
             try:
-                r = scraper.get(url, timeout=15)
+                r = session.get(url, timeout=15)
                 if r.status_code != 200:
                     break
-                r.encoding = "utf-8"  # Xing sends UTF-8 but cloudscraper detects ISO-8859-1
+                r.encoding = "utf-8"  # Xing sends UTF-8
                 raw = r.text
             except Exception as e:
                 print(f"[!] Xing fetch error ({role} page {page}): {e}")
@@ -516,23 +531,29 @@ def parse_stepstone_timeago(timeago: str) -> datetime:
         elif "tag" in unit:
             return now - timedelta(days=n)
     return now
-
 def fetch_stepstone_jobs():
     """Fetch jobs from Stepstone.de via HTML scraping (free, no Apify).
-    Uses cloudscraper to fetch server-side rendered search result pages.
-    Stepstone SSR-renders job cards in the initial HTML with data-at
+    Uses plain requests to fetch server-side rendered search result pages.
+    Stepstone is behind Akamai (not Cloudflare), so cloudscraper's challenge-
+    solving hangs and causes read timeouts on port 443. Plain requests with a
+    browser User-Agent works — Stepstone serves SSR HTML without anti-bot
+    challenge. SSR-renders job cards in the initial HTML with data-at
     attributes for each field. Uses path-based URLs (/jobs/{slug}/in-deutschland)
     — the query-param format (?keyword=...) returns generic results regardless
     of the keyword. The ag=age_1 parameter pre-filters to last 24h ('Neuer als 24h').
     """
-    if not cloudscraper:
-        print("[!] cloudscraper not installed — skipping Stepstone. Install with: pip install cloudscraper")
+    if requests is None:
+        print("[!] requests not installed — skipping Stepstone. Install with: pip install requests")
         return []
 
     jobs = []
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=FRESHNESS_HOURS)
-    scraper = cloudscraper.create_scraper()
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    })
     seen_urls = set()
     STEPSTONE_PAGES_PER_ROLE = 3  # 25 results/page × 3 = 75 max per role
 
@@ -549,7 +570,7 @@ def fetch_stepstone_jobs():
                 f"&page={page}"
             )
             try:
-                r = scraper.get(url, timeout=15)
+                r = session.get(url, timeout=15)
                 if r.status_code != 200:
                     print(f"[!] Stepstone/{role} page {page}: HTTP {r.status_code}")
                     break
