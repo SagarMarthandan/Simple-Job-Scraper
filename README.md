@@ -17,7 +17,7 @@ Output is written to `Job Search/YYYY-MM-DD/`.
 The pipeline runs seven platform fetchers in sequence, applies a multi-stage filter chain, deduplicates, and exports four deliverable files:
 
 ```
-7 platforms → title relevance → seniority/experience → Germany location → working-student city → dedup → export
+7 platforms → title relevance → seniority/experience → Germany location → working-student city → within-run dedup → cross-run dedup → export
 ```
 
 ### Platforms
@@ -68,6 +68,17 @@ Files written to `Job Search/YYYY-MM-DD/` per run:
 | `Job_Search_<Month>_<Day>_<Year>.xlsx` | Frozen header, autofilter dropdowns, clickable `job_url` hyperlinks, numeric `match_score` |
 | `JOB_OPENINGS_LAST_24H.md` | Markdown summary table with apply links |
 
+### Cross-Run Deduplication
+
+Each run compares against the **immediate previous run** (e.g. Friday vs Thursday, or vs Wednesday if Thursday was skipped) and removes jobs already seen. This prevents duplicates across consecutive daily sheets — with 24h freshness, run times drift and windows overlap (31.5% of jobs were duplicates before this was added).
+
+| Key | Method | Catches |
+|---|---|---|
+| **URL** | `normalize_job_url()` — strips LinkedIn tracking params, preserves Indeed/Glassdoor job IDs | Same posting re-listed (URLs are unique) |
+| **Company + Title** | `normalize_key()` — same fuzzy key used for within-run dedup | LinkedIn re-lists (new URL per run, same job) + cross-platform dups (same job on LinkedIn vs Indeed) |
+
+Same-day reruns are handled automatically (today's own earlier CSV is the most recent folder).
+
 **CSV columns:** `language`, `job_board`, `role_type`, `title`, `company`, `location`, `posted_at`, `exp_required`, `match_score`, `job_url`
 
 ## Configuration
@@ -96,7 +107,8 @@ Jobscraper/
 ├── README.md                # this file
 ├── CHANGELOG.md             # version history
 ├── SKILL.md                 # OMP skill definition (trigger keywords, execution instructions)
-├── apify_job_search.py      # main pipeline script (~1230 lines, self-contained)
+├── apify_job_search.py      # main pipeline script (~1340 lines, self-contained)
+├── dedup_existing_sheets.py # standalone cleanup tool for retroactive cross-run dedup
 ├── apify_job_search.md      # detailed technical documentation (actor schemas, gotchas, cost analysis)
 ├── config.json              # Apify token (gitignored)
 ├── .gitignore
@@ -126,8 +138,9 @@ graph TD
     F --> I
     G --> I
     H --> I
-    I --> J[Deduplicate by company::title]
-    J --> K[Export CSV + JSON + MD + XLSX]
+    I --> J[Within-run dedup by company::title]
+    J --> L[Cross-run dedup vs previous run]
+    L --> K[Export CSV + JSON + MD + XLSX]
 ```
 
 ### Key Functions
@@ -147,6 +160,8 @@ graph TD
 | `classify_role_type()` | Working Student / Internship / Full-Time classification |
 | `compute_match_score()` | Percentage match against core tech stack (dbt, airflow, spark, python, sql, etc.) |
 | `normalize_key()` | Dedup key: `company::title` with legal suffixes stripped |
+| `normalize_job_url()` | Cross-run URL identity: strips LinkedIn tracking params, preserves Indeed/Glassdoor job IDs |
+| `load_previous_run_keys()` | Loads URL + title keys from the most recent previous run for cross-run dedup |
 | `convert_csv_to_xlsx()` | openpyxl export with autofilter, frozen header, hyperlinks |
 
 ## Customization

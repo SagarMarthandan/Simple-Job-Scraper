@@ -3,6 +3,16 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
+## [2026-08-21]
+
+### Added
+- **Cross-run deduplication** — consecutive daily runs with 24h freshness windows overlap when run times drift, causing duplicate jobs across sheets (e.g. 76/241 = 31.5% of Aug 21 jobs already appeared in Aug 20). After within-run dedup, `load_previous_run_keys()` loads keys from the **single most recent previous run** (e.g. Friday vs Thursday, or vs Wednesday if Thursday was skipped) and removes jobs already seen:
+  - **URL keys**: `normalize_job_url()` strips LinkedIn tracking params (position/pageNum/refId/trackingId) since the job ID is in the path; Indeed `jk=` and Glassdoor `jl=` IDs are preserved. URLs are unique — if the same URL appeared in the previous run, it's the same job.
+  - **Title keys**: `normalize_key(company, title)` from the same previous run. Catches LinkedIn re-lists (new URL per run, same job) and cross-platform duplicates (same job on LinkedIn vs Indeed).
+- **`normalize_job_url()`** — stable cross-run URL identity. LinkedIn query string dropped (tracking params); other platforms keep their ID-bearing query params.
+- Same-day reruns: today's own earlier CSV is the most recent folder, so a second run suppresses everything already exported.
+- Console output: `Cross-run dedup: compared against previous run (N jobs), removed X already-seen job(s)`.
+
 ## [2026-08-10]
 
 ### Critical Fix

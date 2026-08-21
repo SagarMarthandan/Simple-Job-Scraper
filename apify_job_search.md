@@ -85,9 +85,20 @@ When executed, the script automatically creates `/home/sagar/Skills/Jobscraper/J
    - `match_score` is stored as a number so sorting by Match is numeric, not alphabetical.
    - Requires `openpyxl` in the venv; generated automatically at the end of the pipeline run.
 
+### Cross-Run Deduplication
+
+Each run writes to its own dated subfolder (`Job Search/YYYY-MM-DD/`). Consecutive daily runs with 24h freshness windows overlap when run times drift — a job posted at 14:00 on Aug 20 appears in both the Aug 20 run (if run at 16:00) and the Aug 21 run (if run at 10:00, since 20h < 24h). Without cross-run dedup, 31.5% of jobs were duplicates across consecutive sheets.
+
+After within-run dedup, `load_previous_run_keys()` loads keys from the **single most recent previous run** (e.g. Friday vs Thursday, or vs Wednesday if Thursday was skipped) and removes jobs already seen:
+
+| Key | Method | Rationale |
+|---|---|---|
+| **URL key** | `normalize_job_url()` — strips LinkedIn tracking params (position/pageNum/refId/trackingId); preserves Indeed `jk=` and Glassdoor `jl=` IDs | URLs are unique — if the same URL appeared in the previous run, it's the same job |
+| **Title key** | `normalize_key(company, title)` — same fuzzy key used for within-run dedup | Catches LinkedIn re-lists (new URL per run, same job) and cross-platform duplicates (same job on LinkedIn vs Indeed) |
+
+Same-day reruns: today's own earlier CSV is the most recent folder, so a second run on the same day suppresses everything already exported.
 
 ---
-
 ## 5. Cost Optimization & Actor Status (last updated 2026-08-07)
 
 ### Cost Breakdown (per full pipeline run)

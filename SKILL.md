@@ -57,6 +57,7 @@ Install: `pip install cloudscraper requests openpyxl`
    4. Business Analyst
    5. SQL Developer
    6. Praktikum Data, Werkstudent Data, Werkstudent Business Intelligence
+7. **Cross-Run Deduplication:** After within-run dedup, jobs already in the **immediate previous run** are removed (e.g. Friday vs Thursday, or vs Wednesday if Thursday was skipped). URL match (URLs are unique) + company+title fuzzy match (catches LinkedIn re-lists and cross-platform dups). Prevents duplicates across consecutive daily sheets when 24h freshness windows overlap. Same-day reruns also handled.
 
 ## Output
 

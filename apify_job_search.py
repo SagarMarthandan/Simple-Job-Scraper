@@ -256,6 +256,72 @@ def normalize_key(company: str, title: str) -> str:
     clean_title = re.sub(r"[^\w\s]", "", title).strip().lower()
     return f"{clean_company}::{clean_title}"
 
+def normalize_job_url(url: str) -> str:
+    """Normalize a job URL into a stable cross-run identity key.
+
+    LinkedIn URLs carry per-run tracking params (position/pageNum/refId/trackingId)
+    while the job ID lives in the path — drop the query string there.
+    Indeed (?jk=) and Glassdoor (?jl=) carry their job IDs in the query — keep it.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if "linkedin.com" in url:
+        url = url.split("?", 1)[0]
+    return url.rstrip("/").lower()
+
+def load_previous_run_keys(now: datetime) -> tuple[set, set, int, int]:
+    """Load dedup keys from the single most recent previous run folder.
+
+    Compares today's run against only the immediate previous run (e.g. Friday vs
+    Thursday, or vs Wednesday if Thursday was skipped). For same-day reruns, the
+    most recent folder is today's own earlier run.
+
+    Returns (url_keys, title_keys, runs_scanned, jobs_scanned):
+      - url_keys: normalized job URLs from that one run.
+      - title_keys: normalize_key(company, title) from that same run.
+        Catches LinkedIn re-lists (new URL per run, same job) and cross-platform
+        duplicates (same job on LinkedIn vs Indeed).
+    """
+    url_keys = set()
+    title_keys = set()
+    runs_scanned = 0
+    jobs_scanned = 0
+
+    # Find the most recent dated run folder (<= today)
+    prev_folder = None
+    for folder in sorted(JOB_SEARCH_DIR.iterdir(), reverse=True):
+        if not folder.is_dir():
+            continue
+        try:
+            run_date = datetime.strptime(folder.name, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if run_date > now.date():
+            continue
+        if any(folder.glob("Job_Search_*.csv")):
+            prev_folder = folder
+            break
+
+    if not prev_folder:
+        return url_keys, title_keys, runs_scanned, jobs_scanned
+
+    for csv_file in sorted(prev_folder.glob("Job_Search_*.csv")):
+        try:
+            with open(csv_file, newline="", encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f))
+        except Exception:
+            continue
+        runs_scanned += 1
+        jobs_scanned += len(rows)
+        for row in rows:
+            url = normalize_job_url(row.get("job_url", ""))
+            if url:
+                url_keys.add(url)
+            title_keys.add(normalize_key(row.get("company", ""), row.get("title", "")))
+
+    return url_keys, title_keys, runs_scanned, jobs_scanned
+
 def fetch_arbeitnow_jobs():
     """Fetch jobs from Arbeitnow API across all search roles."""
     jobs = []
@@ -907,6 +973,7 @@ def run_apify_actor(actor_id: str, run_input: dict, label: str = "Apify Actor", 
 
     poll_url = f"https://api.apify.com/v2/acts/{actor_id}/runs/{run_id}?token={APIFY_TOKEN}"
     start_time = time.time()
+    max_poll_seconds = 300  # safety cap: Apify actors should finish well within 5 min
     while True:
         try:
             with urllib.request.urlopen(urllib.request.Request(poll_url), timeout=30) as resp:
@@ -919,6 +986,9 @@ def run_apify_actor(actor_id: str, run_input: dict, label: str = "Apify Actor", 
                     break
                 elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
                     print(f"[!] {label} run failed with status '{status}' after {elapsed}s", flush=True)
+                    return []
+                elif elapsed >= max_poll_seconds:
+                    print(f"[!] {label} exceeded {max_poll_seconds}s poll timeout (status={status}); giving up", flush=True)
                     return []
                 else:
                     print(f"    ... {label} status: {status} ({elapsed}s elapsed)", flush=True)
@@ -1178,7 +1248,7 @@ def main():
     all_jobs.extend(indeed_jobs)
     platform_counts["Indeed"] = len(indeed_jobs)
 
-    # Deduplication
+    # Deduplication (within this run)
     seen_keys = set()
     deduped_jobs = []
     duplicates_count = 0
@@ -1191,11 +1261,26 @@ def main():
         seen_keys.add(key)
         deduped_jobs.append(job)
 
+    # Cross-run deduplication: drop jobs already exported by previous runs
+    # (24h freshness windows of consecutive runs overlap when run times drift).
+    now = datetime.now()
+    prev_url_keys, prev_title_keys, runs_scanned, jobs_scanned = load_previous_run_keys(now)
+    cross_run_duplicates = 0
+    if prev_url_keys or prev_title_keys:
+        final_jobs = []
+        for job in deduped_jobs:
+            if normalize_job_url(job["job_url"]) in prev_url_keys or \
+               normalize_key(job["company"], job["title"]) in prev_title_keys:
+                cross_run_duplicates += 1
+                continue
+            final_jobs.append(job)
+        deduped_jobs = final_jobs
+
     print(f"Per-platform: {platform_counts}")
+    print(f"Cross-run dedup: compared against previous run ({jobs_scanned} jobs), removed {cross_run_duplicates} already-seen job(s)")
     print(f"Est. Apify cost: ~${0.50 + 0.04:.3f} (LinkedIn ~$0.50 + Indeed ~$0.04) + Arbeitnow/Startup.jobs/Xing/Stepstone/Glassdoor FREE")
 
     # Format Date String: e.g. Aug_4_2026
-    now = datetime.now()
     date_str = now.strftime("%b_%d_%Y").replace("_0", "_")
 
     # Per-date subfolder so each run's files are grouped/sorted by day
