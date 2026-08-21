@@ -97,6 +97,7 @@ Read from (in order of precedence):
 - `requests` — HTTP client for Xing (AWS CloudFront) and Stepstone (Akamai) — no anti-bot challenge
 - `openpyxl` — XLSX export with autofilter and hyperlinks
 
+```bash
 pip install cloudscraper requests openpyxl
 ```
 
