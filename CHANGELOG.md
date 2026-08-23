@@ -3,6 +3,43 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
+## [2026-08-23]
+
+### Added
+- **LinkedIn free HTML scraper** (`fetch_linkedin_jobs_free()`) — replaces paid Apify LinkedIn actor ($0.50/run savings). Scrapes LinkedIn's public jobs search page directly: server-rendered HTML with 60 `div.base-card` elements per search, no auth wall. `f_TPR=r86400` server-side 24h filter + `posted_at` datetime post-filter. No job descriptions (title-only filtering = more permissive, title-based `EXCLUDED_TITLE_PATTERNS` still catches Senior/Lead/Manager). Paid actor kept as fallback (`fetch_linkedin_jobs()` at line 1154) but not called.
+- **Multi-city LinkedIn search** — LinkedIn caps results at 60/page with no pagination. Searching "Germany" alone misses jobs beyond the first 60. Each role is now searched across 6 locations (`Germany`, `Berlin`, `Munich`, `Hamburg`, `Frankfurt`, `Cologne`). City-level results have different rankings and overlap only partially with Germany-wide. Verified: 184 unique URLs/role (3.1x coverage vs Germany-only). "Remote" excluded — returns global jobs (6000+), would flood with false positives.
+- **ATS Direct scraping** (`ats_scraper.py`) — new file with 3 ATS platform fetchers using public JSON APIs (no auth, no HTML selectors): Greenhouse (`boards-api.greenhouse.io/v1/boards/{slug}/jobs`, `first_published`), SmartRecruiters (`api.smartrecruiters.com/v1/companies/{slug}/postings`, paginated, `releasedDate`), Ashby (`jobs.ashbyhq.com/{slug}` HTML with embedded `window.__appData` JSON, `publishedDate`). Curated 17 German tech companies. `_is_fresh()` returns True when date is None (false positives > false negatives).
+- **Parallel pipeline execution** — all 8 platform fetchers run simultaneously via `ThreadPoolExecutor(max_workers=8)`. Runtime: 27s (was 191s sequential, 7x speedup). LinkedIn internally parallelizes 10 roles with `max_workers=5` + 429 retry with 3s backoff. I/O bound work — GIL released during requests.
+
+### Changed
+- **Pipeline cost reduced from ~$0.54/run to ~$0.04/run** (93% reduction). Only Indeed still uses Apify ($0.04). LinkedIn, Arbeitnow, Startup.jobs, Xing, Stepstone, Glassdoor, ATS Direct all free.
+- **Pipeline steps: 7 → 9** (added LinkedIn free, ATS Direct). Execution is now parallel — all platforms launch simultaneously instead of sequential `[1/9]`–`[9/9]`.
+- **Xing freshness fix**: jobs with no `dateTime` attribute (sponsored/promoted listings) were being **skipped** (false negative). Now **included** — only jobs with a confirmed date older than 24h are rejected. Aligned with "false positives > false negatives" rule. Result: Xing went from 4 jobs to 267 (0 senior titles, all entry-level/internship/working-student).
+
+### Freshness Audit (all 9 sources)
+| Platform | Server-side filter | Post-filter | No-date behavior |
+|---|---|---|---|
+| Arbeitnow | — | `created_at` vs 24h | N/A (API always has timestamp) |
+| Startup.jobs | — | `timestamp` vs cutoff | Include (FP > FN) |
+| Xing | — | `<time dateTime>` vs cutoff | Include ✅ (was skip — fixed) |
+| Stepstone | `ag=age_1` (24h) | `parse_stepstone_timeago()` vs cutoff | Include (defaults to now) |
+| Glassdoor | — | `ageInDays == 0` from RSC payload | **Skip** (Glassdoor exception — see below) |
+| LinkedIn free | `f_TPR=r86400` (24h) | `posted_at` datetime vs cutoff | Include (safety net only) |
+| Indeed | `datePosted='1'` (unreliable) | `datePublished` vs cutoff | Include (FP > FN) |
+| ATS: Greenhouse | — | `first_published` vs cutoff | Include (via `_is_fresh`) |
+| ATS: SmartRecruiters | — | `releasedDate` vs cutoff | Include (via `_is_fresh`) |
+| ATS: Ashby | — | `publishedDate` vs cutoff | Include (via `_is_fresh`) |
+
+### Glassdoor Exception
+Glassdoor's SSR IGNORES the `fromAge=1` URL parameter and serves unfiltered results (0/30 fresh, 16/30 stale at 15-179 days old in live testing). The `ageInDays == 0` filter is the ONLY barrier against stale jobs. Jobs missing from `age_lookup` are from an unfiltered result set and more likely old than fresh. Unlike other platforms where "no date = include" (false positives > false negatives), Glassdoor **skips** jobs with unverified `ageInDays`. Verified 2026-08-23: including None jobs let 42 unconfirmed jobs through with 0 confirmed fresh — all were `ageInDays=None`. Reverted to skip.
+
+### Rejected Alternatives
+- **Common Crawl slug harvester** (`slug.json`) — over-engineered for a daily Germany data/AI scraper. Curated list of 17 German tech companies is sufficient.
+- **Lever ATS** — API works (`api.lever.co/v0/postings/{slug}?mode=json`) but all 40+ tested company slugs return 404 or 0 postings.
+- **Teamtailor/Workable ATS** — auth-gated, no public API.
+- **BambooHR/Recruitee/Breezy ATS** — JS-rendered, no clean API.
+- **Parallel task agents** — considered for per-platform scraping, but ThreadPoolExecutor gives same speedup without agent spawning overhead. I/O bound work doesn't need independent reasoning per worker.
+
 ## [2026-08-21]
 
 ### Added

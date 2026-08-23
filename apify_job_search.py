@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Apify Job Fetcher, Deduplicator & Dated CSV Exporter for OMP Session
-Platforms: LinkedIn, Indeed, Arbeitnow, Startup.jobs, Xing, Stepstone, Glassdoor (Kununu dropped — actor returns 0 results)
+Platforms: LinkedIn (free HTML), Indeed (Apify), Arbeitnow, Startup.jobs, Xing, Stepstone, Glassdoor, ATS Direct (Greenhouse/SmartRecruiters/Ashby)
 Filters: Freshness (<24h), Experience (<=2 yrs), Germany location guard, Working Student (Hamburg & Kiel ONLY),
          Internships (Germany-wide), Title relevance (data/analytics/AI/SQL/Python keywords)
 Output Path: /home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/Job_Search_<Month>_<Day>_<Year>.csv
@@ -520,18 +520,20 @@ def fetch_xing_jobs():
                 seen_urls.add(job_url)
                 role_raw += 1
 
-                # Date — ISO datetime from <time dateTime="..."> (sponsored jobs lack this)
+                # Date — ISO datetime from <time dateTime="..."> (sponsored jobs lack this).
+                # Per "false positives > false negatives" rule: if no date or unparseable,
+                # include the job (let title/seniority filters handle it, cross-run dedup
+                # catches repeats). Only reject jobs with a confirmed date older than 24h.
                 date_m = re.search(r'dateTime="([^"]+)"', card)
-                if not date_m:
-                    continue  # skip sponsored/no-date listings
+                posted_dt = None
+                if date_m:
+                    try:
+                        posted_dt = datetime.fromisoformat(date_m.group(1).replace("Z", "+00:00"))
+                    except ValueError:
+                        posted_dt = None
 
-                try:
-                    posted_dt = datetime.fromisoformat(date_m.group(1).replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-
-                if posted_dt < cutoff:
-                    continue  # older than 24h
+                if posted_dt and posted_dt < cutoff:
+                    continue  # confirmed stale — skip
 
                 # Title
                 title_m = re.search(r'job-teaser-list-title">([^<]+)<', card)
@@ -563,7 +565,7 @@ def fetch_xing_jobs():
                     "title": title,
                     "company": company,
                     "location": location,
-                    "posted_at": posted_dt.isoformat(),
+                    "posted_at": posted_dt.isoformat() if posted_dt else "Last 24h",
                     "exp_required": "<= 2 Years",
                     "match_score": f"{compute_match_score(title)}%",
                     "job_url": f"https://www.xing.com{job_url}",
@@ -860,10 +862,18 @@ def fetch_glassdoor_jobs():
                     continue
                 jl_id = jl_m.group(1)
 
-                # Filter by ageInDays — only keep jobs posted today (ageInDays == 0)
+                # Filter by ageInDays — only keep jobs posted today (ageInDays == 0).
+                # GLASSDOOR EXCEPTION: Unlike other platforms where "no date = include"
+                # (false positives > false negatives), Glassdoor's SSR IGNORES the
+                # fromAge URL param and serves unfiltered results (0/30 fresh, 16/30
+                # stale at 15-179 days old in live testing). The ageInDays filter is
+                # the ONLY barrier against stale jobs. Jobs missing from age_lookup
+                # are from an unfiltered result set and more likely old than fresh.
+                # Verified 2026-08-23: including None jobs let 42 unconfirmed jobs
+                # through with 0 confirmed fresh — all were ageInDays=None.
                 age_in_days = age_lookup.get(jl_id)
                 if age_in_days is None:
-                    continue  # can't verify freshness — skip
+                    continue  # can't verify freshness — skip (Glassdoor SSR is unfiltered)
                 if age_in_days > 0:
                     role_stale += 1
                     continue  # stale job — skip
@@ -883,8 +893,9 @@ def fetch_glassdoor_jobs():
                 # Location not in JSON-LD — default to Germany (search is Germany-wide)
                 location = "Germany"
 
-                # posted_at based on ageInDays (0 = today)
+                # posted_at based on ageInDays (0 = today, always int here — None was filtered above)
                 posted_dt = datetime.now(timezone.utc) - timedelta(days=age_in_days)
+                posted_at_str = posted_dt.isoformat()
 
                 # Description not available from search page
                 desc = ""
@@ -901,7 +912,7 @@ def fetch_glassdoor_jobs():
                     "title": title,
                     "company": company,
                     "location": location,
-                    "posted_at": posted_dt.isoformat(),
+                    "posted_at": posted_at_str,
                     "exp_required": "<= 2 Years",
                     "match_score": f"{compute_match_score(title)}%",
                     "job_url": job_url,
@@ -1005,6 +1016,153 @@ def run_apify_actor(actor_id: str, run_input: dict, label: str = "Apify Actor", 
     except Exception as e:
         print(f"[!] Failed to fetch dataset items for {label}: {e}", flush=True)
         return []
+
+def fetch_linkedin_jobs_free():
+    """Fetch LinkedIn jobs via free HTML scraping (no Apify, $0 cost).
+    Scrapes the public LinkedIn jobs search page with f_TPR=r86400 (24h filter).
+
+    Multi-city search strategy: LinkedIn caps results at 60 per page with no
+    pagination (start= parameter is ignored). Searching "Germany" alone misses
+    jobs beyond the first 60. To maximize coverage, each role is searched across
+    multiple German cities — city-level results have different rankings and
+    overlap only partially with the Germany-wide search.
+
+    Parallelism: 10 search roles run in parallel via ThreadPoolExecutor (I/O bound
+    — GIL released during requests). Each role scrapes 6 locations sequentially
+    (0.5s polite delay between locations). Total time: ~14s (was 83s sequential).
+
+    Verified 2026-08-23: Germany-only gives 60/role (277 unique across 10 roles).
+    Multi-city (6 locations) gives 184/role (3.1x more coverage).
+
+    Tradeoff vs paid Apify actor:
+    - No job descriptions (search page only). Description-based seniority filter
+      (EXCLUDED_EXP_PATTERNS) can't match — MORE permissive, not less. Title-based
+      EXCLUDED_TITLE_PATTERNS still catches Senior/Lead/Manager in titles.
+    - No pagination, but multi-city strategy recovers more jobs than the paid actor's
+      count=500 cap in practice (184-211 unique/role vs 500 total across all roles).
+    """
+    from bs4 import BeautifulSoup
+    from urllib.parse import urlencode
+
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Multi-city search: Germany-wide + major tech hubs.
+    LINKEDIN_LOCATIONS = ["Germany", "Berlin", "Munich", "Hamburg", "Frankfurt", "Cologne"]
+
+    def _scrape_role(role: str) -> list[dict]:
+        """Scrape one role across all locations. Returns jobs for this role only."""
+        role_jobs = []
+        for loc in LINKEDIN_LOCATIONS:
+            params = {
+                "keywords": role,
+                "location": loc,
+                "f_TPR": "r86400",   # last 24h (server-side filter)
+                "sortBy": "DD",       # date descending
+            }
+            url = f"https://www.linkedin.com/jobs/search/?{urlencode(params)}"
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=15)
+                if resp.status_code == 429:
+                    # Rate limited — back off and retry once
+                    time.sleep(3)
+                    resp = requests.get(url, headers=HEADERS, timeout=15)
+                resp.raise_for_status()
+            except Exception as exc:
+                print(f"[!] LinkedIn free scrape failed for '{role}' / '{loc}': {exc}")
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            for card in soup.select("div.base-card"):
+                title_el = card.select_one("h3.base-search-card__title")
+                company_el = card.select_one("h4.base-search-card__subtitle")
+                location_el = card.select_one("span.job-search-card__location")
+                link_el = card.select_one("a.base-card__full-link")
+                date_el = card.select_one("time")
+
+                if not title_el or not link_el:
+                    continue
+
+                title = title_el.get_text(strip=True)
+                job_url = link_el.get("href", "").split("?")[0]
+                company = company_el.get_text(strip=True) if company_el else "Unknown"
+                card_location = location_el.get_text(strip=True) if location_el else loc
+                posted_raw = date_el.get("datetime", "") if date_el else ""
+
+                desc = ""
+                is_valid, role_type = check_experience_and_location(title, desc, card_location)
+                if not is_valid:
+                    continue
+
+                # Safety-net freshness post-filter
+                if posted_raw:
+                    posted_dt = None
+                    try:
+                        posted_dt = datetime.fromisoformat(posted_raw.replace("Z", "+00:00"))
+                        if posted_dt.tzinfo is None:
+                            posted_dt = posted_dt.replace(tzinfo=timezone.utc)
+                    except (ValueError, TypeError):
+                        try:
+                            posted_dt = datetime.strptime(posted_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        except (ValueError, TypeError):
+                            pass
+                    if posted_dt:
+                        now = datetime.now(timezone.utc)
+                        cutoff = now - timedelta(hours=FRESHNESS_HOURS)
+                        if posted_dt.hour == 0 and posted_dt.minute == 0:
+                            posted_dt = posted_dt.replace(hour=23, minute=59, second=59)
+                        if posted_dt < cutoff:
+                            continue
+
+                role_jobs.append({
+                    "language": detect_language(title),
+                    "job_board": "LinkedIn",
+                    "role_type": role_type,
+                    "title": title,
+                    "company": company,
+                    "location": card_location,
+                    "posted_at": posted_raw or "Last 24h",
+                    "exp_required": "<= 2 Years",
+                    "match_score": f"{compute_match_score(title)}%",
+                    "job_url": job_url,
+                    "description": "",
+                })
+
+            time.sleep(0.5)  # polite delay between locations
+
+        print(f"    LinkedIn free '{role}': {len(role_jobs)} jobs (6 locations)", flush=True)
+        return role_jobs
+
+    # Run roles in parallel with limited concurrency to avoid LinkedIn 429 rate
+    # limiting. 10 concurrent roles × 6 locations = 60 simultaneous requests
+    # triggers rate limiting. 5 workers keeps peak concurrency manageable
+    # (~30 requests over ~14s = ~2 req/s) while still 6x faster than sequential.
+    all_role_jobs = []
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_scrape_role, role): role for role in SEARCH_ROLES}
+        for future in as_completed(futures):
+            try:
+                all_role_jobs.extend(future.result())
+            except Exception as exc:
+                print(f"[!] LinkedIn role error: {exc}", flush=True)
+
+    # Cross-role URL dedup (each role scraped independently, URLs may overlap)
+    seen_urls = set()
+    jobs = []
+    for job in all_role_jobs:
+        url = job["job_url"]
+        if url not in seen_urls:
+            seen_urls.add(url)
+            jobs.append(job)
+
+    return jobs
 
 def fetch_linkedin_jobs():
     """Fetch LinkedIn jobs via curious_coder/linkedin-jobs-scraper using search URLs (f_TPR=r86400 = last 24h).
@@ -1203,50 +1361,58 @@ def convert_csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
 
 def main():
     print("=== Apify Job Fetcher & Dated CSV Exporter ===")
-    print(f"    LinkedIn: count=500 total, maxTotalChargeUsd=$0.60")
+    print(f"    LinkedIn: FREE HTML scraping (no Apify, $0, 10 roles parallel)")
     print(f"    Indeed: title=<role>, limit=50, parallel (10 roles)")
-    print(f"    Xing: free HTML scraping (cloudscraper, no Apify)")
-    print(f"    Stepstone: free HTML scraping (cloudscraper, no Apify)")
-    print(f"    Startup.jobs: free HTML scraping (cloudscraper, no Apify)")
-    print(f"    Glassdoor: free HTML scraping (cloudscraper, JSON-LD, no Apify)")
-    print(f"    Kununu: DROPPED (actor returns 0 results, broken)")
+    print(f"    Xing/Stepstone/Glassdoor/Startup.jobs: free HTML scraping (parallel)")
+    print(f"    ATS Direct: Greenhouse/SmartRecruiters/Ashby (free public APIs)")
+    print(f"    All 9 platforms run in parallel via ThreadPoolExecutor")
+
+    from ats_scraper import fetch_all_ats
+
+    # Each platform fetcher runs in its own thread.
+    # I/O bound work (HTTP requests + parsing) — GIL released during I/O,
+    # so threads give near-linear speedup. Each fetcher is independent:
+    # no shared mutable state, results collected after all complete.
+    PLATFORM_FETCHERS = [
+        ("Arbeitnow",    fetch_arbeitnow_jobs),
+        ("Startup.jobs", fetch_startupjobs_jobs),
+        ("Xing",         fetch_xing_jobs),
+        ("Stepstone",    fetch_stepstone_jobs),
+        ("Glassdoor",    fetch_glassdoor_jobs),
+        ("LinkedIn",     fetch_linkedin_jobs_free),
+        ("Indeed",       fetch_indeed_jobs),
+        ("ATS Direct",   fetch_all_ats),
+    ]
+
     all_jobs = []
     platform_counts = {}
+    errors = {}
 
-    print("[1/7] Fetching Arbeitnow (free API)...")
-    arbeitnow_jobs = fetch_arbeitnow_jobs()
-    all_jobs.extend(arbeitnow_jobs)
-    platform_counts["Arbeitnow"] = len(arbeitnow_jobs)
+    print(f"\n  Launching {len(PLATFORM_FETCHERS)} platform fetchers in parallel...")
+    start_time = time.time()
 
-    print("[2/7] Fetching Startup.jobs (free HTML scraping)...")
-    startupjobs_jobs = fetch_startupjobs_jobs()
-    all_jobs.extend(startupjobs_jobs)
-    platform_counts["Startup.jobs"] = len(startupjobs_jobs)
+    with ThreadPoolExecutor(max_workers=len(PLATFORM_FETCHERS)) as executor:
+        future_to_name = {
+            executor.submit(fetcher): name
+            for name, fetcher in PLATFORM_FETCHERS
+        }
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                jobs = future.result()
+                all_jobs.extend(jobs)
+                platform_counts[name] = len(jobs)
+                print(f"  [✓] {name}: {len(jobs)} jobs ({time.time() - start_time:.1f}s)", flush=True)
+            except Exception as exc:
+                platform_counts[name] = 0
+                errors[name] = str(exc)
+                print(f"  [!] {name}: ERROR — {exc} ({time.time() - start_time:.1f}s)", flush=True)
 
-    print("[3/7] Fetching Xing (free HTML scraping, 10 roles × 3 pages)...")
-    xing_jobs = fetch_xing_jobs()
-    all_jobs.extend(xing_jobs)
-    platform_counts["Xing"] = len(xing_jobs)
+    elapsed = time.time() - start_time
+    print(f"\n  All platforms complete in {elapsed:.1f}s")
 
-    print("[4/7] Fetching Stepstone (free HTML scraping, 10 roles × 3 pages)...")
-    stepstone_jobs = fetch_stepstone_jobs()
-    all_jobs.extend(stepstone_jobs)
-    platform_counts["Stepstone"] = len(stepstone_jobs)
+    print("\n  Deduplication...")
 
-    print("[5/7] Fetching Glassdoor (free HTML scraping, 10 roles × 3 pages, JSON-LD)...")
-    glassdoor_jobs = fetch_glassdoor_jobs()
-    all_jobs.extend(glassdoor_jobs)
-    platform_counts["Glassdoor"] = len(glassdoor_jobs)
-
-    print("[6/7] Fetching LinkedIn (10 roles, count=500 total)...")
-    linkedin_jobs = fetch_linkedin_jobs()
-    all_jobs.extend(linkedin_jobs)
-    platform_counts["LinkedIn"] = len(linkedin_jobs)
-
-    print("[7/7] Fetching Indeed (10 roles, limit=50, parallel)...")
-    indeed_jobs = fetch_indeed_jobs()
-    all_jobs.extend(indeed_jobs)
-    platform_counts["Indeed"] = len(indeed_jobs)
 
     # Deduplication (within this run)
     seen_keys = set()
@@ -1278,7 +1444,7 @@ def main():
 
     print(f"Per-platform: {platform_counts}")
     print(f"Cross-run dedup: compared against previous run ({jobs_scanned} jobs), removed {cross_run_duplicates} already-seen job(s)")
-    print(f"Est. Apify cost: ~${0.50 + 0.04:.3f} (LinkedIn ~$0.50 + Indeed ~$0.04) + Arbeitnow/Startup.jobs/Xing/Stepstone/Glassdoor FREE")
+    print(f"Est. Apify cost: ~${0.04:.3f} (Indeed only) + LinkedIn/Arbeitnow/Startup.jobs/Xing/Stepstone/Glassdoor/ATS Direct ALL FREE")
 
     # Format Date String: e.g. Aug_4_2026
     date_str = now.strftime("%b_%d_%Y").replace("_0", "_")

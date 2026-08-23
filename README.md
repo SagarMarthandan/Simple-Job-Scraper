@@ -1,12 +1,12 @@
 # Jobscraper
 
-Automated job search pipeline that fetches fresh postings (< 24 hours old) from seven platforms, filters them for entry-level data/analytics/AI roles in Germany, and exports a sortable CSV/XLSX/JSON/MD report.
+Automated job search pipeline that fetches fresh postings (< 24 hours old) from **9 sources across 8 platforms**, filters them for entry-level data/analytics/AI roles in Germany, and exports a sortable CSV/XLSX/JSON/MD report. All platforms run in **parallel** via `ThreadPoolExecutor` — total runtime ~27s (was 191s sequential).
 
 ## Quick Start
 
 ```bash
 cd /home/sagar/Skills/Jobscraper
-pip install cloudscraper openpyxl
+pip install cloudscraper requests openpyxl beautifulsoup4
 python3 apify_job_search.py
 ```
 
@@ -14,24 +14,31 @@ Output is written to `Job Search/YYYY-MM-DD/`.
 
 ## What It Does
 
-The pipeline runs seven platform fetchers in sequence, applies a multi-stage filter chain, deduplicates, and exports four deliverable files:
+The pipeline launches all 8 platform fetchers simultaneously, applies a multi-stage filter chain, deduplicates within and across runs, and exports four deliverable files:
 
 ```
-7 platforms → title relevance → seniority/experience → Germany location → working-student city → within-run dedup → cross-run dedup → export
+8 platforms in parallel → title relevance → seniority/experience → Germany location → working-student city → within-run dedup → cross-run dedup → export
 ```
 
 ### Platforms
 
 | Platform | Source | Cost/run | Method |
 |---|---|---|---|
-| LinkedIn | Apify: `curious_coder/linkedin-jobs-scraper` | ~$0.50 | Apify actor, `count=500`, 10 role URLs, `f_TPR=r86400` (24h filter) + safety-net post-filter on `postedAt` |
-| Indeed | Apify: `valig/indeed-jobs-scraper` | ~$0.05 | Apify actor, `limit=50` per role, 10 roles in parallel, `datePosted='1'` (unreliable — post-filter on `datePublished` enforces 24h) |
-| Arbeitnow | Free REST API | $0.00 | `https://www.arbeitnow.com/api/job-board-api` |
-| Startup.jobs | Free HTML scraping | $0.00 | `cloudscraper`, 6 category pages |
-| Xing | Free HTML scraping | $0.00 | `requests`, 10 roles × 3 pages, `data-testid` attributes (AWS CloudFront — no anti-bot) |
-| Stepstone | Free HTML scraping | $0.00 | `requests`, 10 roles × 3 pages, path-based URLs with `ag=age_1` 24h filter (Akamai CDN — cloudscraper hangs, plain requests works) |
-| Glassdoor | Free HTML scraping | $0.00 | `cloudscraper` (chrome emulation), 10 roles × 3 pages, JSON-LD ItemList parsing, `_KE` company extraction, `ageInDays` filtering from RSC payload (`fromAge=1` ignored by SSR), 8x retry for Cloudflare |
-| **Total** | | **~$0.55** | |
+| LinkedIn | Free HTML scraping | $0.00 | Public jobs search page, `f_TPR=r86400` (24h server filter) + post-filter. Multi-city search (6 locations × 10 roles). 10 roles in parallel (`ThreadPoolExecutor(max_workers=5)` + 429 retry). No descriptions — title-only filtering (more permissive). |
+| Indeed | Apify: `valig/indeed-jobs-scraper` | ~$0.04 | Apify actor, `limit=50` per role, 10 roles in parallel, `datePosted='1'` (unreliable — post-filter on `datePublished` enforces 24h) |
+| Arbeitnow | Free REST API | $0.00 | `https://www.arbeitnow.com/api/job-board-api`, filters by `created_at` timestamp |
+| Startup.jobs | Free HTML scraping | $0.00 | `cloudscraper`, 7 category pages, `data-post-template-target` attributes |
+| Xing | Free HTML scraping | $0.00 | `requests`, 10 roles × 3 pages, `data-testid` attributes (AWS CloudFront — no anti-bot). No-date jobs included (sponsored listings are real jobs). |
+| Stepstone | Free HTML scraping | $0.00 | `requests`, 10 roles × 3 pages, path-based URLs with `ag=age_1` 24h server filter + `parse_stepstone_timeago()` post-filter (Akamai CDN — cloudscraper hangs, plain requests works) |
+| Glassdoor | Free HTML scraping | $0.00 | `cloudscraper` (chrome emulation), 10 roles × 3 pages, JSON-LD ItemList parsing, `_KE` company extraction, `ageInDays` filtering from RSC payload. **8x retry for Cloudflare.** `fromAge=1` ignored by SSR — `ageInDays==0` is the only freshness barrier. Jobs with unverified `ageInDays` are **skipped** (Glassdoor exception — SSR serves 15-179 day-old jobs). |
+| ATS Direct | Free public JSON APIs | $0.00 | Greenhouse (`boards-api.greenhouse.io`), SmartRecruiters (`api.smartrecruiters.com`), Ashby (`jobs.ashbyhq.com` embedded JSON). 17 curated German tech companies. No auth, no HTML selectors — stable documented APIs. |
+| **Total** | | **~$0.04** | |
+
+### Parallelization
+
+All 8 platform fetchers run simultaneously via `ThreadPoolExecutor(max_workers=8)`. Each fetcher is independent — no shared mutable state, results collected after all complete. LinkedIn internally parallelizes its 10 search roles with `max_workers=5` (limited to avoid 429 rate limiting) + 3s backoff retry.
+
+Runtime: **~27s** (was 191s sequential — 7x speedup). I/O bound work — Python releases the GIL during HTTP requests, so threads give near-linear speedup.
 
 ### Filter Chain
 
@@ -39,8 +46,25 @@ Every job passes through `check_experience_and_location()` which applies, in ord
 
 1. **Title relevance** (`is_relevant_title`) — rejects titles with no data/analytics/AI/SQL/Python keyword. Catches actor false positives (Indeed returning "Nachtwächter" for "Data Engineer" searches).
 2. **Seniority ceiling** — rejects Senior, Lead, Principal, Staff, Manager, Head, Architect, Director titles and descriptions requiring > 2 years experience.
-3. **Germany location guard** — rejects jobs whose location explicitly names a non-Germany country (30 countries in EN/DE). Added 2026-08-07 after LinkedIn AI search softened `location=Germany` into a natural-language hint. Ambiguous locations (city-only, "Remote") pass through.
+3. **Germany location guard** — rejects jobs whose location explicitly names a non-Germany country (30 countries in EN/DE). Ambiguous locations (city-only, "Remote") pass through.
 4. **Working-student city restriction** — working student roles restricted to Hamburg and Kiel only. Full-time and internships are Germany-wide.
+
+### Freshness Filtering (24h, all 9 sources)
+
+| Platform | Server-side filter | Post-filter | No-date behavior |
+|---|---|---|---|
+| Arbeitnow | — | `created_at` vs 24h cutoff | N/A (API always has timestamp) |
+| Startup.jobs | — | `timestamp` vs cutoff | Include (false positives > false negatives) |
+| Xing | — | `<time dateTime>` vs cutoff | Include (sponsored listings are real jobs) |
+| Stepstone | `ag=age_1` (24h) | `parse_stepstone_timeago()` vs cutoff | Include (defaults to now) |
+| Glassdoor | — | `ageInDays == 0` from RSC payload | **Skip** (Glassdoor exception — SSR serves stale jobs) |
+| LinkedIn | `f_TPR=r86400` (24h) | `posted_at` datetime vs cutoff | Include (safety net only) |
+| Indeed | `datePosted='1'` (unreliable) | `datePublished` vs cutoff | Include (false positives > false negatives) |
+| ATS: Greenhouse | — | `first_published` vs cutoff | Include (via `_is_fresh`) |
+| ATS: SmartRecruiters | — | `releasedDate` vs cutoff | Include (via `_is_fresh`) |
+| ATS: Ashby | — | `publishedDate` vs cutoff | Include (via `_is_fresh`) |
+
+**Glassdoor exception**: Glassdoor's SSR ignores the `fromAge=1` URL parameter and serves unfiltered results (0/30 fresh, 16/30 stale at 15-179 days old in live testing). The `ageInDays==0` filter from the RSC payload is the only barrier against stale jobs. Unlike other platforms where missing dates mean "include" (false positives > false negatives), Glassdoor skips jobs with unverified `ageInDays` because they come from an unfiltered result set and are more likely old than fresh.
 
 ### Target Role Profiles (10 core roles)
 
@@ -68,6 +92,8 @@ Files written to `Job Search/YYYY-MM-DD/` per run:
 | `Job_Search_<Month>_<Day>_<Year>.xlsx` | Frozen header, autofilter dropdowns, clickable `job_url` hyperlinks, numeric `match_score` |
 | `JOB_OPENINGS_LAST_24H.md` | Markdown summary table with apply links |
 
+**CSV columns:** `language`, `job_board`, `role_type`, `title`, `company`, `location`, `posted_at`, `exp_required`, `match_score`, `job_url`
+
 ### Cross-Run Deduplication
 
 Each run compares against the **immediate previous run** (e.g. Friday vs Thursday, or vs Wednesday if Thursday was skipped) and removes jobs already seen. This prevents duplicates across consecutive daily sheets — with 24h freshness, run times drift and windows overlap (31.5% of jobs were duplicates before this was added).
@@ -79,13 +105,11 @@ Each run compares against the **immediate previous run** (e.g. Friday vs Thursda
 
 Same-day reruns are handled automatically (today's own earlier CSV is the most recent folder).
 
-**CSV columns:** `language`, `job_board`, `role_type`, `title`, `company`, `location`, `posted_at`, `exp_required`, `match_score`, `job_url`
-
 ## Configuration
 
 ### Apify Token
 
-Read from (in order of precedence):
+Only needed for Indeed (~$0.04/run). Read from (in order of precedence):
 1. `APIFY_TOKEN` environment variable
 2. `config.json` in the skill root (`{"APIFY_TOKEN": "..."}`)
 3. `~/.apify/auth.json` (Apify CLI auth)
@@ -94,11 +118,12 @@ Read from (in order of precedence):
 
 - Python >= 3.10
 - `cloudscraper` — bypasses Cloudflare for Startup.jobs, Glassdoor
-- `requests` — HTTP client for Xing (AWS CloudFront) and Stepstone (Akamai) — no anti-bot challenge
+- `requests` — HTTP client for Xing (AWS CloudFront), Stepstone (Akamai), LinkedIn (public search)
 - `openpyxl` — XLSX export with autofilter and hyperlinks
+- `beautifulsoup4` — HTML parsing for LinkedIn free scraper
 
 ```bash
-pip install cloudscraper requests openpyxl
+pip install cloudscraper requests openpyxl beautifulsoup4
 ```
 
 ## Project Structure
@@ -108,15 +133,14 @@ Jobscraper/
 ├── README.md                # this file
 ├── CHANGELOG.md             # version history
 ├── SKILL.md                 # OMP skill definition (trigger keywords, execution instructions)
-├── apify_job_search.py      # main pipeline script (~1340 lines, self-contained)
+├── apify_job_search.py      # main pipeline script (~1500 lines, 8 platform fetchers + dedup + export)
+├── ats_scraper.py           # ATS direct scraper (Greenhouse/SmartRecruiters/Ashby, ~430 lines)
 ├── dedup_existing_sheets.py # standalone cleanup tool for retroactive cross-run dedup
 ├── apify_job_search.md      # detailed technical documentation (actor schemas, gotchas, cost analysis)
 ├── config.json              # Apify token (gitignored)
 ├── .gitignore
 └── Job Search/              # output directory (gitignored, one subfolder per run date)
-    ├── 2026-08-06/
-    ├── 2026-08-05/
-    └── 2026-08-04/
+    └── 2026-08-23/
 ```
 
 ## How It Works
@@ -125,70 +149,74 @@ Jobscraper/
 
 ```mermaid
 graph TD
-    A[main] --> B[1/7 Arbeitnow API]
-    A --> C[2/7 Startup.jobs HTML]
-    A --> D[3/7 Xing HTML]
-    A --> E[4/7 Stepstone HTML]
-    A --> F[5/7 Glassdoor HTML]
-    A --> G[6/7 LinkedIn Apify]
-    A --> H[7/7 Indeed Apify]
-    B --> I[check_experience_and_location]
-    C --> I
-    D --> I
-    E --> I
-    F --> I
-    G --> I
-    H --> I
-    I --> J[Within-run dedup by company::title]
-    J --> L[Cross-run dedup vs previous run]
-    L --> K[Export CSV + JSON + MD + XLSX]
+    A[main ThreadPoolExecutor] --> B[Arbeitnow API]
+    A --> C[Startup.jobs HTML]
+    A --> D[Xing HTML]
+    A --> E[Stepstone HTML]
+    A --> F[Glassdoor HTML]
+    A --> G[LinkedIn HTML 5-thread pool]
+    A --> H[Indeed Apify 8-thread pool]
+    A --> I[ATS Direct APIs]
+    B --> J[check_experience_and_location]
+    C --> J
+    D --> J
+    E --> J
+    F --> J
+    G --> J
+    H --> J
+    I --> J
+    J --> K[Within-run dedup by company::title]
+    K --> L[Cross-run dedup vs previous run]
+    L --> M[Export CSV + JSON + MD + XLSX]
 ```
 
 ### Key Functions
 
-| Function | Purpose |
-|---|---|
-| `fetch_arbeitnow_jobs()` | Free REST API, filters by `created_at` timestamp |
-| `fetch_startupjobs_jobs()` | `cloudscraper` HTML parse, `data-post-template-target` attributes |
-| `fetch_xing_jobs()` | `cloudscraper` HTML parse, `data-testid` attributes, `<time dateTime>` ISO timestamps |
-| `fetch_stepstone_jobs()` | `cloudscraper` HTML parse, `data-at` SSR attributes, German relative time parsing |
-| `fetch_glassdoor_jobs()` | `cloudscraper` (chrome emulation), JSON-LD ItemList parsing, `_KE` offset company extraction, 8x Cloudflare retry |
-| `fetch_linkedin_jobs()` | Apify actor, 10 role URLs with `f_TPR=r86400` 24h filter + safety-net post-filter on `postedAt` (date-only treated as end-of-day) |
-| `fetch_indeed_jobs()` | Apify actor, 10 roles in parallel via `ThreadPoolExecutor`, post-filter on `datePublished` (`datePosted='1'` unreliable) |
-| `run_apify_actor()` | Starts actor, polls status, fetches dataset, `maxTotalChargeUsd` safety cap |
-| `check_experience_and_location()` | Multi-stage filter: title relevance → seniority → Germany → city |
-| `is_relevant_title()` | Regex check for data/analytics/AI keywords in title |
-| `classify_role_type()` | Working Student / Internship / Full-Time classification |
-| `compute_match_score()` | Percentage match against core tech stack (dbt, airflow, spark, python, sql, etc.) |
-| `normalize_key()` | Dedup key: `company::title` with legal suffixes stripped |
-| `normalize_job_url()` | Cross-run URL identity: strips LinkedIn tracking params, preserves Indeed/Glassdoor job IDs |
-| `load_previous_run_keys()` | Loads URL + title keys from the most recent previous run for cross-run dedup |
-| `convert_csv_to_xlsx()` | openpyxl export with autofilter, frozen header, hyperlinks |
+| Function | File | Purpose |
+|---|---|---|
+| `fetch_arbeitnow_jobs()` | apify_job_search.py | Free REST API, filters by `created_at` timestamp |
+| `fetch_startupjobs_jobs()` | apify_job_search.py | `cloudscraper` HTML parse, `data-post-template-target` attributes |
+| `fetch_xing_jobs()` | apify_job_search.py | `requests` HTML parse, `data-testid` attributes, no-date jobs included |
+| `fetch_stepstone_jobs()` | apify_job_search.py | `requests` HTML parse, `data-at` SSR attributes, `ag=age_1` + German timeago parsing |
+| `fetch_glassdoor_jobs()` | apify_job_search.py | `cloudscraper` (chrome emulation), JSON-LD ItemList, `_KE` company extraction, `ageInDays` filtering, 8x Cloudflare retry |
+| `fetch_linkedin_jobs_free()` | apify_job_search.py | Free HTML scraping, multi-city (6 locations), 10 roles parallel (`max_workers=5`), 429 retry, cross-role URL dedup |
+| `fetch_indeed_jobs()` | apify_job_search.py | Apify actor, 10 roles in parallel via `ThreadPoolExecutor`, post-filter on `datePublished` |
+| `fetch_all_ats()` | ats_scraper.py | Orchestrator for Greenhouse/SmartRecruiters/Ashby fetchers |
+| `fetch_greenhouse()` | ats_scraper.py | Greenhouse public JSON API, `first_published` freshness |
+| `fetch_smartrecruiters()` | ats_scraper.py | SmartRecruiters public JSON API, paginated, `releasedDate` freshness |
+| `fetch_ashby()` | ats_scraper.py | Ashby embedded `window.__appData` JSON, `publishedDate` freshness |
+| `_is_fresh()` | ats_scraper.py | Freshness check — returns True when date is None (false positives > false negatives) |
+| `check_experience_and_location()` | apify_job_search.py | Multi-stage filter: title relevance → seniority → Germany → city |
+| `compute_match_score()` | apify_job_search.py | Percentage match against core tech stack (dbt, airflow, spark, python, sql, etc.) |
+| `normalize_key()` | apify_job_search.py | Dedup key: `company::title` with legal suffixes stripped |
+| `normalize_job_url()` | apify_job_search.py | Cross-run URL identity: strips LinkedIn tracking params, preserves Indeed/Glassdoor job IDs |
+| `load_previous_run_keys()` | apify_job_search.py | Loads URL + title keys from the most recent previous run for cross-run dedup |
+| `convert_csv_to_xlsx()` | apify_job_search.py | openpyxl export with autofilter, frozen header, hyperlinks |
 
 ## Customization
 
 This pipeline is configured for a specific candidate profile. To adapt it for another user, modify the following in **`SKILL.md`** and **`apify_job_search.py`**:
 
-### Role Types & Location Constraints (`SKILL.md` → Search Criteria §4)
+### Role Types & Location Constraints
 
 | Setting | Current value | Where to change |
 |---|---|---|
-| Full-Time / Part-Time / Entry-Level / Junior | Germany-wide | `SKILL.md` §4, `apify_job_search.py` → `check_experience_and_location()` |
-| Internships (Praktikum / Internship) | Germany-wide | `SKILL.md` §4, `apify_job_search.py` → `check_experience_and_location()` |
-| Working Student (Werkstudent / Working Student) | **Hamburg and Kiel only** | `SKILL.md` §4, `apify_job_search.py` → `check_experience_and_location()` §2b |
+| Full-Time / Part-Time / Entry-Level / Junior | Germany-wide | `apify_job_search.py` → `check_experience_and_location()` |
+| Internships (Praktikum / Internship) | Germany-wide | `apify_job_search.py` → `check_experience_and_location()` |
+| Working Student (Werkstudent / Working Student) | **Hamburg and Kiel only** | `apify_job_search.py` → `check_experience_and_location()` §2b |
 
-### Experience Ceiling (`SKILL.md` → Search Criteria §5)
+### Experience Ceiling
 
 Currently set to **<= 2 years**. Rejects Senior, Lead, Principal, Staff, Manager, Head, Architect, Director titles.
 
-To change this, edit in `apify_job_search.py`:
-- `MAX_EXP_YEARS` constant (line 70)
-- `EXCLUDED_TITLE_PATTERNS` regex (line 98) — the seniority title blacklist
-- `EXCLUDED_EXP_PATTERNS` regex list (line 103) — the description experience pattern matchers
+Edit in `apify_job_search.py`:
+- `MAX_EXP_YEARS` constant
+- `EXCLUDED_TITLE_PATTERNS` regex — the seniority title blacklist
+- `EXCLUDED_EXP_PATTERNS` regex list — the description experience pattern matchers
 
-### Target Role Profiles (`SKILL.md` → Search Criteria §6)
+### Target Role Profiles
 
-Currently 10 core roles. To change which roles are searched, edit the `SEARCH_ROLES` list in `apify_job_search.py` (line 51):
+Edit the `SEARCH_ROLES` list in `apify_job_search.py`:
 
 ```python
 SEARCH_ROLES = [
@@ -205,18 +233,33 @@ SEARCH_ROLES = [
 ]
 ```
 
-Also update the matching `SKILL.md` §6 list so the skill documentation stays in sync.
+### ATS Company Slugs
+
+Edit in `ats_scraper.py`:
+- `GREENHOUSE_SLUGS` — list of company slugs for Greenhouse API
+- `SMARTRECRUITERS_SLUGS` — list of company slugs for SmartRecruiters API (case-sensitive!)
+- `ASHBY_SLUGS` — list of company slugs for Ashby boards
+
+### LinkedIn Multi-City Search
+
+Edit `LINKEDIN_LOCATIONS` in `fetch_linkedin_jobs_free()`:
+
+```python
+LINKEDIN_LOCATIONS = ["Germany", "Berlin", "Munich", "Hamburg", "Frankfurt", "Cologne"]
+```
+
+"Remote" is excluded — it returns global jobs (6000+), flooding results with false positives.
 
 ### Other User-Specific Settings
 
 | Setting | Where | Current value |
 |---|---|---|
-| Candidate name | `SKILL.md` → Context, `apify_job_search.md` §1 | Sagar Marthandan |
-| Base location | `SKILL.md` → Context, `apify_job_search.md` §1 | Kiel, Germany |
+| Candidate name | `SKILL.md` → Context | Sagar Marthandan |
+| Base location | `SKILL.md` → Context | Kiel, Germany |
 | Working student cities | `apify_job_search.py` → `check_experience_and_location()` §2b | Hamburg, Kiel |
-| Match score tech stack | `apify_job_search.py` → `TECH_KEYWORDS` (line 111) | dbt, airflow, spark, pyspark, python, sql, gcp, bigquery, aws, azure, databricks, docker, kafka, postgresql, snowflake |
-| Title relevance keywords | `apify_job_search.py` → `DOMAIN_TITLE_KEYWORDS` (line 116) | data, analytics, AI, SQL, Python, BI, ML, ETL, etc. |
-| Output directory | `apify_job_search.py` → `JOB_SEARCH_DIR` (line 42) | `/home/sagar/Skills/Jobscraper/Job Search` |
+| Match score tech stack | `apify_job_search.py` → `TECH_KEYWORDS` | dbt, airflow, spark, pyspark, python, sql, gcp, bigquery, aws, azure, databricks, docker, kafka, postgresql, snowflake |
+| Title relevance keywords | `apify_job_search.py` → `DOMAIN_TITLE_KEYWORDS` | data, analytics, AI, SQL, Python, BI, ML, ETL, etc. |
+| Output directory | `apify_job_search.py` → `JOB_SEARCH_DIR` | `/home/sagar/Skills/Jobscraper/Job Search` |
 | Apify token | `config.json` or `APIFY_TOKEN` env var | user-specific |
 
 ## Detailed Documentation
