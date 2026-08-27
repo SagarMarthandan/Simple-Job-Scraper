@@ -102,8 +102,6 @@ GERMAN_REQUIRED_PATTERNS = [
     # "Muttersprache" / native speaker
     r'Muttersprache\s+Deutsch',
     r'(?:Deutsch|German)\s+as\s+a\s+(?:first\s+)?native\s+language',
-    # "Sehr gute Deutschkenntnisse" — usually means C1+
-    r'sehr\s+gute\s+Deutsch(?:kenntnisse|sprachkenntnisse)',
     # "Verhandlungssicher" — business-fluent, C1+
     r'(?:Deutsch|German)\s+verhandlungssicher',
     r'verhandlungssicher\s+in\s+Deutsch',
@@ -542,31 +540,21 @@ def verify_linkedin(job: dict) -> dict:
 # ── Indeed Verifier (plain requests) ─────────────────────────────────────────
 
 def verify_indeed(job: dict) -> dict:
-    """Verify an Indeed job via plain requests. Indeed job pages are public."""
+    """Verify an Indeed job using pre-fetched description from Apify dataset.
+
+    Indeed job pages (de.indeed.com/viewjob?jk=...) are behind a 401/403 auth
+    wall — both plain requests and cloudscraper fail. The Apify actor already
+    fetched the JD text during the scraper run; it's injected into the job dict
+    from the sibling JSON file by run_verification(). Use it directly.
+    """
     result = _empty_result()
-    url = job.get("job_url", "")
-    if not url:
+    desc = job.get("description", "")
+    if not desc:
+        # No pre-fetched description — can't verify, keep as unknown
         return result
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS,
-                            allow_redirects=True)
-        time.sleep(2)
-        if resp.status_code in (404, 410):
-            result["verified_active"] = "False"
-            return result
-        if resp.status_code != 200:
-            return result
-        html = resp.text
-        # Indeed closed jobs show "Diese Anzeige ist nicht mehr verfügbar" or redirect
-        lower_html = html.lower()
-        if "nicht mehr verfügbar" in lower_html or "no longer available" in lower_html:
-            result["verified_active"] = "False"
-            return result
-        result["verified_active"] = "True"
-        desc, jsonld = _extract_description_text(html)
-        result = _process_result(result, desc, jsonld)
-    except (requests.RequestException, requests.Timeout):
-        pass
+    # Job was found by Apify < 24h ago — it's active
+    result["verified_active"] = "True"
+    result = _process_result(result, desc)
     return result
 
 
@@ -1033,7 +1021,28 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         print(f"[!] No rows found in {csv_path}")
         return
 
-    print(f"[*] Loaded {len(rows)} jobs from {csv_path}")
+
+    # Load sibling JSON for pre-fetched descriptions (Indeed, Arbeitnow, Stepstone)
+    # Indeed job pages are behind 401/403 — use Apify-provided description instead
+    json_path = csv_path.with_suffix(".json")
+    if json_path.exists():
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                json_data = json.load(f)
+            url_to_desc = {}
+            for j in json_data:
+                if isinstance(j, dict) and j.get("description"):
+                    url_to_desc[j.get("job_url", "")] = j["description"]
+            injected = 0
+            for row in rows:
+                url = row.get("job_url", "")
+                if url in url_to_desc and not row.get("description"):
+                    row["description"] = url_to_desc[url]
+                    injected += 1
+            if injected:
+                print(f"[*] Injected descriptions from JSON for {injected} job(s)")
+        except (json.JSONDecodeError, OSError):
+            pass
 
     # Idempotency: skip rows already verified unless --force
     to_verify: list[tuple[int, dict]] = []

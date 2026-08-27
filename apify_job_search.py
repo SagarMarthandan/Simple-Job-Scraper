@@ -481,7 +481,7 @@ def fetch_arbeitnow_jobs():
                     "exp_required": "<= 2 Years",
                     "match_score": f"{score}%",
                     "job_url": item.get("url", ""),
-                    "description": desc[:500]
+                    "description": desc
                 })
     except Exception as e:
         print(f"[!] Error fetching Arbeitnow: {e}")
@@ -1401,7 +1401,7 @@ def fetch_indeed_jobs():
                 "exp_required": "<= 2 Years",
                 "match_score": f"{compute_match_score(f'{title} {desc}')}%",
                 "job_url": item.get("url") or item.get("jobUrl") or "",
-                "description": desc[:500]
+                "description": desc
             })
         return role_jobs
 
