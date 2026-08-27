@@ -94,16 +94,63 @@ Files written to `Job Search/YYYY-MM-DD/` per run:
 
 **CSV columns:** `language`, `job_board`, `role_type`, `title`, `company`, `location`, `posted_at`, `exp_required`, `match_score`, `job_url`
 
-### Cross-Run Deduplication
+### Deduplication (Three Tiers)
 
-Each run compares against the **immediate previous run** (e.g. Friday vs Thursday, or vs Wednesday if Thursday was skipped) and removes jobs already seen. This prevents duplicates across consecutive daily sheets — with 24h freshness, run times drift and windows overlap (31.5% of jobs were duplicates before this was added).
+The pipeline applies three dedup stages in sequence:
 
-| Key | Method | Catches |
-|---|---|---|
-| **URL** | `normalize_job_url()` — strips LinkedIn tracking params, preserves Indeed/Glassdoor job IDs | Same posting re-listed (URLs are unique) |
-| **Company + Title** | `normalize_key()` — same fuzzy key used for within-run dedup | LinkedIn re-lists (new URL per run, same job) + cross-platform dups (same job on LinkedIn vs Indeed) |
+| Tier | Stage | Method | Catches |
+|---|---|---|---|
+| 1 | **Within-run** | `normalize_key()` — enhanced normalization strips parentheticals, legal suffixes (`gmbh\|ag\|group\|gruppe\|international\|deutschland\|germany\|global\|e.g.`), seniority/gender markers (`senior\|junior\|m/w/d`), and REF codes (`REF99139A`). Exact match on `company::title`. | Same posting on same platform with name/title variants |
+| 2 | **Cross-platform** | `cross_platform_dedup()` — fuzzy matching across *different platforms only*. Company token overlap ≥ 0.5 (min-set denominator), title Jaccard similarity ≥ 0.6, location match (with city aliases: München/Munich, Köln/Cologne). Keeps higher-priority platform (LinkedIn > Xing > Stepstone > Indeed). | Same job reposted across LinkedIn/Xing/Stepstone/Indeed with company name variants (Bosch vs Bosch Gruppe, PENNY vs PENNY International) |
+| 3 | **Cross-run** | `load_previous_run_keys()` — compares against the immediate previous run using URL keys (all history) + title keys (previous run only). | Consecutive-day duplicates from 24h window overlap, LinkedIn re-lists (new URL per run, same job) |
 
 Same-day reruns are handled automatically (today's own earlier CSV is the most recent folder).
+
+## Job Verification (Optional Post-Step)
+
+After the pipeline exports the CSV, `verify_jobs.py` visits each job URL to filter out unsuitable listings **before** you start applying:
+
+```bash
+python3 verify_jobs.py                    # auto-finds latest CSV
+python3 verify_jobs.py --csv path/to.csv  # specific CSV
+python3 verify_jobs.py --force            # re-verify all rows
+```
+
+### What It Does
+
+1. **German C1+ filter (primary eliminator)** — scans job descriptions for hard German language requirements (`fließend Deutsch`, `C1 Niveau`, `Muttersprache Deutsch`, `verhandlungssicher`). Drops rows requiring C1+ German. Soft requirements (`Deutschkenntnisse wünschenswert`, `German is a plus`) are flagged but kept. Expected to eliminate 30–50% of Xing/Stepstone listings.
+2. **Stale/closed check** — 404/410/redirect-to-expired = drop. Catches already-filled positions.
+3. **Experience years** — regex for `X Jahre Berufserfahrung` / `X years experience` in body text. Catches senior jobs that slipped through the title filter.
+4. **Remote/hybrid/onsite** — detected from page text.
+5. **Salary** — extracted from body text or JSON-LD `baseSalary`.
+
+### Per-Platform Strategy
+
+| Platform | Method | Delay | Workers |
+|---|---|---|---|
+| Xing | Plain `requests` | 1.5s | 1 |
+| Stepstone | Plain `requests` | 2s | 1 |
+| Greenhouse/SmartRecruiters/Ashby | Public JSON API | 0.5s | 4 |
+| Startup.jobs | `cloudscraper` | 2s | 1 |
+| Glassdoor | `cloudscraper` | 2s | 1 |
+| Arbeitnow | Free API | — | 1 |
+| LinkedIn/Indeed | **Skipped** (fresh < 24h, trust the data) | — | — |
+
+All platforms run in parallel via `ThreadPoolExecutor`. Total wall time ~5 min (dominated by Xing). Network errors don't drop jobs — `verified_active` is left empty (treated as "unknown, keep").
+
+### Output
+
+`Job_Search_<date>_verified.csv` — same columns as input plus:
+
+| Column | Values |
+|---|---|
+| `verified_active` | `True` / `False` / empty (unknown) |
+| `detail_language` | `German C1+ required` (row dropped) / `German preferred` (flagged) / empty |
+| `detail_exp_years` | Integer or empty |
+| `detail_salary` | e.g. `45000-60000 EUR/year` or empty |
+| `detail_remote` | `remote` / `hybrid` / `onsite` / empty |
+
+Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ required"`.
 
 ## Configuration
 
@@ -126,21 +173,20 @@ Only needed for Indeed (~$0.04/run). Read from (in order of precedence):
 pip install cloudscraper requests openpyxl beautifulsoup4
 ```
 
-## Project Structure
-
 ```
 Jobscraper/
 ├── README.md                # this file
 ├── CHANGELOG.md             # version history
 ├── SKILL.md                 # OMP skill definition (trigger keywords, execution instructions)
-├── apify_job_search.py      # main pipeline script (~1500 lines, 8 platform fetchers + dedup + export)
+├── apify_job_search.py      # main pipeline script (~1600 lines, 8 platform fetchers + 3-tier dedup + export)
 ├── ats_scraper.py           # ATS direct scraper (Greenhouse/SmartRecruiters/Ashby, ~430 lines)
+├── verify_jobs.py           # post-step: verifies job URLs, filters German C1+ reqs, enriches with exp/salary/remote (~850 lines)
 ├── dedup_existing_sheets.py # standalone cleanup tool for retroactive cross-run dedup
 ├── apify_job_search.md      # detailed technical documentation (actor schemas, gotchas, cost analysis)
 ├── config.json              # Apify token (gitignored)
 ├── .gitignore
 └── Job Search/              # output directory (gitignored, one subfolder per run date)
-    └── 2026-08-23/
+    └── 2026-08-27/
 ```
 
 ## How It Works
@@ -166,9 +212,10 @@ graph TD
     H --> J
     I --> J
     J --> K[Within-run dedup by company::title]
-    K --> L[Cross-run dedup vs previous run]
+    K --> K2[Cross-platform fuzzy dedup — company overlap + title Jaccard + location]
+    K2 --> L[Cross-run dedup vs previous run]
     L --> M[Export CSV + JSON + MD + XLSX]
-```
+    M --> N[verify_jobs.py — optional post-step: German C1+ filter, stale check, enrichment]
 
 ### Key Functions
 
@@ -188,10 +235,22 @@ graph TD
 | `_is_fresh()` | ats_scraper.py | Freshness check — returns True when date is None (false positives > false negatives) |
 | `check_experience_and_location()` | apify_job_search.py | Multi-stage filter: title relevance → seniority → Germany → city |
 | `compute_match_score()` | apify_job_search.py | Percentage match against core tech stack (dbt, airflow, spark, python, sql, etc.) |
-| `normalize_key()` | apify_job_search.py | Dedup key: `company::title` with legal suffixes stripped |
+| `normalize_key()` | apify_job_search.py | Enhanced dedup key: `company::title` with parentheticals, expanded legal suffixes, seniority/gender markers, and REF codes stripped |
+| `_norm_company()` / `_norm_title()` | apify_job_search.py | Normalization helpers for company names and job titles |
+| `_company_tokens()` | apify_job_search.py | Distinctive company tokens for fuzzy overlap matching |
+| `_title_similarity()` | apify_job_search.py | Jaccard similarity of normalized title token sets |
+| `_location_match()` | apify_job_search.py | City-level location matching with German/English city aliases |
+| `cross_platform_dedup()` | apify_job_search.py | Fuzzy cross-platform dedup: company overlap ≥ 0.5 + title Jaccard ≥ 0.6 + location match, keeps higher-priority platform |
 | `normalize_job_url()` | apify_job_search.py | Cross-run URL identity: strips LinkedIn tracking params, preserves Indeed/Glassdoor job IDs |
 | `load_previous_run_keys()` | apify_job_search.py | Loads URL + title keys from the most recent previous run for cross-run dedup |
 | `convert_csv_to_xlsx()` | apify_job_search.py | openpyxl export with autofilter, frozen header, hyperlinks |
+| `detect_german_requirement()` | verify_jobs.py | German C1+ detection from job description text (required vs soft patterns) |
+| `extract_exp_years()` | verify_jobs.py | Experience years from body text (`X Jahre Berufserfahrung` / `X years experience`) |
+| `extract_salary()` | verify_jobs.py | Salary from body text regex or JSON-LD `baseSalary` |
+| `extract_remote()` | verify_jobs.py | Remote/hybrid/onsite detection from page text |
+| `verify_xing()` / `verify_stepstone()` | verify_jobs.py | Per-platform URL verification with live check + signal extraction |
+| `verify_greenhouse()` / `verify_smartrecruiters()` / `verify_ashby()` | verify_jobs.py | ATS API verification — 404/empty = closed |
+| `run_verification()` | verify_jobs.py | Main entry: load CSV, verify per-platform in parallel, write results, print summary |
 
 ## Customization
 

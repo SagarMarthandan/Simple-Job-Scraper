@@ -174,6 +174,19 @@ NON_GERMANY_COUNTRIES = (
     "hungary", "ungarn",
 )
 
+# Foreign CITIES seen leaking through city-only location strings (LinkedIn/
+# Stepstone/Xing return e.g. "London", "Bern", "Amsterdam"). Only consulted
+# when the location lacks a germany/deutschland marker. Word-boundary matched
+# so German lookalikes ("Bernau bei Berlin") are NOT rejected.
+NON_GERMANY_CITIES = re.compile(
+    r"\b(london|amsterdam|rotterdam|the\s+hague|antwerp\w*|brussels?|bruxelles|"
+    r"bern|basel|z(?:ü|ue|u)rich|gen[eè]ve|genf|graz|vienna|wien|paris|milan|milano|"
+    r"rome|roma|madrid|barcelona|lisbon|lisboa|dublin|copenhagen|københavn|kopenhagen|"
+    r"stockholm|oslo|helsinki|warsaw|warszawa|prague|prag|praha|budapest|"
+    r"s[aã]o\s+paulo|new\s+york)\b",
+    re.IGNORECASE,
+)
+
 def is_relevant_title(title: str) -> bool:
     """Check if the job title contains at least one core data/analytics/AI keyword.
     This catches false positives from all actors (Indeed returns 'Nachtwächter' for
@@ -233,6 +246,8 @@ def check_experience_and_location(title: str, description: str, location: str) -
         for country in NON_GERMANY_COUNTRIES:
             if country in loc_clean:
                 return False, f"Location outside Germany ({location})"
+        if NON_GERMANY_CITIES.search(location):
+            return False, f"Location outside Germany ({location})"
 
     # 2b. Working Student — strictly restricted to Hamburg & Kiel
     if role_type == "Working Student":
@@ -247,14 +262,119 @@ def compute_match_score(text: str) -> int:
     matches = sum(1 for kw in TECH_KEYWORDS if kw in text_lower)
     return min(100, int((matches / len(TECH_KEYWORDS)) * 100 * 2.5))  # Normalized score
 
+def _norm_company(c: str) -> str:
+    c = (c or "").lower().strip()
+    # Strip parentheticals: "(REWE Group)", "(m/w/d)"
+    c = re.sub(r"\(.*?\)", "", c)
+    # Strip legal suffixes (expanded)
+    c = re.sub(r"\b(gmbh|ag|inc|ltd|co|kg|se|corp|llc|group|gruppe|holding|"
+               r"international|deutschland|germany|global|e\.?g\.?|gmbh & co)\b", "", c)
+    # Strip punctuation, collapse whitespace
+    c = re.sub(r"[^\w\s]", "", c)
+    return " ".join(c.split())
+
+def _norm_title(t: str) -> str:
+    t = (t or "").lower().strip()
+    # Strip parentheticals (gender markers, location hints)
+    t = re.sub(r"\(.*?\)", "", t)
+    # Strip seniority + gender markers
+    t = re.sub(r"\b(senior|junior|lead|principal|staff|sr\.?|jr\.?)\b", "", t)
+    t = re.sub(r"\b(m/w/d|m/f/d|m/w|f/m/d|w/m/d|w/m/x|m/f/x|all genders|w/m|f/w/d)\b", "", t)
+    # Strip reference codes: "- REF99139A", "REF12345"
+    t = re.sub(r"\bref\d+\w*\b", "", t)
+    # Strip punctuation, collapse whitespace
+    t = re.sub(r"[^\w\s]", "", t)
+    return " ".join(t.split())
+
 def normalize_key(company: str, title: str) -> str:
-    """Generate deduplication key."""
-    company = company or ""
-    title = title or ""
-    clean_company = re.sub(r"\b(gmbh|ag|inc|ltd|co|kg|se|corp|llc)\b", "", company, flags=re.IGNORECASE)
-    clean_company = re.sub(r"[^\w\s]", "", clean_company).strip().lower()
-    clean_title = re.sub(r"[^\w\s]", "", title).strip().lower()
-    return f"{clean_company}::{clean_title}"
+    """Generate deduplication key (enhanced: strips parentheticals, legal suffixes,
+    seniority/gender markers, and REF codes for cross-platform matching)."""
+    return f"{_norm_company(company)}::{_norm_title(title)}"
+
+def _company_tokens(c: str) -> set:
+    """Distinctive tokens from company name for overlap matching."""
+    c = _norm_company(c)
+    GENERIC = {"the", "und", "and", "de", "solutions", "consulting", "services"}
+    return {t for t in c.split() if t not in GENERIC and len(t) > 2}
+
+def _title_similarity(t1: str, t2: str) -> float:
+    """Jaccard similarity of normalized title token sets."""
+    s1 = set(_norm_title(t1).split())
+    s2 = set(_norm_title(t2).split())
+    if not s1 or not s2:
+        return 0.0
+    return len(s1 & s2) / len(s1 | s2)
+
+def _location_match(l1: str, l2: str) -> bool:
+    """Check if two location strings refer to the same city."""
+    CITY_ALIASES = {
+        "munich": "munich", "münchen": "munich",
+        "cologne": "cologne", "köln": "cologne",
+        "frankfurt": "frankfurt", "frankfurt am main": "frankfurt",
+        "nuremberg": "nuremberg", "nürnberg": "nuremberg",
+        "hannover": "hannover", "hanover": "hannover",
+    }
+    def _norm_loc(l):
+        l = l.lower()
+        for alias, canonical in CITY_ALIASES.items():
+            if alias in l:
+                return canonical
+        return " ".join(re.sub(r"[^\w\s]", "", l).split())
+    return _norm_loc(l1) == _norm_loc(l2)
+
+def cross_platform_dedup(jobs: list) -> tuple[list, int]:
+    """Remove cross-platform duplicates via fuzzy company+title+location matching.
+
+    Only compares jobs across different job_board values. A job is a duplicate if:
+    - company token overlap >= 0.5 (min-set denominator)
+    - title Jaccard similarity >= 0.6
+    - location match
+    Keeps the first occurrence by platform priority order.
+
+    Returns (deduped_jobs, removed_count).
+    """
+    PLATFORM_PRIORITY = {"LinkedIn": 0, "Xing": 1, "Stepstone": 2, "Indeed": 3}
+    # Sort by platform priority so the preferred platform's job is kept first.
+    priority = lambda job: PLATFORM_PRIORITY.get(job["job_board"], 99)
+    ordered = sorted(jobs, key=priority)
+    kept = []
+    removed = 0
+    # Track signatures of kept jobs for comparison
+    kept_sigs = []  # list of (job, company_tokens, norm_title, loc_key)
+
+    for job in ordered:
+        ct = _company_tokens(job["company"])
+        nt = _norm_title(job["title"])
+        is_dup = False
+        for kept_job, kept_ct, kept_nt, kept_loc in kept_sigs:
+            # Only compare across different platforms
+            if job["job_board"] == kept_job["job_board"]:
+                continue
+            # Company token overlap
+            if not ct or not kept_ct:
+                continue
+            overlap = len(ct & kept_ct) / min(len(ct), len(kept_ct))
+            if overlap < 0.5:
+                continue
+            # Title similarity
+            s1, s2 = set(nt.split()), set(kept_nt.split())
+            if not s1 or not s2:
+                continue
+            tsim = len(s1 & s2) / len(s1 | s2)
+            if tsim < 0.6:
+                continue
+            # Location match
+            if not _location_match(job["location"], kept_loc):
+                continue
+            # Confirmed dup — skip this job
+            is_dup = True
+            removed += 1
+            break
+        if not is_dup:
+            kept.append(job)
+            kept_sigs.append((job, ct, nt, job["location"]))
+
+    return kept, removed
 
 def normalize_job_url(url: str) -> str:
     """Normalize a job URL into a stable cross-run identity key.
@@ -1426,6 +1546,9 @@ def main():
             continue
         seen_keys.add(key)
         deduped_jobs.append(job)
+    # --- Cross-platform fuzzy dedup ---
+    deduped_jobs, cross_platform_count = cross_platform_dedup(deduped_jobs)
+    print(f"Cross-platform dedup: removed {cross_platform_count} cross-platform duplicate(s)")
 
     # Cross-run deduplication: drop jobs already exported by previous runs
     # (24h freshness windows of consecutive runs overlap when run times drift).

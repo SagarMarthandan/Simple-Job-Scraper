@@ -3,6 +3,31 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
+## [2026-08-27]
+
+### Added
+- **Cross-platform fuzzy dedup** (`cross_platform_dedup()`) — new dedup tier that catches the same job reposted across different platforms with company name variants (Bosch vs Bosch Gruppe, PENNY vs PENNY International (REWE Group), XSYS Germany GmbH vs XSYS Global). Uses fuzzy matching across *different platforms only*: company token overlap ≥ 0.5 (min-set denominator), title Jaccard similarity ≥ 0.6, location match with city aliases (München/Munich, Köln/Cologne, etc.). Keeps the higher-priority platform's copy (LinkedIn > Xing > Stepstone > Indeed). Runs after within-run dedup, before cross-run dedup. O(n²) but with different-platform-only shortcut and early-exit on company overlap — < 1s for 600 jobs. Confirmed 11 true cross-platform dups in the 2026-08-27 run (443 → ~432 jobs).
+- **Job verification post-step** (`verify_jobs.py`) — new standalone script that visits each job URL after CSV export to filter out unsuitable listings before applying. Per-platform verifiers with `ThreadPoolExecutor` parallelism (1 worker per platform, 4 for ATS APIs). Total wall time ~5 min (dominated by Xing ~200 URLs at 1.5s delay).
+  - **German C1+ filter (primary eliminator)** — scans job descriptions for hard German language requirements (`fließend Deutsch`, `C1 Niveau`, `Muttersprache Deutsch`, `verhandlungssicher`, `business fluent in German`). Drops rows requiring C1+ German. Soft requirements (`Deutschkenntnisse wünschenswert`, `German is a plus`) are flagged but kept. Expected to eliminate 30–50% of Xing/Stepstone listings. Uses same-sentence contradiction logic: if a hard pattern and soft pattern co-occur in the same sentence, the soft qualifier wins.
+  - **Stale/closed check** — 404/410/redirect-to-expired = drop. Catches already-filled positions (estimated 10–20% of Xing jobs).
+  - **Experience years extraction** — regex for `X Jahre Berufserfahrung` / `X years experience` / `min. X Jahre` in body text. Catches senior jobs that slipped through the title filter.
+  - **Remote/hybrid/onsite detection** — from page text (Remote, Home-Office, hybrid, vor Ort).
+  - **Salary extraction** — from body text regex or JSON-LD `baseSalary` field.
+  - **LinkedIn/Indeed skipped** — fresh < 24h data, trust it. Anti-bot risk not worth the ROI.
+  - **Idempotent** — skips already-verified rows unless `--force`. Network errors leave `verified_active` empty (treat as "unknown, keep").
+  - **Output**: `Job_Search_<date>_verified.csv` with 5 new columns (`verified_active`, `detail_language`, `detail_exp_years`, `detail_salary`, `detail_remote`). Drops rows where `verified_active = False` OR `detail_language = "German C1+ required"`.
+
+### Changed
+- **`normalize_key()` enhanced** — now splits into `_norm_company()` and `_norm_title()` helpers. Strips parentheticals (`(REWE Group)`, `(m/w/d)`), expanded legal suffixes (`group`, `gruppe`, `holding`, `international`, `deutschland`, `germany`, `global`, `e.g.`), seniority markers (`senior`, `junior`, `lead`, `principal`, `staff`, `sr.`, `jr.`), gender markers (`m/w/d`, `m/f/d`, `all genders`), and reference codes (`REF99139A`). Catches Bosch/Bosch Gruppe, PENNY/PENNY International, Intersport/INTERSPORT Deutschland e.G., Continental with/without REF code — all now produce identical dedup keys. Cross-run dedup auto-benefits (no separate change needed).
+- **Pipeline dedup flow**: within-run → cross-platform fuzzy → cross-run (was within-run → cross-run, 2 tiers → 3 tiers).
+
+### Verification
+- `normalize_key('Bosch Gruppe', 'Data Engineer (m/w/d)') == normalize_key('Bosch', 'Data Engineer')` → `'bosch::data engineer'` ✓
+- Synthetic `cross_platform_dedup()` test: 6 jobs (2 cross-platform dups + 2 non-dups) → removed 2, kept 4. Higher-priority platform kept in each dup pair. Same-company different-title non-dups retained. ✓
+- `detect_german_requirement('fließend Deutsch C1')` → `'German C1+ required'` ✓
+- `detect_german_requirement('Deutschkenntnisse wünschenswert')` → `'German preferred'` ✓
+- `detect_german_requirement('English only')` → `''` ✓
+
 ## [2026-08-23]
 
 ### Added
