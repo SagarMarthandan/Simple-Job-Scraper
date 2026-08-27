@@ -102,6 +102,9 @@ GERMAN_REQUIRED_PATTERNS = [
     # "Muttersprache" / native speaker
     r'Muttersprache\s+Deutsch',
     r'(?:Deutsch|German)\s+as\s+a\s+(?:first\s+)?native\s+language',
+    # "Sehr gute Deutschkenntnisse" (standalone) — C1+, DROP
+    # Does NOT match suspended compound "sehr gute Deutsch- und Englischkenntnisse" (false positive, keep)
+    r'sehr\s+gute\s+Deutsch(?:kenntnisse|sprachkenntnisse)',
     # "Verhandlungssicher" — business-fluent, C1+
     r'(?:Deutsch|German)\s+verhandlungssicher',
     r'verhandlungssicher\s+in\s+Deutsch',
