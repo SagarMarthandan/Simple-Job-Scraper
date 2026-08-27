@@ -3,7 +3,33 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
-## [2026-08-27]
+## [2026-08-28]
+
+### Changed
+- **`verify_jobs.py` v2 rewrite** — full rewrite of the job verification post-step. Now verifies **every** platform (including LinkedIn + Indeed, previously skipped). 109 jobs → 69 kept + 23 reposted + 13 German-dropped + 4 exp-dropped + 0 closed. Runtime: 66s (was ~5 min, v1 skipped 44% of jobs).
+  - **LinkedIn via plain requests + JSON-LD** — job detail pages serve full JD in `<script type="application/ld+json">` to unauthenticated requests. No auth wall, no browser relay, no Apify actor. 2 workers, 1s delay, retry once with 3s backoff. Verified 2026-08-27: 10/10 sample URLs returned JSON-LD with full description.
+  - **Indeed verification** (new) — plain requests, JD extracted from page HTML/JSON-LD. Was skipped in v1.
+  - **German filter expanded to max B2** — v1 only dropped C1+. v2 drops C1/C2/fließend/Muttersprache/verhandlungssicher/sehr gute Deutschkenntnisse/business fluent. B1/B2 explicit → keep (`German B1/B2 OK`). Soft (`wünschenswert`, `von Vorteil`, `nice to have`) → keep + flag (`German preferred`). Same-sentence contradiction logic preserved.
+  - **Experience ≥3 years → hard drop** — v1 had experience as enrichment-only. v2 drops rows where JD body text requires ≥3 years (`X Jahre Berufserfahrung`, `X years experience`, `min. X Jahre`, `at least X years`). Returns minimum years found (handles "1-3 Jahre" → 1).
+  - **Reposted LinkedIn detection** — two signals: (1) cross-run history scan — `normalize_key(company,title)` match in any previous run >7 days ago, (2) job ID age gap — LinkedIn creates ~530K IDs/day globally; if today's max ID minus job ID suggests >14 days old, flag as reposted. Either signal → segregated to "Reposted" sheet (NOT dropped — user reviews manually). `datePosted` is reset on repost, so it can't be used for age detection.
+  - **Match score recalculated from JD text** — v1 kept the pipeline's title-based score. v2 runs `compute_match_score_from_jd()` on the full JD text using `TECH_KEYWORDS` (dbt, airflow, spark, pyspark, python, sql, gcp, bigquery, aws, azure, databricks, docker, kafka, postgresql, snowflake). Same density formula as pipeline but on actual description text.
+  - **Output: 2-sheet XLSX** (was CSV) — "Job Search" sheet (69 rows, passed all filters) + "Reposted" sheet (23 rows, LinkedIn reposts for manual review). Frozen header, autofilter, clickable URL hyperlinks, numeric match_score. Uses openpyxl (same formatting as pipeline's `convert_csv_to_xlsx`).
+  - **New output columns**: `detail_reposted` (True/False/empty), `match_score` now recalculated from JD text. Total 16 columns (was 15).
+  - **Drop logic**: `verified_active == "False"` OR `detail_language == "German C1+ required"` OR `detail_exp_years >= 3` → dropped. `detail_reposted == "True"` → segregated to Reposted sheet (not dropped).
+
+### Verification
+- `detect_german_requirement('fliessend Deutsch C1')` → `'German C1+ required'` ✓ (ASCII double-s)
+- `detect_german_requirement('fließend Deutsch')` → `'German C1+ required'` ✓ (Unicode ß)
+- `detect_german_requirement('Muttersprache Deutsch')` → `'German C1+ required'` ✓
+- `detect_german_requirement('verhandlungssicher')` → `'German C1+ required'` ✓
+- `detect_german_requirement('Deutsch B2')` → `'German B1/B2 OK'` ✓
+- `detect_german_requirement('Deutschkenntnisse wünschenswert')` → `'German preferred'` ✓
+- `detect_german_requirement('English only')` → `''` ✓
+- `extract_exp_years('5 Jahre Berufserfahrung')` → `'5'` ✓
+- `extract_exp_years('min. 2 Jahre')` → `'2'` ✓
+- `compute_match_score_from_jd('Python SQL dbt airflow spark AWS')` → `100` ✓
+- XLSX output: 2 sheets (Job Search: 69 rows, Reposted: 23 rows), 16 columns, numeric scores, hyperlinks, autofilter ✓
+
 
 ### Added
 - **Cross-platform fuzzy dedup** (`cross_platform_dedup()`) — new dedup tier that catches the same job reposted across different platforms with company name variants (Bosch vs Bosch Gruppe, PENNY vs PENNY International (REWE Group), XSYS Germany GmbH vs XSYS Global). Uses fuzzy matching across *different platforms only*: company token overlap ≥ 0.5 (min-set denominator), title Jaccard similarity ≥ 0.6, location match with city aliases (München/Munich, Köln/Cologne, etc.). Keeps the higher-priority platform's copy (LinkedIn > Xing > Stepstone > Indeed). Runs after within-run dedup, before cross-run dedup. O(n²) but with different-platform-only shortcut and early-exit on company overlap — < 1s for 600 jobs. Confirmed 11 true cross-platform dups in the 2026-08-27 run (443 → ~432 jobs).
