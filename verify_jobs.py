@@ -360,12 +360,13 @@ def _extract_description_text(html: str) -> tuple[str, dict | None]:
 
 # ── Reposted Detection (LinkedIn only) ───────────────────────────────────────
 
-def _load_all_previous_run_keys(job_search_dir: Path, today_str: str) -> set:
-    """Load normalize_key(company, title) from ALL previous runs (not just most recent).
+def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
+    """Load reposted detection data from previous runs.
 
-    Returns a set of title keys from runs older than REPOST_CROSS_RUN_DAYS.
+    Returns:
+        old_title_keys: normalize_key(company, title) from runs >7 days ago
+        recent_urls: job URLs from the most recent previous run (carryovers)
     """
-    # Import here to avoid circular dependency at module load time
     import sys
     skill_dir = Path("/home/sagar/Skills/Jobscraper")
     if str(skill_dir) not in sys.path:
@@ -373,26 +374,50 @@ def _load_all_previous_run_keys(job_search_dir: Path, today_str: str) -> set:
     from apify_job_search import normalize_key
 
     cutoff = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=REPOST_CROSS_RUN_DAYS)
-    old_keys = set()
+    old_title_keys = set()
+    recent_urls = set()
 
     if not job_search_dir.exists():
-        return old_keys
+        return old_title_keys, recent_urls
 
+    # Find the most recent previous run (for carryover detection)
+    prev_dirs = []
     for run_dir in sorted(job_search_dir.iterdir()):
         if not run_dir.is_dir() or not run_dir.name.startswith("2026-"):
             continue
         if run_dir.name >= today_str:
-            continue  # skip today and future
+            continue
+        try:
+            datetime.strptime(run_dir.name, "%Y-%m-%d")
+        except ValueError:
+            continue
+        prev_dirs.append(run_dir)
+
+    # Load URLs from the most recent previous run (carryover detection)
+    if prev_dirs:
+        most_recent = prev_dirs[-1]
+        csvs = [c for c in most_recent.glob("Job_Search_*.csv")
+                if "_verified" not in c.name and "_deduped" not in c.name]
+        if csvs:
+            try:
+                with open(csvs[0], newline="", encoding="utf-8-sig") as f:
+                    for row in csv.DictReader(f):
+                        url = (row.get("job_url", "") or "").rstrip("/")
+                        if url:
+                            recent_urls.add(url)
+            except Exception:
+                pass
+
+    # Load title keys from runs older than 7 days (repost detection)
+    for run_dir in prev_dirs:
         try:
             run_date = datetime.strptime(run_dir.name, "%Y-%m-%d")
         except ValueError:
             continue
         if run_date >= cutoff:
-            continue  # only look at runs older than 7 days
-
-        csvs = list(run_dir.glob("Job_Search_*.csv"))
-        # Skip verified/deduped variants — only original pipeline CSVs
-        csvs = [c for c in csvs if "_verified" not in c.name and "_deduped" not in c.name]
+            continue
+        csvs = [c for c in run_dir.glob("Job_Search_*.csv")
+                if "_verified" not in c.name and "_deduped" not in c.name]
         if not csvs:
             continue
         try:
@@ -402,11 +427,11 @@ def _load_all_previous_run_keys(job_search_dir: Path, today_str: str) -> set:
                         continue
                     key = normalize_key(row.get("company", ""), row.get("title", ""))
                     if key:
-                        old_keys.add(key)
+                        old_title_keys.add(key)
         except Exception:
             pass
 
-    return old_keys
+    return old_title_keys, recent_urls
 
 
 def _extract_linkedin_job_id(url: str) -> int:
@@ -416,14 +441,22 @@ def _extract_linkedin_job_id(url: str) -> int:
 
 
 def detect_reposted(job: dict, today_str: str, old_title_keys: set,
-                    today_max_linkedin_id: int) -> bool:
+                    today_max_linkedin_id: int, recent_urls: set | None = None) -> bool:
     """Check if a LinkedIn job is likely reposted.
 
     Two signals (either triggers):
     1. Cross-run history: company::title appeared in a run >7 days ago
     2. Job ID age gap: job ID suggests >14 days old (based on ~530K IDs/day)
+
+    Carryover exception: if the job URL appeared in the most recent previous
+    run, it's a carryover (not a new repost) — skip both signals.
     """
     if job.get("job_board") != "LinkedIn":
+        return False
+
+    # Carryover check: if URL was in yesterday's run, it's not a new repost
+    url = (job.get("job_url", "") or "").rstrip("/")
+    if recent_urls and url in recent_urls:
         return False
 
     # Signal 1: cross-run history
@@ -439,7 +472,7 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
         return True
 
     # Signal 2: job ID age gap
-    job_id = _extract_linkedin_job_id(job.get("job_url", ""))
+    job_id = _extract_linkedin_job_id(url)
     if job_id and today_max_linkedin_id:
         age_days = (today_max_linkedin_id - job_id) / LINKEDIN_DAILY_ID_GROWTH
         if age_days > REPOST_JOB_ID_AGE_DAYS:
@@ -1078,8 +1111,9 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     # ── Reposted detection setup (LinkedIn only) ──
     today_str = datetime.now().strftime("%Y-%m-%d")
     print(f"\n[*] Loading cross-run history for reposted detection...")
-    old_title_keys = _load_all_previous_run_keys(JOB_SEARCH_DIR, today_str)
+    old_title_keys, recent_urls = _load_repost_data(JOB_SEARCH_DIR, today_str)
     print(f"    Loaded {len(old_title_keys)} title keys from runs >{REPOST_CROSS_RUN_DAYS} days ago")
+    print(f"    Loaded {len(recent_urls)} URLs from most recent previous run (carryover detection)")
 
     # Find today's max LinkedIn job ID for age-gap estimation
     today_max_linkedin_id = 0
@@ -1120,7 +1154,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         if result:
             row.update(result)
         # Reposted detection (LinkedIn only, uses CSV data — no page fetch needed)
-        is_repost = detect_reposted(row, today_str, old_title_keys, today_max_linkedin_id)
+        is_repost = detect_reposted(row, today_str, old_title_keys, today_max_linkedin_id, recent_urls)
         row["detail_reposted"] = "True" if is_repost else ("False" if row.get("job_board") == "LinkedIn" else "")
 
     # ── Apply filters and split into main + reposted ──
