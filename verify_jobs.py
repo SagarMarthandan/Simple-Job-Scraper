@@ -1199,6 +1199,10 @@ def llm_classify_all(rows: list[dict]) -> None:
     if not to_classify:
         return
 
+    # One-time check: warn if LLM not available (regex fallback is less accurate)
+    if "completion" not in globals():
+        print("[!] WARNING: LLM not available — using regex fallback (less accurate)")
+
     print(f"\n[*] LLM batch classification: {len(to_classify)} jobs in batches of {LLM_BATCH_SIZE}...")
 
     # Process in batches

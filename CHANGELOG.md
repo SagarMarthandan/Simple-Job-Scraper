@@ -3,6 +3,11 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
+## [2026-08-28b]
+
+### Changed
+- **LLM-based German + experience classification** — replaced regex-based `detect_german_requirement()` and `extract_exp_years()` with LLM batch classification. Regex had endless gaps: "sehr gut Deutsch" (no -e ending), "mind. auf Level C1" (abbreviation + "auf Level"), "fließend in Wort und Schrift", "mehrjährige Erfahrung", etc. Each fix uncovered another variant. LLM approach: `llm_classify_batch()` sends 5 JDs per call to smol model with JSON schema output. Classifies German as C1+/B1-B2/preferred/none + extracts minimum exp years. Handles all phrasing variants, suspended compounds, abbreviations. Falls back to regex with one-time warning when `completion()` not available (standalone mode). Run inside eval sandbox: `import verify_jobs; verify_jobs.completion = completion; verify_jobs.run_verification(...)`. Results: 71 German C1+ drops (was 38 with regex), 42 exp drops (was 23). 383 jobs classified in 77 batches.
+
 ## [2026-08-28]
 
 ### Changed
