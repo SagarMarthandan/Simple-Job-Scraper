@@ -638,12 +638,11 @@ def verify_linkedin(job: dict) -> dict:
 # ── Indeed Verifier (plain requests) ─────────────────────────────────────────
 
 def verify_indeed(job: dict) -> dict:
-    """Verify an Indeed job using pre-fetched description from Apify dataset.
+    """Verify an Indeed job using pre-fetched description.
 
-    Indeed job pages (de.indeed.com/viewjob?jk=...) are behind a 401/403 auth
-    wall — both plain requests and cloudscraper fail. The Apify actor already
-    fetched the JD text during the scraper run; it's injected into the job dict
-    from the sibling JSON file by run_verification(). Use it directly.
+    Description may come from Apify JSON (if non-empty) or TinyFish pre-fetch.
+    Indeed job pages are behind a 401/403 auth wall — both plain requests and
+    cloudscraper fail. If no description is available, the job stays unverified.
     """
     result = _empty_result()
     desc = job.get("description", "")
@@ -659,10 +658,18 @@ def verify_indeed(job: dict) -> dict:
 # ── Xing Verifier ────────────────────────────────────────────────────────────
 
 def verify_xing(job: dict) -> dict:
-    """Verify a Xing job listing. Plain requests, 1.5s delay."""
+    """Verify a Xing job listing. Uses pre-fetched TinyFish description if
+    available, falls back to plain requests otherwise."""
     result = _empty_result()
     url = job.get("job_url", "")
     if not url:
+        return result
+
+    # If TinyFish already injected a description, use it directly
+    prefetched = job.get("description", "")
+    if prefetched and len(prefetched) > 50:
+        result["verified_active"] = "True"
+        result = _process_result(result, prefetched)
         return result
     try:
         resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS,
@@ -690,10 +697,18 @@ def verify_xing(job: dict) -> dict:
 # ── Stepstone Verifier ───────────────────────────────────────────────────────
 
 def verify_stepstone(job: dict) -> dict:
-    """Verify a Stepstone job listing. Plain requests, 2s delay."""
+    """Verify a Stepstone job listing. Uses pre-fetched TinyFish description if
+    available, falls back to plain requests otherwise."""
     result = _empty_result()
     url = job.get("job_url", "")
     if not url:
+        return result
+
+    # If TinyFish already injected a description, use it directly
+    prefetched = job.get("description", "")
+    if prefetched and len(prefetched) > 50:
+        result["verified_active"] = "True"
+        result = _process_result(result, prefetched)
         return result
     try:
         resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS,
@@ -720,10 +735,18 @@ def verify_stepstone(job: dict) -> dict:
 # ── Startup.jobs / Glassdoor Verifiers (cloudscraper) ────────────────────────
 
 def verify_startupjobs(job: dict) -> dict:
-    """Verify a Startup.jobs listing. Cloudscraper, 2s delay."""
+    """Verify a Startup.jobs listing. Uses pre-fetched TinyFish description if
+    available, falls back to cloudscraper otherwise."""
     result = _empty_result()
     url = job.get("job_url", "")
     if not url:
+        return result
+
+    # If TinyFish already injected a description, use it directly
+    prefetched = job.get("description", "")
+    if prefetched and len(prefetched) > 50:
+        result["verified_active"] = "True"
+        result = _process_result(result, prefetched)
         return result
     if cloudscraper is None:
         return result
@@ -746,10 +769,18 @@ def verify_startupjobs(job: dict) -> dict:
 
 
 def verify_glassdoor(job: dict) -> dict:
-    """Verify a Glassdoor listing. Cloudscraper, 2s delay."""
+    """Verify a Glassdoor listing. Uses pre-fetched TinyFish description if
+    available, falls back to cloudscraper otherwise."""
     result = _empty_result()
     url = job.get("job_url", "")
     if not url:
+        return result
+
+    # If TinyFish already injected a description, use it directly
+    prefetched = job.get("description", "")
+    if prefetched and len(prefetched) > 50:
+        result["verified_active"] = "True"
+        result = _process_result(result, prefetched)
         return result
     if cloudscraper is None:
         return result
@@ -1351,13 +1382,23 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     # Pre-fetch LinkedIn JDs via TinyFish (main thread — tool.* not thread-safe)
     # TinyFish renders JS-heavy LinkedIn pages that plain requests can't.
     if "tinyfish_fetch" in globals():
-        linkedin_jobs = [r for r in rows if r.get("job_board") == "LinkedIn" and not r.get("description")]
-        if linkedin_jobs:
-            print(f"[*] Pre-fetching {len(linkedin_jobs)} LinkedIn JDs via TinyFish...")
+        # Pre-fetch JDs via TinyFish for all platforms that need page rendering.
+        # Skip ATS (Greenhouse/SmartRecruiters/Ashby) — they use public JSON APIs.
+        # Skip Arbeitnow — free API already provides descriptions.
+        # Skip jobs that already have a description (from Apify JSON injection).
+        TINYFISH_PLATFORMS = {"LinkedIn", "Indeed", "Xing", "Stepstone",
+                              "Startup.jobs", "Glassdoor"}
+        tf_jobs = [r for r in rows
+                   if r.get("job_board") in TINYFISH_PLATFORMS
+                   and not r.get("description")]
+        if tf_jobs:
+            print(f"[*] Pre-fetching {len(tf_jobs)} JDs via TinyFish "
+                  f"({', '.join(sorted({r['job_board'] for r in tf_jobs}))})...")
             tf_batch_size = 2  # keep response under truncation limit
             tf_injected = 0
-            for batch_start in range(0, len(linkedin_jobs), tf_batch_size):
-                batch = linkedin_jobs[batch_start:batch_start + tf_batch_size]
+            tf_auth_wall = 0
+            for batch_start in range(0, len(tf_jobs), tf_batch_size):
+                batch = tf_jobs[batch_start:batch_start + tf_batch_size]
                 urls = [j.get("job_url", "") for j in batch if j.get("job_url")]
                 if not urls:
                     continue
@@ -1366,18 +1407,20 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
                     for item in resp.get("results", []):
                         u = item.get("url", "")
                         text = item.get("text", "")
-                        if text:
-                            for row in rows:
-                                if row.get("job_url") == u:
-                                    row["description"] = text
-                                    tf_injected += 1
-                                    break
+                        if not text:
+                            continue
+                        for row in rows:
+                            if row.get("job_url") == u:
+                                row["description"] = text
+                                tf_injected += 1
+                                break
                 except Exception as exc:
                     print(f"  [!] TinyFish batch {batch_start // tf_batch_size + 1} failed: {exc}")
                 batch_num = batch_start // tf_batch_size + 1
-                total_batches = (len(linkedin_jobs) + tf_batch_size - 1) // tf_batch_size
-                print(f"    TinyFish batch {batch_num}/{total_batches} done ({tf_injected} JDs so far)", flush=True)
-            print(f"[*] TinyFish injected {tf_injected} LinkedIn descriptions")
+                total_batches = (len(tf_jobs) + tf_batch_size - 1) // tf_batch_size
+                print(f"    TinyFish batch {batch_num}/{total_batches} done "
+                      f"({tf_injected} JDs so far)", flush=True)
+            print(f"[*] TinyFish injected {tf_injected} descriptions")
 
     # Idempotency: skip rows already verified unless --force
     to_verify: list[tuple[int, dict]] = []

@@ -134,24 +134,28 @@ verify_jobs.tinyfish_fetch = tinyfish_fetch  # TinyFish bridge function
 
 ### Per-Platform Strategy
 
-| Platform | Method | Delay | Workers |
+| Platform | Sandbox (TinyFish) | Standalone (no TinyFish) | Workers |
 |---|---|---|---|
-| LinkedIn | TinyFish pre-fetch (sandbox) or plain `requests` + JSON-LD (standalone) | 1s | 2 |
-| Indeed | Apify JSON description (401/403 walled) | — | 1 |
-| Xing | Plain `requests` | 1.5s | 1 |
-| Stepstone | Plain `requests` | 2s | 1 |
-| Greenhouse/SmartRecruiters/Ashby | Public JSON API | 0.5s | 4 |
-| Startup.jobs | `cloudscraper` | 2s | 1 |
-| Glassdoor | `cloudscraper` | 2s | 1 |
-| Arbeitnow | Free API | — | 1 |
+| LinkedIn | TinyFish pre-fetch (89% render rate) | Plain `requests` + JSON-LD (6% hit rate) | 2 |
+| Indeed | TinyFish pre-fetch (fills Apify gaps) | Apify JSON description only | 1 |
+| Xing | TinyFish pre-fetch | Plain `requests` | 1 |
+| Stepstone | TinyFish pre-fetch | Plain `requests` | 1 |
+| Startup.jobs | TinyFish pre-fetch | `cloudscraper` | 1 |
+| Glassdoor | TinyFish pre-fetch | `cloudscraper` | 1 |
+| Greenhouse/SmartRecruiters/Ashby | Public JSON API (no change) | Public JSON API | 4 |
+| Arbeitnow | Free API (no change) | Free API | 1 |
 
 All platforms run in parallel via `ThreadPoolExecutor` (1 thread per platform). Network errors don't drop jobs — `verified_active` is left empty (treated as "unknown, keep").
 
-### LinkedIn JD Extraction
+### TinyFish JD Pre-Fetch (Sandbox Mode)
 
-**TinyFish (sandbox mode)**: When `tinyfish_fetch` is injected, LinkedIn JDs are pre-fetched in the **main thread** before platform verification starts (TinyFish MCP tool is not thread-safe — calling `tool.*` from `ThreadPoolExecutor` worker threads raises `RuntimeError`). JDs are fetched in batches of 2 URLs (response truncates at ~25K chars with larger batches), injected into `row["description"]`, then `verify_linkedin` in worker threads picks up the pre-fetched description without making network calls. 187 LinkedIn URLs → 94 batches × ~8s = ~12 min. Auth-wall detection: if TinyFish returns only LinkedIn boilerplate (Similar jobs, People also viewed, Referrals increase) without real JD markers (requirements, responsibilities, Aufgaben, etc.), the job is flagged with `detail_language = "AUTH WALL — review manually"` and left unverified for manual review.
+When `tinyfish_fetch` is injected, **all** JD-dependent platforms (LinkedIn, Indeed, Xing, Stepstone, Startup.jobs, Glassdoor) are pre-fetched via TinyFish in the **main thread** before platform verification starts. TinyFish MCP tool is not thread-safe — calling `tool.*` from `ThreadPoolExecutor` worker threads raises `RuntimeError: Missing session/run/name`. ATS platforms (Greenhouse/SmartRecruiters/Ashby) and Arbeitnow are skipped (they use public APIs with 100% accuracy).
 
-**Plain requests (standalone mode)**: LinkedIn job detail pages serve full JDs via JSON-LD `<script type="application/ld+json">` tags to unauthenticated plain requests. No auth wall, no Cloudflare challenge on detail pages. The JSON-LD contains `description` (full JD, HTML-entity-encoded, 3K-8K chars), `datePosted`, `validThrough`, `title`, `hiringOrganization`, `jobLocation`, `skills`. 2 workers with 1s delay + retry once on failure (~95%+ success rate). CRITICAL: `datePosted` is reset on repost — use job ID age gap or cross-run history for repost detection, not `datePosted`.
+JDs are fetched in batches of 2 URLs (TinyFish response truncates at ~25K chars with larger batches), injected into `row["description"]`. Each platform verifier then checks for a pre-fetched description (>50 chars) and calls `_process_result` directly without making network requests. Falls back to the platform's native method (requests/cloudscraper) when no pre-fetched description is available.
+
+**Auth-wall detection** (LinkedIn): if TinyFish returns only LinkedIn boilerplate (Similar jobs, People also viewed, Referrals increase) without real JD markers (requirements, responsibilities, Aufgaben, etc.), the job is flagged with `detail_language = "AUTH WALL — review manually"` and left unverified for manual review. ~11% of LinkedIn jobs affected.
+
+**Runtime**: ~500 URLs → 250 batches × ~8s = ~33 min. No cost — TinyFish `fetch_content` is free.
 
 ### LLM Classification
 

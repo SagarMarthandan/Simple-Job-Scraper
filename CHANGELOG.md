@@ -3,6 +3,12 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
+## [2026-08-28d]
+
+### Changed
+- **TinyFish universal pre-fetch** — extended TinyFish JD pre-fetch from LinkedIn-only to all JD-dependent platforms: LinkedIn, Indeed, Xing, Stepstone, Startup.jobs, Glassdoor. ATS platforms (Greenhouse/SmartRecruiters/Ashby) and Arbeitnow skipped (public APIs, 100% accuracy). Each platform verifier (`verify_xing`, `verify_stepstone`, `verify_startupjobs`, `verify_glassdoor`) now checks for pre-fetched `description` (>50 chars) before making network requests, same pattern as `verify_linkedin`. Falls back to native method (requests/cloudscraper) when no pre-fetched description. Indeed already checked `description` — now TinyFish fills gaps when Apify returns empty. Runtime: ~500 URLs → 250 batches × ~8s = ~33 min. No cost (TinyFish `fetch_content` is free).
+
+
 ## [2026-08-28c]
 
 ### Changed
