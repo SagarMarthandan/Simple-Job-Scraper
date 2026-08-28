@@ -230,6 +230,7 @@ graph TD
     K2 --> L[Cross-run dedup vs previous run]
     L --> M[Export CSV + JSON + MD + XLSX]
     M --> N[verify_jobs.py — post-step: verify all URLs, German >B2 filter, exp ≥3y drop, reposted segregation, match score recalc, 2-sheet XLSX]
+```
 
 ### Key Functions
 
