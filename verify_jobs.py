@@ -482,29 +482,30 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
     2. Job ID age gap: job ID suggests >14 days old (based on ~530K IDs/day)
 
     Carryover exception: if the job URL appeared in the most recent previous
-    run, it's a carryover (not a new repost) — skip both signals.
+    run, skip signal 1 (cross-run title match) — it's likely a 24h window
+    overlap, not a repost. But signal 2 (job ID age gap) is NOT suppressed —
+    a 277-day-old job ID is a repost regardless of carryover.
     """
     if job.get("job_board") != "LinkedIn":
         return False
 
-    # Carryover check: if URL was in yesterday's run, it's not a new repost
     url = _normalize_url(job.get("job_url", ""))
-    if recent_urls and url in recent_urls:
-        return False
+    is_carryover = bool(recent_urls and url in recent_urls)
 
-    # Signal 1: cross-run history
-    import sys
-    from pathlib import Path as _P
-    skill_dir = _P("/home/sagar/Skills/Jobscraper")
-    if str(skill_dir) not in sys.path:
-        sys.path.insert(0, str(skill_dir))
-    from apify_job_search import normalize_key
+    # Signal 1: cross-run history (suppressed by carryover exception)
+    if not is_carryover:
+        import sys
+        from pathlib import Path as _P
+        skill_dir = _P("/home/sagar/Skills/Jobscraper")
+        if str(skill_dir) not in sys.path:
+            sys.path.insert(0, str(skill_dir))
+        from apify_job_search import normalize_key
 
-    key = normalize_key(job.get("company", ""), job.get("title", ""))
-    if key and key in old_title_keys:
-        return True
+        key = normalize_key(job.get("company", ""), job.get("title", ""))
+        if key and key in old_title_keys:
+            return True
 
-    # Signal 2: job ID age gap
+    # Signal 2: job ID age gap (NOT suppressed by carryover — old ID = repost)
     job_id = _extract_linkedin_job_id(url)
     if job_id and today_max_linkedin_id:
         age_days = (today_max_linkedin_id - job_id) / LINKEDIN_DAILY_ID_GROWTH
@@ -1395,6 +1396,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
             row.update(result)
         # Reposted detection (LinkedIn only, uses CSV data — no page fetch needed)
         is_repost = detect_reposted(row, today_str, old_title_keys, today_max_linkedin_id, recent_urls)
+        row["detail_reposted"] = "True" if is_repost else ("False" if row.get("job_board") == "LinkedIn" else "")
 
     # ── LLM batch classification (German level + experience years) ──
     llm_classify_all(rows)
@@ -1414,6 +1416,13 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         exp_str = row.get("detail_exp_years", "")
         is_repost = row.get("detail_reposted", "") == "True"
 
+        # Segregate: reposted (checked first — reposted jobs go to separate
+        # sheet regardless of German/exp filters, for manual review)
+        if is_repost:
+            reposted_count += 1
+            reposted_rows.append(row)
+            continue
+
         # Hard drop: closed
         if active == "False":
             closed_count += 1
@@ -1432,12 +1441,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
             except (ValueError, TypeError):
                 pass
 
-        # Segregate: reposted (not dropped)
-        if is_repost:
-            reposted_count += 1
-            reposted_rows.append(row)
-        else:
-            main_rows.append(row)
+        main_rows.append(row)
 
         # Count enriched
         if (row.get("detail_exp_years") or row.get("detail_salary")
