@@ -80,6 +80,17 @@ HEADERS = {
 
 REQUEST_TIMEOUT = 15
 
+
+def _response_text(resp) -> str:
+    """Get response text with correct encoding.
+    requests defaults to ISO-8859-1 when no charset is in Content-Type header,
+    causing mojibake on German sites (Ã¼ instead of ü). Use apparent_encoding
+    (chardet detection) as a better fallback.
+    """
+    if resp.encoding is None or resp.encoding.lower() in ("iso-8859-1", "latin-1"):
+        resp.encoding = resp.apparent_encoding or "utf-8"
+    return resp.text
+
 # Platforms that use public APIs (no HTML scraping)
 ATS_PLATFORMS = {"Greenhouse", "SmartRecruiters", "Ashby"}
 
@@ -566,7 +577,7 @@ def verify_linkedin(job: dict) -> dict:
                     continue
                 return result
 
-            html = resp.text
+            html = _response_text(resp)
             jsonld = _extract_jsonld(html)
 
             if jsonld:
@@ -639,7 +650,7 @@ def verify_xing(job: dict) -> dict:
             return result
         if resp.status_code != 200:
             return result
-        html = resp.text
+        html = _response_text(resp)
         jsonld = _extract_jsonld(html)
         title = job.get("title", "")
         if jsonld or (title and title.lower() in html.lower()):
@@ -670,7 +681,7 @@ def verify_stepstone(job: dict) -> dict:
             return result
         if resp.status_code != 200:
             return result
-        html = resp.text
+        html = _response_text(resp)
         lower_html = html.lower()
         if "nicht mehr verfügbar" in lower_html or "no longer available" in lower_html:
             result["verified_active"] = "False"
@@ -702,7 +713,7 @@ def verify_startupjobs(job: dict) -> dict:
             return result
         if resp.status_code != 200:
             return result
-        html = resp.text
+        html = _response_text(resp)
         result["verified_active"] = "True"
         desc, jsonld = _extract_description_text(html)
         result = _process_result(result, desc, jsonld)
@@ -728,7 +739,7 @@ def verify_glassdoor(job: dict) -> dict:
             return result
         if resp.status_code != 200:
             return result
-        html = resp.text
+        html = _response_text(resp)
         result["verified_active"] = "True"
         desc, jsonld = _extract_description_text(html)
         result = _process_result(result, desc, jsonld)
@@ -1103,6 +1114,42 @@ Job descriptions:
 
 Return a JSON array of {count} objects, one per job, in order."""
 
+# Keywords for extracting relevant JD sections (German + experience)
+_RELEVANT_KEYWORDS = re.compile(
+    r'(?:[Dd]eutsch|[Gg]erman|[Ss]prach(?:e|en|kenntnis|kenntnisse)|'
+    r'[Ll]anguage|[Ff]ließend|[Mm]uttersprach|'
+    r'[Vv]erhandlungssicher|[Bb]usiness\s+fluent|'
+    r'[Nn]iveau|[Ll]evel\s+[ABC]|B[12]|C[12]|'
+    r'[Ee]rfahrung|[Yy]ears?[Jj]ahre|[Bb]erufserfahrung|'
+    r'[Jj]ahre\s+[Bb]eruf|mind\.\s*\d|mindestens\s*\d|'
+    r'at\s+least\s+\d|\d+\+?\s+years?)',
+    re.IGNORECASE
+)
+
+
+def _extract_relevant_sections(jd_text: str, context_chars: int = 200) -> str:
+    """Extract sentences/sections containing German or experience keywords.
+
+    Requirements often appear past char 2000 in JDs. Instead of truncating,
+    extract only the relevant sections to keep the LLM prompt focused.
+    Falls back to first 2000 chars if no keywords found.
+    """
+    if len(jd_text) <= 2000:
+        return jd_text
+
+    # Split into sentences (rough split on . ! ? followed by space/capital)
+    sentences = re.split(r'(?<=[.!?])\s+', jd_text)
+    relevant = []
+    for sent in sentences:
+        if _RELEVANT_KEYWORDS.search(sent):
+            relevant.append(sent.strip())
+
+    if relevant:
+        return " ".join(relevant)[:3000]  # Cap at 3000 to keep prompt manageable
+
+    # No keywords found — return first 2000 chars (job may have no requirements)
+    return jd_text[:2000]
+
 
 def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
     """Classify German level + experience years for a batch of JD texts via LLM.
@@ -1113,10 +1160,17 @@ def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
     if not jd_texts:
         return []
 
-    # Truncate each JD to 2000 chars to keep prompt manageable
-    truncated = [t[:2000] for t in jd_texts]
+    # If LLM not available, skip straight to regex (avoids per-batch NameError noise)
+    if "completion" not in globals():
+        return [
+            {"german": _regex_german_level(t), "exp_years": _regex_exp_years(t)}
+            for t in jd_texts
+        ]
+    # Extract relevant sections (German/language + experience keywords)
+    # instead of truncating — requirements often appear past char 2000
+    extracted = [_extract_relevant_sections(t) for t in jd_texts]
     jobs_block = "\n\n".join(
-        f"Job {i+1}: {text}" for i, text in enumerate(truncated)
+        f"Job {i+1}: {text}" for i, text in enumerate(extracted)
     )
     prompt = _LLM_CLASSIFY_PROMPT.format(jobs=jobs_block, count=len(jd_texts))
 
