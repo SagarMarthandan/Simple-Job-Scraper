@@ -477,9 +477,13 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
                     today_max_linkedin_id: int, recent_urls: set | None = None) -> bool:
     """Check if a LinkedIn job is likely reposted.
 
-    Two signals (either triggers):
+    Two signals:
     1. Cross-run history: company::title appeared in a run >7 days ago
     2. Job ID age gap: job ID suggests >14 days old (based on ~530K IDs/day)
+
+    Job ID override: if the job ID is fresh (<14 days old), signal 1 is
+    suppressed — a fresh ID means it's a new posting, not a repost,
+    even if the same company+title appeared in an old run.
 
     Carryover exception: if the job URL appeared in the most recent previous
     run, skip signal 1 (cross-run title match) — it's likely a 24h window
@@ -492,8 +496,17 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
     url = _normalize_url(job.get("job_url", ""))
     is_carryover = bool(recent_urls and url in recent_urls)
 
-    # Signal 1: cross-run history (suppressed by carryover exception)
-    if not is_carryover:
+    # Check job ID age first — fresh ID overrides title match
+    job_id = _extract_linkedin_job_id(url)
+    is_fresh = False
+    if job_id and today_max_linkedin_id:
+        age_days = (today_max_linkedin_id - job_id) / LINKEDIN_DAILY_ID_GROWTH
+        is_fresh = age_days <= REPOST_JOB_ID_AGE_DAYS
+        if age_days > REPOST_JOB_ID_AGE_DAYS:
+            return True
+
+    # Signal 1: cross-run history (suppressed by carryover OR fresh job ID)
+    if not is_carryover and not is_fresh:
         import sys
         from pathlib import Path as _P
         skill_dir = _P("/home/sagar/Skills/Jobscraper")
@@ -503,13 +516,6 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
 
         key = normalize_key(job.get("company", ""), job.get("title", ""))
         if key and key in old_title_keys:
-            return True
-
-    # Signal 2: job ID age gap (NOT suppressed by carryover — old ID = repost)
-    job_id = _extract_linkedin_job_id(url)
-    if job_id and today_max_linkedin_id:
-        age_days = (today_max_linkedin_id - job_id) / LINKEDIN_DAILY_ID_GROWTH
-        if age_days > REPOST_JOB_ID_AGE_DAYS:
             return True
 
     return False
@@ -555,17 +561,38 @@ def _process_result(result: dict, desc_text: str, jsonld: dict | None = None) ->
 # ── LinkedIn Verifier (plain requests + JSON-LD, no auth) ────────────────────
 
 def verify_linkedin(job: dict) -> dict:
-    """Verify a LinkedIn job via plain requests + JSON-LD extraction.
-
-    LinkedIn job detail pages serve full JD in JSON-LD to unauthenticated
-    requests. 2 workers, 1s delay, retry once on failure.
+    """Verify a single LinkedIn job. Uses pre-fetched TinyFish description if
+    available, falls back to plain requests + JSON-LD otherwise.
     """
     result = _empty_result()
     url = job.get("job_url", "")
     if not url:
         return result
 
-    for attempt in range(2):  # max 2 attempts
+    # If TinyFish already injected a description, use it directly
+    prefetched = job.get("description", "")
+    if prefetched and len(prefetched) > 50:
+        # Detect LinkedIn auth-wall boilerplate (no real JD content)
+        _BOILERPLATE_MARKERS = ("Similar jobs", "People also viewed", "Referrals increase")
+        _JD_MARKERS = ("requirements", "responsibilities", "qualifications", "experience",
+                       "skills", "You will", "Your role", "What you", "Aufgaben",
+                       "Anforderungen", "Profil", "Voraussetzungen", "Wir suchen",
+                       "Über uns", "Das bringen Sie", "What you'll", "About the role",
+                       "Job description", "About you", "Your mission", "Was Sie")
+        text_lower = prefetched.lower()
+        is_boilerplate = any(m in prefetched for m in _BOILERPLATE_MARKERS)
+        has_jd = any(m.lower() in text_lower for m in _JD_MARKERS)
+        if is_boilerplate and not has_jd:
+            # Auth wall — LinkedIn didn't render the real JD. Leave unverified
+            # so the user can review manually.
+            result["detail_language"] = "AUTH WALL — review manually"
+            return result
+        result["verified_active"] = "True"
+        result = _process_result(result, prefetched)
+        return result
+
+    # Fallback: plain requests + JSON-LD
+    for attempt in range(2):
         try:
             resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS,
                                 allow_redirects=True)
@@ -586,31 +613,26 @@ def verify_linkedin(job: dict) -> dict:
                 desc, _ = _extract_description_text(html)
                 result = _process_result(result, desc, jsonld)
             else:
-                # No JSON-LD — might be rate-limited or auth-walled
-                # Check if page has job content at all
                 title = job.get("title", "")
                 if title and title.lower() in html.lower():
                     result["verified_active"] = "True"
-                    desc, _ = _extract_description_text(html)
-                    result = _process_result(result, desc)
                 elif attempt == 0:
-                    # Retry once — might be transient rate-limit
                     time.sleep(3)
                     continue
                 else:
-                    # Unknown — keep, no signals
                     pass
             break
         except (requests.RequestException, requests.Timeout):
             if attempt == 0:
                 time.sleep(3)
                 continue
-            # Network error — unknown, keep
             pass
             break
 
-    time.sleep(1)  # polite delay
+    time.sleep(1)
     return result
+
+
 
 
 # ── Indeed Verifier (plain requests) ─────────────────────────────────────────
@@ -952,7 +974,7 @@ def verify_platform_batch(platform: str, jobs: list[dict]) -> list[tuple[int, di
                 except Exception:
                     results.append((idx, _empty_result()))
     elif platform in PARALLEL_PLATFORMS:
-        # LinkedIn: 2 workers (5 workers causes ~29% rate-limit failures)
+        # LinkedIn fallback: 2 workers (plain requests, rate-limit sensitive)
         with ThreadPoolExecutor(max_workers=2) as executor:
             future_to_idx = {
                 executor.submit(verifier, job): i for i, job in enumerate(jobs)
@@ -1091,29 +1113,28 @@ def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict]) -> N
 
 LLM_BATCH_SIZE = 5
 
-_LLM_CLASSIFY_PROMPT = """Analyze these job descriptions and classify the German language requirement and minimum experience years for each.
+_LLM_CLASSIFY_PROMPT = """Classify German language requirement and minimum experience years for each job.
 
-For German level, classify as:
-- "C1+" = requires German above B2 level (C1, C2, fluent/fließend, native/Muttersprache, verhandlungssicher, business fluent, "sehr gute Deutschkenntnisse" standalone, "sehr gut Deutsch")
-- "B1/B2" = explicitly requires B1 or B2 level only (OK for a B2 candidate). Also "gute Deutschkenntnisse" without "sehr"
-- "preferred" = German is nice-to-have/wünschenswert/von Vorteil/idealerweise/a plus (not strictly required)
-- "none" = no German requirement mentioned, or English-only workplace
+German level (pick one):
+- C1+ = C1, C2, fluent/fließend, native/Muttersprache, verhandlungssicher, "sehr gute Deutschkenntnisse" standalone, "mind. C1", "mindestens C1"
+- B1/B2 = B1 or B2 only, "gute Deutschkenntnisse" without "sehr"
+- preferred = nice-to-have/wünschenswert/von Vorteil/idealerweise
+- none = no German mentioned, English-only
 
-IMPORTANT distinctions:
-- "Sehr gute Deutsch- und Englischkenntnisse" (suspended compound) = B1/B2, NOT C1+
-- "Sehr gute Deutschkenntnisse" (standalone) = C1+
-- "Gute Deutschkenntnisse" (without "sehr") = B1/B2
-- "mind." or "mindestens" + C1/C2 = C1+ regardless of phrasing
+Notes: "Sehr gute Deutsch- und Englischkenntnisse" = B1/B2. "Sehr gute Deutschkenntnisse" standalone = C1+.
 
-For minimum experience years:
-- Extract the MINIMUM years of professional experience required
-- "1-3 Jahre" = 1 (minimum), "mehrjährige Erfahrung" = 3, "einige Jahre" = 2, "berufliche Erfahrung" without number = null
-- null if no experience requirement mentioned
+Experience years (minimum required):
+- "mehrere Jahre" = 3, "mehrjährige" = 3, "einige Jahre" = 2, "1-3 Jahre" = 1
+- empty = no requirement mentioned
 
-Job descriptions:
+Jobs:
 {jobs}
 
-Return a JSON array of {count} objects, one per job, in order."""
+Reply with EXACTLY {count} lines. Format: <job_number>|<german_level>|<exp_years_or_empty>
+Example:
+1|C1+|3
+2|none|
+3|preferred|2"""
 
 # Keywords for extracting relevant JD sections (German + experience)
 _RELEVANT_KEYWORDS = re.compile(
@@ -1152,6 +1173,13 @@ def _extract_relevant_sections(jd_text: str, context_chars: int = 200) -> str:
     return jd_text[:2000]
 
 
+# Parse "N|level|years" lines from LLM plain-text output
+_LLM_LINE_RE = re.compile(
+    r'^(\d+)\s*\|\s*(C1\+|B1/B2|preferred|none)\s*\|\s*(\d*)\s*$',
+    re.IGNORECASE,
+)
+
+
 def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
     """Classify German level + experience years for a batch of JD texts via LLM.
 
@@ -1161,56 +1189,55 @@ def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
     if not jd_texts:
         return []
 
-    # If LLM not available, skip straight to regex (avoids per-batch NameError noise)
     if "completion" not in globals():
         return [
             {"german": _regex_german_level(t), "exp_years": _regex_exp_years(t)}
             for t in jd_texts
         ]
-    # Extract relevant sections (German/language + experience keywords)
-    # instead of truncating — requirements often appear past char 2000
+
     extracted = [_extract_relevant_sections(t) for t in jd_texts]
     jobs_block = "\n\n".join(
-        f"Job {i+1}: {text}" for i, text in enumerate(extracted)
+        f"{i+1}: {text}" for i, text in enumerate(extracted)
     )
     prompt = _LLM_CLASSIFY_PROMPT.format(jobs=jobs_block, count=len(jd_texts))
 
     try:
-        result = completion(
-            prompt=prompt,
-            model="smol",
-            schema={
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "german": {
-                            "type": "string",
-                            "enum": ["C1+", "B1/B2", "preferred", "none"]
-                        },
-                        "exp_years": {
-                            "type": ["integer", "null"]
-                        }
-                    },
-                    "required": ["german", "exp_years"]
-                }
-            }
-        )
-        # result is a dict with "items" key (from schema array)
-        items = result.get("items", result) if isinstance(result, dict) else result
-        if isinstance(items, list) and len(items) == len(jd_texts):
-            return items
-        # Length mismatch — fall back to regex for all
-        print(f"  [!] LLM returned {len(items) if isinstance(items, list) else 0} results for {len(jd_texts)} jobs — falling back to regex")
+        raw = completion(prompt=prompt, model="smol")
+        if isinstance(raw, dict):
+            text = raw.get("value") or raw.get("text") or str(raw)
+        else:
+            text = str(raw)
+
+        # Parse "N|level|years" lines
+        parsed = {}
+        for line in text.splitlines():
+            m = _LLM_LINE_RE.match(line.strip())
+            if m:
+                job_num = int(m.group(1))
+                german = m.group(2)
+                exp_str = m.group(3).strip()
+                exp = int(exp_str) if exp_str else None
+                parsed[job_num] = {"german": german, "exp_years": exp}
+
+        # Build results in order, filling gaps with regex
+        results = []
+        missing = 0
+        for i in range(1, len(jd_texts) + 1):
+            if i in parsed:
+                results.append(parsed[i])
+            else:
+                missing += 1
+                results.append({"german": _regex_german_level(jd_texts[i-1]), "exp_years": _regex_exp_years(jd_texts[i-1])})
+
+        if missing:
+            print(f"  [!] LLM: {len(parsed)}/{len(jd_texts)} parsed, {missing} filled with regex")
+
+        return results
     except Exception as e:
         print(f"  [!] LLM classification failed: {e} — falling back to regex")
 
-    # Fallback: regex
     return [
-        {
-            "german": _regex_german_level(t),
-            "exp_years": _regex_exp_years(t),
-        }
+        {"german": _regex_german_level(t), "exp_years": _regex_exp_years(t)}
         for t in jd_texts
     ]
 
@@ -1320,6 +1347,37 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
                 print(f"[*] Injected descriptions from JSON for {injected} job(s)")
         except (json.JSONDecodeError, OSError):
             pass
+
+    # Pre-fetch LinkedIn JDs via TinyFish (main thread — tool.* not thread-safe)
+    # TinyFish renders JS-heavy LinkedIn pages that plain requests can't.
+    if "tinyfish_fetch" in globals():
+        linkedin_jobs = [r for r in rows if r.get("job_board") == "LinkedIn" and not r.get("description")]
+        if linkedin_jobs:
+            print(f"[*] Pre-fetching {len(linkedin_jobs)} LinkedIn JDs via TinyFish...")
+            tf_batch_size = 2  # keep response under truncation limit
+            tf_injected = 0
+            for batch_start in range(0, len(linkedin_jobs), tf_batch_size):
+                batch = linkedin_jobs[batch_start:batch_start + tf_batch_size]
+                urls = [j.get("job_url", "") for j in batch if j.get("job_url")]
+                if not urls:
+                    continue
+                try:
+                    resp = tinyfish_fetch(urls)
+                    for item in resp.get("results", []):
+                        u = item.get("url", "")
+                        text = item.get("text", "")
+                        if text:
+                            for row in rows:
+                                if row.get("job_url") == u:
+                                    row["description"] = text
+                                    tf_injected += 1
+                                    break
+                except Exception as exc:
+                    print(f"  [!] TinyFish batch {batch_start // tf_batch_size + 1} failed: {exc}")
+                batch_num = batch_start // tf_batch_size + 1
+                total_batches = (len(linkedin_jobs) + tf_batch_size - 1) // tf_batch_size
+                print(f"    TinyFish batch {batch_num}/{total_batches} done ({tf_injected} JDs so far)", flush=True)
+            print(f"[*] TinyFish injected {tf_injected} LinkedIn descriptions")
 
     # Idempotency: skip rows already verified unless --force
     to_verify: list[tuple[int, dict]] = []

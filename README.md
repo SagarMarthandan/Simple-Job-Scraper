@@ -116,12 +116,19 @@ python3 verify_jobs.py --csv path/to.csv  # specific CSV
 python3 verify_jobs.py --force            # re-verify all rows
 ```
 
+When run inside the OMP eval sandbox, `verify_jobs.py` can use **TinyFish** (MCP tool) to render LinkedIn job pages and **LLM batch classification** for German level + experience years. Inject both before calling `run_verification()`:
+
+```python
+verify_jobs.completion = completion       # smol model for LLM classification
+verify_jobs.tinyfish_fetch = tinyfish_fetch  # TinyFish bridge function
+```
+
 ### What It Does
 
 1. **Active/closed check** — 404/410/redirect-to-expired = drop. Catches already-filled positions.
-2. **German level filter (max B2)** — LLM-based classification of JD text (smol model, batch of 5 JDs per call). Classifies as C1+ (drop), B1/B2 (keep), preferred (keep + flag), or none. Handles all phrasing variants: `fließend Deutsch`, `C1 Niveau`, `Muttersprache`, `verhandlungssicher`, `sehr gute Deutschkenntnisse` standalone (drop), `Sehr gute Deutsch- und Englischkenntnisse` suspended compound (keep), `gute Deutschkenntnisse` without `sehr` (keep), `wünschenswert`/`von Vorteil` (preferred). Falls back to regex when LLM not available (standalone mode).
+2. **German level filter (max B2)** — LLM-based classification of JD text (smol model, batch of 5 JDs per call, plain-text `N|level|years` output format). Classifies as C1+ (drop), B1/B2 (keep), preferred (keep + flag), or none. Handles all phrasing variants: `fließend Deutsch`, `C1 Niveau`, `Muttersprache`, `verhandlungssicher`, `sehr gute Deutschkenntnisse` standalone (drop), `Sehr gute Deutsch- und Englischkenntnisse` suspended compound (keep), `gute Deutschkenntnisse` without `sehr` (keep), `wünschenswert`/`von Vorteil` (preferred). Falls back to regex when LLM not available (standalone mode).
 3. **Experience ≥3 years → drop** — LLM extracts minimum experience years from JD body text. Handles `X Jahre Berufserfahrung`, `mehrjährige Erfahrung` (→3), `einige Jahre` (→2), `1-3 Jahre` (→1, minimum), `at least X years`. Hard drop (was enrichment-only in v1). Falls back to regex when LLM not available.
-4. **Reposted LinkedIn detection** — segregates to "Reposted" sheet (not dropped). Two signals: (1) cross-run history — same `company::title` appeared in a run >7 days ago, (2) job ID age gap — LinkedIn creates ~530K IDs/day; if job ID suggests >14 days old, flag as reposted. Carryover exception: if the job URL appeared in the most recent previous run, it's a carryover (not a repost) — skip both signals. URLs normalized (trailing slash + query params stripped) before comparison. `datePosted` is reset on repost, so it can't be used.
+4. **Reposted LinkedIn detection** — segregates to "Reposted" sheet (not dropped). Two signals: (1) cross-run history — same `company::title` appeared in a run >7 days ago, (2) job ID age gap — LinkedIn creates ~530K IDs/day; if job ID suggests >14 days old, flag as reposted. **Job ID override**: if the job ID is fresh (<14 days old), signal 1 is suppressed — a fresh ID means it's a new posting, not a repost, even if the same company+title appeared in an old run. Carryover exception: if the job URL appeared in the most recent previous run, it's a carryover (not a repost) — skip signal 1. URLs normalized (trailing slash + query params stripped) before comparison. `datePosted` is reset on repost, so it can't be used.
 5. **Match score recalculation** — recalculated from actual JD text using `TECH_KEYWORDS` (dbt, airflow, spark, python, sql, gcp, bigquery, aws, azure, databricks, docker, kafka, postgresql, snowflake). Same density formula as pipeline but on full description text.
 6. **Enrichment** — remote/hybrid/onsite detection, salary extraction (from body text or JSON-LD `baseSalary`).
 
@@ -129,7 +136,7 @@ python3 verify_jobs.py --force            # re-verify all rows
 
 | Platform | Method | Delay | Workers |
 |---|---|---|---|
-| LinkedIn | Plain `requests` + JSON-LD | 1s | 2 |
+| LinkedIn | TinyFish pre-fetch (sandbox) or plain `requests` + JSON-LD (standalone) | 1s | 2 |
 | Indeed | Apify JSON description (401/403 walled) | — | 1 |
 | Xing | Plain `requests` | 1.5s | 1 |
 | Stepstone | Plain `requests` | 2s | 1 |
@@ -138,11 +145,17 @@ python3 verify_jobs.py --force            # re-verify all rows
 | Glassdoor | `cloudscraper` | 2s | 1 |
 | Arbeitnow | Free API | — | 1 |
 
-All platforms run in parallel via `ThreadPoolExecutor` (1 thread per platform). Total wall time ~7 min for 394 jobs (dominated by Xing 196 URLs at 1.5s delay). Network errors don't drop jobs — `verified_active` is left empty (treated as "unknown, keep").
+All platforms run in parallel via `ThreadPoolExecutor` (1 thread per platform). Network errors don't drop jobs — `verified_active` is left empty (treated as "unknown, keep").
 
 ### LinkedIn JD Extraction
 
-LinkedIn job detail pages serve full JDs via JSON-LD `<script type="application/ld+json">` tags to unauthenticated plain requests. No auth wall, no Cloudflare challenge on detail pages. The JSON-LD contains `description` (full JD, HTML-entity-encoded, 3K-8K chars), `datePosted`, `validThrough`, `title`, `hiringOrganization`, `jobLocation`, `skills`. 2 workers with 1s delay + retry once on failure (~95%+ success rate). CRITICAL: `datePosted` is reset on repost — use job ID age gap or cross-run history for repost detection, not `datePosted`.
+**TinyFish (sandbox mode)**: When `tinyfish_fetch` is injected, LinkedIn JDs are pre-fetched in the **main thread** before platform verification starts (TinyFish MCP tool is not thread-safe — calling `tool.*` from `ThreadPoolExecutor` worker threads raises `RuntimeError`). JDs are fetched in batches of 2 URLs (response truncates at ~25K chars with larger batches), injected into `row["description"]`, then `verify_linkedin` in worker threads picks up the pre-fetched description without making network calls. 187 LinkedIn URLs → 94 batches × ~8s = ~12 min. Auth-wall detection: if TinyFish returns only LinkedIn boilerplate (Similar jobs, People also viewed, Referrals increase) without real JD markers (requirements, responsibilities, Aufgaben, etc.), the job is flagged with `detail_language = "AUTH WALL — review manually"` and left unverified for manual review.
+
+**Plain requests (standalone mode)**: LinkedIn job detail pages serve full JDs via JSON-LD `<script type="application/ld+json">` tags to unauthenticated plain requests. No auth wall, no Cloudflare challenge on detail pages. The JSON-LD contains `description` (full JD, HTML-entity-encoded, 3K-8K chars), `datePosted`, `validThrough`, `title`, `hiringOrganization`, `jobLocation`, `skills`. 2 workers with 1s delay + retry once on failure (~95%+ success rate). CRITICAL: `datePosted` is reset on repost — use job ID age gap or cross-run history for repost detection, not `datePosted`.
+
+### LLM Classification
+
+German level and experience years are classified by an LLM (smol model via `completion()`) in batches of 5 JDs per call. Output format is plain-text `N|level|years` per line (not JSON schema — JSON caused response shape mismatches across models). The parser uses `_LLM_LINE_RE = re.compile(r'^(\d+)\s*\|\s*(C1\+|B1/B2|preferred|none)\s*\|\s*(\d*)\s*$', re.IGNORECASE)`. Partial results (some lines unparseable) fill gaps with regex fallback. When `completion()` is not available (standalone mode), regex-based `detect_german_requirement()` and `extract_exp_years()` are used with a one-time warning.
 
 ### Output
 
@@ -158,7 +171,7 @@ Both sheets have the same 16 columns:
 | Column | Values |
 |---|---|
 | `verified_active` | `True` / `False` / empty (unknown) |
-| `detail_language` | `German C1+ required` (dropped) / `German preferred` (flagged) / `German B1/B2 OK` (kept) / empty |
+| `detail_language` | `German C1+ required` (dropped) / `German preferred` (flagged) / `German B1/B2 OK` (kept) / `AUTH WALL — review manually` (TinyFish auth wall) / empty |
 | `detail_exp_years` | Integer (minimum years required) or empty |
 | `detail_reposted` | `True` / `False` (LinkedIn only) / empty |
 | `detail_salary` | e.g. `45000-60000 EUR/year` or empty |

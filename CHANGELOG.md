@@ -3,6 +3,26 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
+## [2026-08-28c]
+
+### Changed
+- **TinyFish LinkedIn JD pre-fetch** — LinkedIn's free scraper returns `description: ""` for all jobs, and `verify_jobs.py`'s `requests.get()` fallback gets rate-limited (no JSON-LD, 76K chars of HTML boilerplate). TinyFish MCP tool (`fetch_content`) renders LinkedIn pages in a real browser and extracts clean JD text. Pre-fetches all LinkedIn JDs in the **main thread** before platform verification (TinyFish `tool.*` is not thread-safe — `RuntimeError: Missing session/run/name` from `ThreadPoolExecutor` worker threads). JDs injected into `row["description"]`, same pattern as Indeed JSON injection. Batch size 2 (response truncates at ~25K chars with larger batches). 187 LinkedIn URLs → 94 batches × ~8s = ~12 min. Result: 299 jobs classified by LLM (was 113), 68 C1+ dropped (was 39), 34 exp dropped (was 17).
+- **LLM plain-text output format** — replaced JSON schema with plain-text `N|level|years` per-line format. JSON schema caused `{'value': '[...]'}` response shape mismatches across models. Parser: `_LLM_LINE_RE = re.compile(r'^(\d+)\s*\|\s*(C1\+|B1/B2|preferred|none)\s*\|\s*(\d*)\s*$', re.IGNORECASE)`. Partial results fill gaps with regex fallback.
+- **Reposted detection: job ID override** — if LinkedIn job ID is fresh (<14 days old), cross-run title match (signal 1) is suppressed. A fresh ID means it's a new posting, not a repost, even if the same `company::title` appeared in an old run. Fixes false positives like Code Compass ML Engineer (3.7-day-old job ID, same title as old run → was wrongly segregated to Reposted sheet).
+- **`verify_linkedin` uses pre-fetched description** — checks `job.get("description")` (>50 chars) before making network requests. If TinyFish already injected the JD, calls `_process_result` directly and returns. Falls back to `requests.get()` + JSON-LD only when no pre-fetched description is available.
+- **Auth-wall detection** — if TinyFish returns only LinkedIn boilerplate (Similar jobs, People also viewed, Referrals increase) without real JD markers (requirements, responsibilities, Aufgaben, Profil, etc.), the job is flagged with `detail_language = "AUTH WALL — review manually"` and `verified_active` is left empty for manual review. ~21/187 LinkedIn jobs affected (LinkedIn auth wall, not a code bug).
+
+### Removed
+- **`verify_linkedin_tinyfish()`** — dead code. Was a batch function called from `verify_platform_batch` that invoked `tinyfish_fetch` from worker threads (failed with `RuntimeError`). Replaced by the main-thread pre-fetch in `run_verification()`.
+- **TinyFish dispatch in `verify_platform_batch`** — the `elif platform == "LinkedIn" and "tinyfish_fetch" in globals()` branch that routed to `verify_linkedin_tinyfish`. LinkedIn now falls through to the normal `PARALLEL_PLATFORMS` path with `verify_linkedin`.
+
+### Verification
+- 301 input → 105 kept, 93 reposted, 1 closed, 68 C1+ dropped, 34 exp dropped, 79 enriched (was: 151 kept, 39 C1+ dropped, 17 exp dropped, 48 enriched with regex-only)
+- Hypoport SE Data Engineer correctly dropped (C1+ German, 3+ years exp) — was in main sheet with empty signals before fix
+- Code Compass ML Engineer stays in main sheet (3.7-day-old job ID, fresh posting)
+- 187/187 LinkedIn JDs injected via TinyFish (batch size 2, 94 batches)
+- 299/301 jobs classified by LLM (60 batches of 5, plain-text format)
+
 ## [2026-08-28b]
 
 ### Changed
