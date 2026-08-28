@@ -402,7 +402,7 @@ def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
             try:
                 with open(csvs[0], newline="", encoding="utf-8-sig") as f:
                     for row in csv.DictReader(f):
-                        url = (row.get("job_url", "") or "").rstrip("/")
+                        url = _normalize_url(row.get("job_url", ""))
                         if url:
                             recent_urls.add(url)
             except Exception:
@@ -434,6 +434,17 @@ def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
     return old_title_keys, recent_urls
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize URL for cross-run comparison: strip query params + trailing slash."""
+    url = url or ""
+    # Drop query string first (LinkedIn tracking params like ?refId=... change per run)
+    if "?" in url:
+        url = url.split("?", 1)[0]
+    # Then strip trailing slash
+    url = url.rstrip("/")
+    return url
+
+
 def _extract_linkedin_job_id(url: str) -> int:
     """Extract numeric job ID from LinkedIn URL. Returns 0 if not found."""
     m = re.search(r'-(\d+)$', url or "")
@@ -455,7 +466,7 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
         return False
 
     # Carryover check: if URL was in yesterday's run, it's not a new repost
-    url = (job.get("job_url", "") or "").rstrip("/")
+    url = _normalize_url(job.get("job_url", ""))
     if recent_urls and url in recent_urls:
         return False
 
