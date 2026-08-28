@@ -119,9 +119,9 @@ python3 verify_jobs.py --force            # re-verify all rows
 ### What It Does
 
 1. **Active/closed check** — 404/410/redirect-to-expired = drop. Catches already-filled positions.
-2. **German level filter (max B2)** — scans JD text for hard German requirements (`fließend Deutsch`, `C1/C2 Niveau`, `Muttersprache Deutsch`, `verhandlungssicher`, `business fluent`, `sehr gute Deutschkenntnisse`). Drops rows requiring >B2 German. B1/B2 explicit → keep (`German B1/B2 OK`). Soft requirements (`wünschenswert`, `von Vorteil`, `nice to have`) → flagged but kept (`German preferred`). Uses same-sentence contradiction logic.
+2. **German level filter (max B2)** — scans JD text for hard German requirements (`fließend Deutsch`, `C1/C2 Niveau`, `Muttersprache Deutsch`, `verhandlungssicher`, `business fluent`, `sehr gute Deutschkenntnisse` standalone). Drops rows requiring >B2 German. `Sehr gute Deutsch- und Englischkenntnisse` (suspended compound) → keep (false positive). B1/B2 explicit → keep (`German B1/B2 OK`). Soft requirements (`wünschenswert`, `von Vorteil`, `nice to have`) → flagged but kept (`German preferred`). Uses same-sentence contradiction logic.
 3. **Experience ≥3 years → drop** — regex for `X Jahre Berufserfahrung` / `X years experience` / `min. X Jahre` / `at least X years` in JD body text. Hard drop (was enrichment-only in v1). Returns minimum years found (handles "1-3 Jahre" → 1).
-4. **Reposted LinkedIn detection** — segregates to "Reposted" sheet (not dropped). Two signals: (1) cross-run history — same `company::title` appeared in a run >7 days ago, (2) job ID age gap — LinkedIn creates ~530K IDs/day; if job ID suggests >14 days old, flag as reposted. `datePosted` is reset on repost, so it can't be used.
+4. **Reposted LinkedIn detection** — segregates to "Reposted" sheet (not dropped). Two signals: (1) cross-run history — same `company::title` appeared in a run >7 days ago, (2) job ID age gap — LinkedIn creates ~530K IDs/day; if job ID suggests >14 days old, flag as reposted. Carryover exception: if the job URL appeared in the most recent previous run, it's a carryover (not a repost) — skip both signals. URLs normalized (trailing slash + query params stripped) before comparison. `datePosted` is reset on repost, so it can't be used.
 5. **Match score recalculation** — recalculated from actual JD text using `TECH_KEYWORDS` (dbt, airflow, spark, python, sql, gcp, bigquery, aws, azure, databricks, docker, kafka, postgresql, snowflake). Same density formula as pipeline but on full description text.
 6. **Enrichment** — remote/hybrid/onsite detection, salary extraction (from body text or JSON-LD `baseSalary`).
 
@@ -130,7 +130,7 @@ python3 verify_jobs.py --force            # re-verify all rows
 | Platform | Method | Delay | Workers |
 |---|---|---|---|
 | LinkedIn | Plain `requests` + JSON-LD | 1s | 2 |
-| Indeed | Plain `requests` | 2s | 1 |
+| Indeed | Apify JSON description (401/403 walled) | — | 1 |
 | Xing | Plain `requests` | 1.5s | 1 |
 | Stepstone | Plain `requests` | 2s | 1 |
 | Greenhouse/SmartRecruiters/Ashby | Public JSON API | 0.5s | 4 |
@@ -138,7 +138,7 @@ python3 verify_jobs.py --force            # re-verify all rows
 | Glassdoor | `cloudscraper` | 2s | 1 |
 | Arbeitnow | Free API | — | 1 |
 
-All platforms run in parallel via `ThreadPoolExecutor` (1 thread per platform). Total wall time ~66s for 109 jobs. Network errors don't drop jobs — `verified_active` is left empty (treated as "unknown, keep").
+All platforms run in parallel via `ThreadPoolExecutor` (1 thread per platform). Total wall time ~7 min for 394 jobs (dominated by Xing 196 URLs at 1.5s delay). Network errors don't drop jobs — `verified_active` is left empty (treated as "unknown, keep").
 
 ### LinkedIn JD Extraction
 
@@ -229,7 +229,7 @@ graph TD
     K --> K2[Cross-platform fuzzy dedup — company overlap + title Jaccard + location]
     K2 --> L[Cross-run dedup vs previous run]
     L --> M[Export CSV + JSON + MD + XLSX]
-    M --> N[verify_jobs.py — optional post-step: German C1+ filter, stale check, enrichment]
+    M --> N[verify_jobs.py — post-step: verify all URLs, German >B2 filter, exp ≥3y drop, reposted segregation, match score recalc, 2-sheet XLSX]
 
 ### Key Functions
 
@@ -264,10 +264,10 @@ graph TD
 | `extract_remote()` | verify_jobs.py | Remote/hybrid/onsite detection from page text |
 | `compute_match_score_from_jd()` | verify_jobs.py | Recalculates match score from full JD text using `TECH_KEYWORDS` density |
 | `verify_linkedin()` | verify_jobs.py | LinkedIn JD via plain requests + JSON-LD extraction (no auth, 2 workers, 1s delay, retry once) |
-| `verify_indeed()` | verify_jobs.py | Indeed JD via plain requests, HTML/JSON-LD extraction |
+| `verify_indeed()` | verify_jobs.py | Indeed JD from Apify-provided JSON description (URL is 401/403 walled, no fetch needed) |
 | `verify_xing()` / `verify_stepstone()` | verify_jobs.py | Per-platform URL verification with live check + signal extraction |
 | `verify_greenhouse()` / `verify_smartrecruiters()` / `verify_ashby()` | verify_jobs.py | ATS API verification — 404/empty = closed |
-| `detect_reposted()` | verify_jobs.py | Reposted detection: cross-run history (>7d) + LinkedIn job ID age gap (>14d) |
+| `detect_reposted()` | verify_jobs.py | Reposted detection: cross-run history (>7d) + job ID age gap (>14d), with carryover exception (URL in recent run → skip) |
 | `save_xlsx()` | verify_jobs.py | 2-sheet XLSX export (Job Search + Reposted) with autofilter, frozen header, hyperlinks |
 | `run_verification()` | verify_jobs.py | Main entry: load CSV, verify per-platform in parallel, apply 4 filters, write 2-sheet XLSX, print summary |
 
