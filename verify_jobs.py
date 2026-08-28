@@ -22,9 +22,20 @@ Output: Job_Search_<date>_verified.xlsx with 2 sheets:
   - "Reposted":   LinkedIn jobs flagged as reposted (for manual review)
 
 Usage:
+  # Run inside eval sandbox (LLM classification available):
+  import verify_jobs; verify_jobs.completion = completion
+  verify_jobs.run_verification(Path("Job Search/YYYY-MM-DD/Job_Search_*.csv"), force=True)
+
+  # Or standalone (falls back to regex for German/exp if no LLM):
   python3 verify_jobs.py                  # auto-finds most recent CSV
   python3 verify_jobs.py --csv path.csv   # specify input
   python3 verify_jobs.py --force          # re-verify all (ignore prior results)
+
+Note: German level + experience classification uses LLM (smol model, batch of 5
+JDs per call) when completion() is available. Falls back to regex patterns
+when running standalone without an LLM client. LLM catches all phrasing variants
+("sehr gut Deutsch, mind. auf Level C1", "fließend in Wort und Schrift", etc.)
+that regex misses.
 """
 
 import argparse
@@ -506,20 +517,26 @@ def _empty_result() -> dict:
 
 
 def _extract_signals(text: str, jsonld: dict | None = None) -> dict:
-    """Run all signal extractors on description text."""
+    """Run regex-based signal extractors on description text.
+
+    German language and experience are classified later via LLM batch.
+    Only salary and remote use regex (simpler patterns, fewer variants).
+    """
     return {
-        "detail_language": detect_german_requirement(text),
-        "detail_exp_years": extract_exp_years(text),
         "detail_salary": extract_salary(text, jsonld),
         "detail_remote": extract_remote(text),
     }
 
 
 def _process_result(result: dict, desc_text: str, jsonld: dict | None = None) -> dict:
-    """Fill in signals + recalculated match score from JD text."""
+    """Fill in signals + recalculated match score from JD text.
+
+    Stores desc_text for later LLM batch classification of German + exp.
+    """
     signals = _extract_signals(desc_text, jsonld)
     result.update(signals)
     result["match_score"] = f"{compute_match_score_from_jd(desc_text)}%"
+    result["_jd_text"] = desc_text  # stored for LLM batch, removed before export
     return result
 
 
@@ -1058,6 +1075,160 @@ def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict]) -> N
     wb.save(path)
     print(f"[✓] XLSX exported to: {path}")
 
+# ── LLM Batch Classification (German + Experience) ──────────────────────────
+
+LLM_BATCH_SIZE = 5
+
+_LLM_CLASSIFY_PROMPT = """Analyze these job descriptions and classify the German language requirement and minimum experience years for each.
+
+For German level, classify as:
+- "C1+" = requires German above B2 level (C1, C2, fluent/fließend, native/Muttersprache, verhandlungssicher, business fluent, "sehr gute Deutschkenntnisse" standalone, "sehr gut Deutsch")
+- "B1/B2" = explicitly requires B1 or B2 level only (OK for a B2 candidate). Also "gute Deutschkenntnisse" without "sehr"
+- "preferred" = German is nice-to-have/wünschenswert/von Vorteil/idealerweise/a plus (not strictly required)
+- "none" = no German requirement mentioned, or English-only workplace
+
+IMPORTANT distinctions:
+- "Sehr gute Deutsch- und Englischkenntnisse" (suspended compound) = B1/B2, NOT C1+
+- "Sehr gute Deutschkenntnisse" (standalone) = C1+
+- "Gute Deutschkenntnisse" (without "sehr") = B1/B2
+- "mind." or "mindestens" + C1/C2 = C1+ regardless of phrasing
+
+For minimum experience years:
+- Extract the MINIMUM years of professional experience required
+- "1-3 Jahre" = 1 (minimum), "mehrjährige Erfahrung" = 3, "einige Jahre" = 2, "berufliche Erfahrung" without number = null
+- null if no experience requirement mentioned
+
+Job descriptions:
+{jobs}
+
+Return a JSON array of {count} objects, one per job, in order."""
+
+
+def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
+    """Classify German level + experience years for a batch of JD texts via LLM.
+
+    Returns list of {"german": str, "exp_years": int|None} per job.
+    Falls back to regex if LLM fails.
+    """
+    if not jd_texts:
+        return []
+
+    # Truncate each JD to 2000 chars to keep prompt manageable
+    truncated = [t[:2000] for t in jd_texts]
+    jobs_block = "\n\n".join(
+        f"Job {i+1}: {text}" for i, text in enumerate(truncated)
+    )
+    prompt = _LLM_CLASSIFY_PROMPT.format(jobs=jobs_block, count=len(jd_texts))
+
+    try:
+        result = completion(
+            prompt=prompt,
+            model="smol",
+            schema={
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "german": {
+                            "type": "string",
+                            "enum": ["C1+", "B1/B2", "preferred", "none"]
+                        },
+                        "exp_years": {
+                            "type": ["integer", "null"]
+                        }
+                    },
+                    "required": ["german", "exp_years"]
+                }
+            }
+        )
+        # result is a dict with "items" key (from schema array)
+        items = result.get("items", result) if isinstance(result, dict) else result
+        if isinstance(items, list) and len(items) == len(jd_texts):
+            return items
+        # Length mismatch — fall back to regex for all
+        print(f"  [!] LLM returned {len(items) if isinstance(items, list) else 0} results for {len(jd_texts)} jobs — falling back to regex")
+    except Exception as e:
+        print(f"  [!] LLM classification failed: {e} — falling back to regex")
+
+    # Fallback: regex
+    return [
+        {
+            "german": _regex_german_level(t),
+            "exp_years": _regex_exp_years(t),
+        }
+        for t in jd_texts
+    ]
+
+
+def _regex_german_level(text: str) -> str:
+    """Regex fallback for German level classification."""
+    result = detect_german_requirement(text)
+    if result == "German C1+ required":
+        return "C1+"
+    elif result == "German B1/B2 OK":
+        return "B1/B2"
+    elif result == "German preferred":
+        return "preferred"
+    return "none"
+
+
+def _regex_exp_years(text: str) -> int | None:
+    """Regex fallback for experience years extraction."""
+    result = extract_exp_years(text)
+    try:
+        return int(result) if result else None
+    except (ValueError, TypeError):
+        return None
+
+
+def llm_classify_all(rows: list[dict]) -> None:
+    """Batch-classify German + exp for all rows with JD text.
+
+    Mutates rows in-place: sets detail_language and detail_exp_years.
+    Removes _jd_text field after classification.
+    """
+    # Collect rows that have JD text and need classification
+    to_classify = []
+    for i, row in enumerate(rows):
+        jd = row.pop("_jd_text", None)
+        if not jd:
+            # No JD text — skip (already has regex/empty values from verifier)
+            continue
+        to_classify.append((i, jd))
+
+    if not to_classify:
+        return
+
+    print(f"\n[*] LLM batch classification: {len(to_classify)} jobs in batches of {LLM_BATCH_SIZE}...")
+
+    # Process in batches
+    for batch_start in range(0, len(to_classify), LLM_BATCH_SIZE):
+        batch = to_classify[batch_start:batch_start + LLM_BATCH_SIZE]
+        jd_texts = [jd for _, jd in batch]
+
+        results = llm_classify_batch(jd_texts)
+
+        for (row_idx, _), classification in zip(batch, results):
+            row = rows[row_idx]
+            german = classification.get("german", "none")
+            exp = classification.get("exp_years")
+
+            # Map LLM classification to output format
+            if german == "C1+":
+                row["detail_language"] = "German C1+ required"
+            elif german == "B1/B2":
+                row["detail_language"] = "German B1/B2 OK"
+            elif german == "preferred":
+                row["detail_language"] = "German preferred"
+            else:
+                row["detail_language"] = ""
+
+            row["detail_exp_years"] = str(exp) if exp is not None else ""
+
+        batch_num = batch_start // LLM_BATCH_SIZE + 1
+        total_batches = (len(to_classify) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
+        print(f"  [✓] Batch {batch_num}/{total_batches} done ({len(batch)} jobs)")
+
 
 # ── Main Orchestration ───────────────────────────────────────────────────────
 
@@ -1166,7 +1337,9 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
             row.update(result)
         # Reposted detection (LinkedIn only, uses CSV data — no page fetch needed)
         is_repost = detect_reposted(row, today_str, old_title_keys, today_max_linkedin_id, recent_urls)
-        row["detail_reposted"] = "True" if is_repost else ("False" if row.get("job_board") == "LinkedIn" else "")
+
+    # ── LLM batch classification (German level + experience years) ──
+    llm_classify_all(rows)
 
     # ── Apply filters and split into main + reposted ──
     main_rows = []
