@@ -249,19 +249,44 @@ _SALARY_RE = re.compile(
 )
 
 
+def _extract_salary_jsonld(jsonld: dict | None) -> str:
+    """Extract salary string from JSON-LD baseSalary field. Returns "" if absent."""
+    if not jsonld or not isinstance(jsonld, dict):
+        return ""
+    bs = jsonld.get("baseSalary")
+    if not bs or not isinstance(bs, dict):
+        return ""
+    cur = bs.get("currency", "EUR")
+    val = bs.get("value", {})
+    if not isinstance(val, dict):
+        return ""
+    lo = val.get("minValue", val.get("value", ""))
+    hi = val.get("maxValue", "")
+    if lo and hi:
+        return f"{lo}-{hi} {cur}/year"
+    return ""
+
+
+def _detect_salary_period(text: str, match: re.Match) -> str:
+    """Detect salary period ("/year", "/month", or "") from text after the match."""
+    if match.group(3):
+        return "/year"
+    if match.group(4):
+        return "/month"
+    tail = text[match.end():match.end() + 20].lower()
+    if "jahr" in tail or "year" in tail or "p.a" in tail:
+        return "/year"
+    if "monat" in tail or "month" in tail:
+        return "/month"
+    return ""
+
+
 def extract_salary(text: str, jsonld: dict | None = None) -> str:
     """Extract salary range from text or JSON-LD baseSalary field."""
     # JSON-LD baseSalary (structured data) — highest priority
-    if jsonld and isinstance(jsonld, dict):
-        bs = jsonld.get("baseSalary")
-        if bs and isinstance(bs, dict):
-            cur = bs.get("currency", "EUR")
-            val = bs.get("value", {})
-            if isinstance(val, dict):
-                lo = val.get("minValue", val.get("value", ""))
-                hi = val.get("maxValue", "")
-                if lo and hi:
-                    return f"{lo}-{hi} {cur}/year"
+    jsonld_salary = _extract_salary_jsonld(jsonld)
+    if jsonld_salary:
+        return jsonld_salary
     if not text:
         return ""
     m = _SALARY_RE.search(text)
@@ -269,17 +294,7 @@ def extract_salary(text: str, jsonld: dict | None = None) -> str:
         return ""
     lo = m.group(1)
     hi = m.group(2)
-    period = ""
-    if m.group(3):
-        period = "/year"
-    elif m.group(4):
-        period = "/month"
-    else:
-        tail = text[m.end():m.end() + 20].lower()
-        if "jahr" in tail or "year" in tail or "p.a" in tail:
-            period = "/year"
-        elif "monat" in tail or "month" in tail:
-            period = "/month"
+    period = _detect_salary_period(text, m)
     if hi:
         return f"{lo}-{hi} EUR{period}"
     return f"{lo} EUR{period}"
@@ -382,27 +397,8 @@ def _extract_description_text(html: str) -> tuple[str, dict | None]:
 
 # ── Reposted Detection (LinkedIn only) ───────────────────────────────────────
 
-def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
-    """Load reposted detection data from previous runs.
-
-    Returns:
-        old_title_keys: normalize_key(company, title) from runs >7 days ago
-        recent_urls: job URLs from the most recent previous run (carryovers)
-    """
-    import sys
-    skill_dir = Path("/home/sagar/Skills/Jobscraper")
-    if str(skill_dir) not in sys.path:
-        sys.path.insert(0, str(skill_dir))
-    from apify_job_search import normalize_key
-
-    cutoff = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=REPOST_CROSS_RUN_DAYS)
-    old_title_keys = set()
-    recent_urls = set()
-
-    if not job_search_dir.exists():
-        return old_title_keys, recent_urls
-
-    # Find the most recent previous run (for carryover detection)
+def _find_previous_run_dirs(job_search_dir: Path, today_str: str) -> list[Path]:
+    """Return previous run directories sorted by date, excluding today and non-date dirs."""
     prev_dirs = []
     for run_dir in sorted(job_search_dir.iterdir()):
         if not run_dir.is_dir() or not run_dir.name.startswith("2026-"):
@@ -414,6 +410,60 @@ def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
         except ValueError:
             continue
         prev_dirs.append(run_dir)
+    return prev_dirs
+
+
+def _load_urls_from_csv(csv_path: Path) -> set[str]:
+    """Return set of normalized job URLs from a CSV file."""
+    urls = set()
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                url = _normalize_url(row.get("job_url", ""))
+                if url:
+                    urls.add(url)
+    except Exception:
+        pass
+    return urls
+
+
+def _load_linkedin_title_keys_from_csv(csv_path: Path) -> set[str]:
+    """Return set of normalize_key(company, title) for LinkedIn rows from a CSV file."""
+    import sys
+    skill_dir = Path("/home/sagar/Skills/Jobscraper")
+    if str(skill_dir) not in sys.path:
+        sys.path.insert(0, str(skill_dir))
+    from apify_job_search import normalize_key
+
+    keys = set()
+    try:
+        with open(csv_path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                if row.get("job_board") != "LinkedIn":
+                    continue
+                key = normalize_key(row.get("company", ""), row.get("title", ""))
+                if key:
+                    keys.add(key)
+    except Exception:
+        pass
+    return keys
+
+
+def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
+    """Load reposted detection data from previous runs.
+
+    Returns:
+        old_title_keys: normalize_key(company, title) from runs >7 days ago
+        recent_urls: job URLs from the most recent previous run (carryovers)
+    """
+    cutoff = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=REPOST_CROSS_RUN_DAYS)
+    old_title_keys = set()
+    recent_urls = set()
+
+    if not job_search_dir.exists():
+        return old_title_keys, recent_urls
+
+    prev_dirs = _find_previous_run_dirs(job_search_dir, today_str)
 
     # Load URLs from the most recent previous run (carryover detection)
     if prev_dirs:
@@ -421,14 +471,7 @@ def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
         csvs = [c for c in most_recent.glob("Job_Search_*.csv")
                 if "_verified" not in c.name and "_deduped" not in c.name]
         if csvs:
-            try:
-                with open(csvs[0], newline="", encoding="utf-8-sig") as f:
-                    for row in csv.DictReader(f):
-                        url = _normalize_url(row.get("job_url", ""))
-                        if url:
-                            recent_urls.add(url)
-            except Exception:
-                pass
+            recent_urls = _load_urls_from_csv(csvs[0])
 
     # Load title keys from runs older than 7 days (repost detection)
     for run_dir in prev_dirs:
@@ -442,16 +485,7 @@ def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
                 if "_verified" not in c.name and "_deduped" not in c.name]
         if not csvs:
             continue
-        try:
-            with open(csvs[0], newline="", encoding="utf-8-sig") as f:
-                for row in csv.DictReader(f):
-                    if row.get("job_board") != "LinkedIn":
-                        continue
-                    key = normalize_key(row.get("company", ""), row.get("title", ""))
-                    if key:
-                        old_title_keys.add(key)
-        except Exception:
-            pass
+        old_title_keys |= _load_linkedin_title_keys_from_csv(csvs[0])
 
     return old_title_keys, recent_urls
 
@@ -887,6 +921,24 @@ def verify_smartrecruiters(job: dict) -> dict:
     return result
 
 
+def _find_ashby_posting(postings: list, job_id: str) -> dict | None:
+    """Find the posting dict matching job_id in the Ashby postings list."""
+    for posting in postings:
+        if not isinstance(posting, dict):
+            continue
+        if posting.get("id") == job_id or job_id in (posting.get("id", "")):
+            return posting
+    return None
+
+
+def _extract_ashby_desc(target: dict) -> str:
+    """Extract and HTML-strip the description from an Ashby posting dict."""
+    desc = target.get("descriptionHtml", "") or target.get("description", "")
+    if isinstance(desc, str) and "<" in desc:
+        desc = re.sub(r'<[^>]+>', ' ', desc)
+    return desc if isinstance(desc, str) else ""
+
+
 def verify_ashby(job: dict) -> dict:
     """Verify an Ashby job via public API. 404/empty = closed."""
     result = _empty_result()
@@ -905,21 +957,13 @@ def verify_ashby(job: dict) -> dict:
             return result
         data = resp.json()
         postings = data if isinstance(data, list) else data.get("postings", [])
-        target = None
-        for posting in postings:
-            if not isinstance(posting, dict):
-                continue
-            if posting.get("id") == job_id or job_id in (posting.get("id", "")):
-                target = posting
-                break
+        target = _find_ashby_posting(postings, job_id)
         if target is None:
             result["verified_active"] = "False"
             return result
         result["verified_active"] = "True"
-        desc = target.get("descriptionHtml", "") or target.get("description", "")
-        if isinstance(desc, str) and "<" in desc:
-            desc = re.sub(r'<[^>]+>', ' ', desc)
-        result = _process_result(result, desc if isinstance(desc, str) else "")
+        desc = _extract_ashby_desc(target)
+        result = _process_result(result, desc)
     except (requests.RequestException, requests.Timeout, json.JSONDecodeError):
         pass
     return result
@@ -1211,6 +1255,39 @@ _LLM_LINE_RE = re.compile(
 )
 
 
+def _parse_llm_response(text: str, jd_texts: list[str]) -> list[dict] | None:
+    """Parse "N|level|years" lines from LLM output into result dicts.
+
+    Fills gaps with regex fallback. Returns None if no lines parsed at all.
+    """
+    parsed = {}
+    for line in text.splitlines():
+        m = _LLM_LINE_RE.match(line.strip())
+        if m:
+            job_num = int(m.group(1))
+            german = m.group(2)
+            exp_str = m.group(3).strip()
+            exp = int(exp_str) if exp_str else None
+            parsed[job_num] = {"german": german, "exp_years": exp}
+
+    if not parsed:
+        return None
+
+    results = []
+    missing = 0
+    for i in range(1, len(jd_texts) + 1):
+        if i in parsed:
+            results.append(parsed[i])
+        else:
+            missing += 1
+            results.append({"german": _regex_german_level(jd_texts[i-1]), "exp_years": _regex_exp_years(jd_texts[i-1])})
+
+    if missing:
+        print(f"  [!] LLM: {len(parsed)}/{len(jd_texts)} parsed, {missing} filled with regex")
+
+    return results
+
+
 def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
     """Classify German level + experience years for a batch of JD texts via LLM.
 
@@ -1239,31 +1316,10 @@ def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
         else:
             text = str(raw)
 
-        # Parse "N|level|years" lines
-        parsed = {}
-        for line in text.splitlines():
-            m = _LLM_LINE_RE.match(line.strip())
-            if m:
-                job_num = int(m.group(1))
-                german = m.group(2)
-                exp_str = m.group(3).strip()
-                exp = int(exp_str) if exp_str else None
-                parsed[job_num] = {"german": german, "exp_years": exp}
-
-        # Build results in order, filling gaps with regex
-        results = []
-        missing = 0
-        for i in range(1, len(jd_texts) + 1):
-            if i in parsed:
-                results.append(parsed[i])
-            else:
-                missing += 1
-                results.append({"german": _regex_german_level(jd_texts[i-1]), "exp_years": _regex_exp_years(jd_texts[i-1])})
-
-        if missing:
-            print(f"  [!] LLM: {len(parsed)}/{len(jd_texts)} parsed, {missing} filled with regex")
-
-        return results
+        results = _parse_llm_response(text, jd_texts)
+        if results is not None:
+            return results
+        print(f"  [!] LLM: 0/{len(jd_texts)} parsed — falling back to regex")
     except Exception as e:
         print(f"  [!] LLM classification failed: {e} — falling back to regex")
 

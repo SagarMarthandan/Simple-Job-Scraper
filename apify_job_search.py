@@ -499,6 +499,66 @@ STARTUPJOBS_PAGES = [
     "https://startup.jobs/locations/germany/analytics-engineer",
 ]
 
+def _parse_startupjobs_page(raw, cutoff, seen_urls):
+    """Parse one startup.jobs page HTML and return a list of job dicts.
+
+    Extracts companies, titles, locations, and timestamps from data-post-template-target
+    attributes, enforces 24h freshness, and applies title/experience/location filters.
+    Deduplicates via seen_urls.
+    """
+    jobs = []
+    companies = re.findall(r'data-post-template-target="companyName"[^>]*>([^<]+)<', raw)
+    titles = re.findall(r'data-post-template-target="title"[^>]*href="([^"]+)"[^>]*>.*?<div[^>]*>([^<]+)</div>', raw, re.DOTALL)
+    loc_blocks = re.findall(r'data-post-template-target="location"[^>]*>(.*?)</div>', raw, re.DOTALL)
+    locations = []
+    for block in loc_blocks:
+        parts = re.findall(r'>([^<]+)<', block)
+        loc_str = ", ".join(p.strip() for p in parts if p.strip() and p.strip() != ",")
+        locations.append(loc_str)
+    timestamps = re.findall(r'data-post-template-target="timestamp"[^>]*>([^<]*)<', raw)
+
+    for i, (job_url, title) in enumerate(titles):
+        if job_url in seen_urls:
+            continue
+        seen_urls.add(job_url)
+
+        title = html_mod.unescape(title.strip())
+        company = html_mod.unescape(companies[i].strip()) if i < len(companies) else "Unknown"
+        location = html_mod.unescape(locations[i].strip()) if i < len(locations) else "Germany"
+        posted_str = html_mod.unescape(timestamps[i].strip()) if i < len(timestamps) else ""
+
+        # Parse date and enforce 24h freshness
+        posted_dt = None
+        if posted_str:
+            try:
+                posted_dt = datetime.strptime(posted_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+                if posted_dt < cutoff:
+                    continue
+            except ValueError:
+                pass
+
+        # No description available from listing page — use title for filtering
+        desc = ""
+        is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
+        if not is_valid:
+            continue
+
+        jobs.append({
+            "language": detect_language(title),
+            "job_board": "Startup.jobs",
+            "role_type": role_type_or_reason,
+            "title": title,
+            "company": company,
+            "location": location,
+            "posted_at": posted_str or "Last 24h",
+            "exp_required": "<= 2 Years",
+            "match_score": f"{compute_match_score(title)}%",
+            "job_url": f"https://startup.jobs{job_url}",
+            "description": ""
+        })
+
+    return jobs
+
 def fetch_startupjobs_jobs():
     """Fetch jobs from startup.jobs via HTML scraping (free, no Apify).
     Uses cloudscraper to bypass Cloudflare challenge. Fetches category pages
@@ -526,62 +586,79 @@ def fetch_startupjobs_jobs():
             print(f"[!] startup.jobs/{label} fetch error: {e}")
             continue
 
-        # Parse using data-post-template-target attributes
-        companies = re.findall(r'data-post-template-target="companyName"[^>]*>([^<]+)<', raw)
-        titles = re.findall(r'data-post-template-target="title"[^>]*href="([^"]+)"[^>]*>.*?<div[^>]*>([^<]+)</div>', raw, re.DOTALL)
-        loc_blocks = re.findall(r'data-post-template-target="location"[^>]*>(.*?)</div>', raw, re.DOTALL)
-        locations = []
-        for block in loc_blocks:
-            parts = re.findall(r'>([^<]+)<', block)
-            loc_str = ", ".join(p.strip() for p in parts if p.strip() and p.strip() != ",")
-            locations.append(loc_str)
-        timestamps = re.findall(r'data-post-template-target="timestamp"[^>]*>([^<]*)<', raw)
-
-        page_count = 0
-        for i, (job_url, title) in enumerate(titles):
-            if job_url in seen_urls:
-                continue
-            seen_urls.add(job_url)
-
-            title = html_mod.unescape(title.strip())
-            company = html_mod.unescape(companies[i].strip()) if i < len(companies) else "Unknown"
-            location = html_mod.unescape(locations[i].strip()) if i < len(locations) else "Germany"
-            posted_str = html_mod.unescape(timestamps[i].strip()) if i < len(timestamps) else ""
-
-            # Parse date and enforce 24h freshness
-            posted_dt = None
-            if posted_str:
-                try:
-                    posted_dt = datetime.strptime(posted_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
-                    if posted_dt < cutoff:
-                        continue
-                except ValueError:
-                    pass
-
-            # No description available from listing page — use title for filtering
-            desc = ""
-            is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
-            if not is_valid:
-                continue
-
-            jobs.append({
-                "language": detect_language(title),
-                "job_board": "Startup.jobs",
-                "role_type": role_type_or_reason,
-                "title": title,
-                "company": company,
-                "location": location,
-                "posted_at": posted_str or "Last 24h",
-                "exp_required": "<= 2 Years",
-                "match_score": f"{compute_match_score(title)}%",
-                "job_url": f"https://startup.jobs{job_url}",
-                "description": ""
-            })
-            page_count += 1
-
-        print(f"    startup.jobs/{label}: {page_count} new jobs (total seen: {len(seen_urls)})")
+        page_jobs = _parse_startupjobs_page(raw, cutoff, seen_urls)
+        jobs.extend(page_jobs)
+        print(f"    startup.jobs/{label}: {len(page_jobs)} new jobs (total seen: {len(seen_urls)})")
 
     return jobs
+
+def _parse_xing_card(card, cutoff, seen_urls):
+    """Parse one Xing job card HTML into a job dict, or None if filtered out.
+
+    Handles URL dedup (seen_urls), date-based freshness filtering (only rejects
+    confirmed stale jobs — no date means include per false-positives-over-false-negatives
+    rule), and title/experience/location filters.
+    """
+    # URL — skip /jobs/search/ (promoted recommendation links)
+    url_m = re.search(r'href="(/jobs/(?!search)[^"]+)"', card)
+    if not url_m:
+        return None
+    job_url = url_m.group(1)
+    if job_url in seen_urls:
+        return None
+    seen_urls.add(job_url)
+
+    # Date — ISO datetime from <time dateTime="..."> (sponsored jobs lack this).
+    # Per "false positives > false negatives" rule: if no date or unparseable,
+    # include the job (let title/seniority filters handle it, cross-run dedup
+    # catches repeats). Only reject jobs with a confirmed date older than 24h.
+    date_m = re.search(r'dateTime="([^"]+)"', card)
+    posted_dt = None
+    if date_m:
+        try:
+            posted_dt = datetime.fromisoformat(date_m.group(1).replace("Z", "+00:00"))
+        except ValueError:
+            posted_dt = None
+
+    if posted_dt and posted_dt < cutoff:
+        return None  # confirmed stale — skip
+
+    # Title
+    title_m = re.search(r'job-teaser-list-title">([^<]+)<', card)
+    if not title_m:
+        return None
+    title = html_mod.unescape(title_m.group(1).strip())
+
+    # Company — aria-label on <img> is most reliable
+    company_m = re.search(r'aria-label="([^"]+)"[^>]*loading="lazy"', card)
+    company = html_mod.unescape(company_m.group(1).strip()) if company_m else "Unknown"
+
+    # Location — text before <b> tag inside multi-location-display container
+    loc_m = re.search(
+        r'multi-location-display-styles__Container[^>]*>.*?data-xds="BodyCopy">([^<]+)<b',
+        card, re.DOTALL
+    )
+    location = html_mod.unescape(loc_m.group(1).strip()) if loc_m else "Germany"
+
+    # Apply existing filters (title relevance, seniority, experience, location)
+    desc = ""  # no description from listing page
+    is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
+    if not is_valid:
+        return None
+
+    return {
+        "language": detect_language(title),
+        "job_board": "Xing",
+        "role_type": role_type_or_reason,
+        "title": title,
+        "company": company,
+        "location": location,
+        "posted_at": posted_dt.isoformat() if posted_dt else "Last 24h",
+        "exp_required": "<= 2 Years",
+        "match_score": f"{compute_match_score(title)}%",
+        "job_url": f"https://www.xing.com{job_url}",
+        "description": ""
+    }
 
 def fetch_xing_jobs():
     """Fetch jobs from Xing.com via HTML scraping (free, no Apify).
@@ -630,69 +707,19 @@ def fetch_xing_jobs():
 
             page_fresh = 0
             for card in job_cards:
-                # URL — skip /jobs/search/ (promoted recommendation links)
+                # URL dedup — extract path for seen_urls check before parsing
                 url_m = re.search(r'href="(/jobs/(?!search)[^"]+)"', card)
                 if not url_m:
                     continue
                 job_url = url_m.group(1)
                 if job_url in seen_urls:
                     continue
-                seen_urls.add(job_url)
                 role_raw += 1
-
-                # Date — ISO datetime from <time dateTime="..."> (sponsored jobs lack this).
-                # Per "false positives > false negatives" rule: if no date or unparseable,
-                # include the job (let title/seniority filters handle it, cross-run dedup
-                # catches repeats). Only reject jobs with a confirmed date older than 24h.
-                date_m = re.search(r'dateTime="([^"]+)"', card)
-                posted_dt = None
-                if date_m:
-                    try:
-                        posted_dt = datetime.fromisoformat(date_m.group(1).replace("Z", "+00:00"))
-                    except ValueError:
-                        posted_dt = None
-
-                if posted_dt and posted_dt < cutoff:
-                    continue  # confirmed stale — skip
-
-                # Title
-                title_m = re.search(r'job-teaser-list-title">([^<]+)<', card)
-                if not title_m:
-                    continue
-                title = html_mod.unescape(title_m.group(1).strip())
-
-                # Company — aria-label on <img> is most reliable
-                company_m = re.search(r'aria-label="([^"]+)"[^>]*loading="lazy"', card)
-                company = html_mod.unescape(company_m.group(1).strip()) if company_m else "Unknown"
-
-                # Location — text before <b> tag inside multi-location-display container
-                loc_m = re.search(
-                    r'multi-location-display-styles__Container[^>]*>.*?data-xds="BodyCopy">([^<]+)<b',
-                    card, re.DOTALL
-                )
-                location = html_mod.unescape(loc_m.group(1).strip()) if loc_m else "Germany"
-
-                # Apply existing filters (title relevance, seniority, experience, location)
-                desc = ""  # no description from listing page
-                is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
-                if not is_valid:
-                    continue
-
-                jobs.append({
-                    "language": detect_language(title),
-                    "job_board": "Xing",
-                    "role_type": role_type_or_reason,
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "posted_at": posted_dt.isoformat() if posted_dt else "Last 24h",
-                    "exp_required": "<= 2 Years",
-                    "match_score": f"{compute_match_score(title)}%",
-                    "job_url": f"https://www.xing.com{job_url}",
-                    "description": ""
-                })
-                page_fresh += 1
-                role_fresh += 1
+                job = _parse_xing_card(card, cutoff, seen_urls)
+                if job:
+                    jobs.append(job)
+                    page_fresh += 1
+                    role_fresh += 1
 
             # Stop paginating if no fresh jobs on this page (results are relevance-sorted, not date-sorted)
             if page_fresh == 0 and page > 1:
@@ -719,6 +746,77 @@ def parse_stepstone_timeago(timeago: str) -> datetime:
         elif "tag" in unit:
             return now - timedelta(days=n)
     return now
+def _parse_stepstone_card(card, cutoff, now):
+    """Parse one Stepstone job card HTML into a job dict, or None if filtered out.
+
+    Extracts URL, title, company, location, date, and description from the card's
+    data-at attributes, enforces 24h freshness, and applies title/experience/location filters.
+    """
+    # URL — href on the job-item-title link
+    url_m = re.search(r'href="(/stellenangebote--[^"]+)"', card)
+    if not url_m:
+        return None
+    job_url = url_m.group(1)
+
+    # Title — text content inside the job-item-title link
+    title_m = re.search(r'data-at="job-item-title"[^>]*>(.*?)</a>', card, re.DOTALL)
+    if not title_m:
+        return None
+    title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
+    title = html_mod.unescape(title)
+
+    # Company — text inside a <div> within the TEXT span after company-name
+    company_m = re.search(
+        r'data-at="job-item-company-name"[^>]*>.*?data-genesis-element="TEXT"[^>]*>(.*?)</span>\s*</span>\s*</span>',
+        card, re.DOTALL
+    )
+    if company_m:
+        company = re.sub(r'<[^>]+>', '', company_m.group(1)).strip()
+    else:
+        company = "Unknown"
+    company = html_mod.unescape(company)
+
+    # Location — text inside the TEXT span within job-item-location
+    loc_m = re.search(
+        r'data-at="job-item-location"[^>]*>.*?data-genesis-element="TEXT"[^>]*>([^<]+)<',
+        card, re.DOTALL
+    )
+    location = html_mod.unescape(loc_m.group(1).strip()) if loc_m else "Germany"
+
+    # Date — inside <time> tag within job-item-timeago
+    time_m = re.search(
+        r'data-at="job-item-timeago"[^>]*><time[^>]*>([^<]+)</time>', card
+    )
+    timeago = time_m.group(1).strip() if time_m else ""
+    posted_dt = parse_stepstone_timeago(timeago) if timeago else now
+
+    # Freshness check (redundant with ag=age_1, but catches edge cases)
+    if posted_dt < cutoff:
+        return None
+
+    # Description snippet from jobcard-content
+    desc_m = re.search(r'data-at="jobcard-content"[^>]*>(.*?)</div>', card, re.DOTALL)
+    desc = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip() if desc_m else ""
+    desc = html_mod.unescape(desc)
+
+    # Apply existing filters (title relevance, seniority, experience, location)
+    is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
+    if not is_valid:
+        return None
+
+    return {
+        "language": detect_language(title),
+        "job_board": "Stepstone",
+        "role_type": role_type_or_reason,
+        "title": title,
+        "company": company,
+        "location": location,
+        "posted_at": posted_dt.isoformat(),
+        "exp_required": "<= 2 Years",
+        "match_score": f"{compute_match_score(title)}%",
+        "job_url": f"https://www.stepstone.de{job_url}",
+        "description": desc
+    }
 def fetch_stepstone_jobs():
     """Fetch jobs from Stepstone.de via HTML scraping (free, no Apify).
     Uses plain requests to fetch server-side rendered search result pages.
@@ -779,7 +877,7 @@ def fetch_stepstone_jobs():
 
             page_fresh = 0
             for card in job_cards:
-                # URL — href on the job-item-title link
+                # URL dedup — extract path for seen_urls check before parsing
                 url_m = re.search(r'href="(/stellenangebote--[^"]+)"', card)
                 if not url_m:
                     continue
@@ -789,67 +887,11 @@ def fetch_stepstone_jobs():
                 seen_urls.add(job_url)
                 role_raw += 1
 
-                # Title — text content inside the job-item-title link
-                title_m = re.search(r'data-at="job-item-title"[^>]*>(.*?)</a>', card, re.DOTALL)
-                if not title_m:
-                    continue
-                title = re.sub(r'<[^>]+>', '', title_m.group(1)).strip()
-                title = html_mod.unescape(title)
-
-                # Company — text inside a <div> within the TEXT span after company-name
-                company_m = re.search(
-                    r'data-at="job-item-company-name"[^>]*>.*?data-genesis-element="TEXT"[^>]*>(.*?)</span>\s*</span>\s*</span>',
-                    card, re.DOTALL
-                )
-                if company_m:
-                    company = re.sub(r'<[^>]+>', '', company_m.group(1)).strip()
-                else:
-                    company = "Unknown"
-                company = html_mod.unescape(company)
-
-                # Location — text inside the TEXT span within job-item-location
-                loc_m = re.search(
-                    r'data-at="job-item-location"[^>]*>.*?data-genesis-element="TEXT"[^>]*>([^<]+)<',
-                    card, re.DOTALL
-                )
-                location = html_mod.unescape(loc_m.group(1).strip()) if loc_m else "Germany"
-
-                # Date — inside <time> tag within job-item-timeago
-                time_m = re.search(
-                    r'data-at="job-item-timeago"[^>]*><time[^>]*>([^<]+)</time>', card
-                )
-                timeago = time_m.group(1).strip() if time_m else ""
-                posted_dt = parse_stepstone_timeago(timeago) if timeago else now
-
-                # Freshness check (redundant with ag=age_1, but catches edge cases)
-                if posted_dt < cutoff:
-                    continue
-
-                # Description snippet from jobcard-content
-                desc_m = re.search(r'data-at="jobcard-content"[^>]*>(.*?)</div>', card, re.DOTALL)
-                desc = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip() if desc_m else ""
-                desc = html_mod.unescape(desc)
-
-                # Apply existing filters (title relevance, seniority, experience, location)
-                is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
-                if not is_valid:
-                    continue
-
-                jobs.append({
-                    "language": detect_language(title),
-                    "job_board": "Stepstone",
-                    "role_type": role_type_or_reason,
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "posted_at": posted_dt.isoformat(),
-                    "exp_required": "<= 2 Years",
-                    "match_score": f"{compute_match_score(title)}%",
-                    "job_url": f"https://www.stepstone.de{job_url}",
-                    "description": desc
-                })
-                page_fresh += 1
-                role_fresh += 1
+                job = _parse_stepstone_card(card, cutoff, now)
+                if job:
+                    jobs.append(job)
+                    page_fresh += 1
+                    role_fresh += 1
 
             # Stop paginating if no fresh jobs on this page
             if page_fresh == 0:
@@ -858,6 +900,117 @@ def fetch_stepstone_jobs():
         print(f"    Stepstone/{role}: {role_fresh} fresh (of {role_raw} raw)")
 
     return jobs
+
+GLASSDOOR_MAX_RETRIES = 8  # ~40% success rate → 8 retries = 98%+ reliability
+
+def _glassdoor_fetch_with_retry(url):
+    """Fetch a Glassdoor URL with fresh scraper instances and retry on Cloudflare 403."""
+    for attempt in range(GLASSDOOR_MAX_RETRIES):
+        try:
+            s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+            r = s.get(url, timeout=20)
+            if r.status_code == 200 and 'application/ld+json' in r.text:
+                return r.text
+        except Exception:
+            pass
+        time.sleep(2)
+    return None
+
+def _extract_age_lookup(raw):
+    """Extract {listingId: ageInDays} from the Next.js RSC payload.
+
+    The RSC payload (self.__next_f.push) contains escaped JSON with job data.
+    Each job entry has: \\"ageInDays\\":NNN ... listingId:LLL
+    ageInDays comes BEFORE listingId in each entry. We pair them by finding
+    each listingId and searching backward for the nearest ageInDays.
+    """
+    lid_matches = list(re.finditer(r'listingId["\\]*:(\d+)', raw))
+    age_matches = list(re.finditer(r'\\"ageInDays\\":(\d+)', raw))
+
+    lookup = {}
+    for lid_m in lid_matches:
+        lid = lid_m.group(1)
+        lid_pos = lid_m.start()
+        # Find nearest ageInDays BEFORE this listingId (within 3000 chars)
+        nearest_age = None
+        nearest_dist = float('inf')
+        for age_m in age_matches:
+            dist = lid_pos - age_m.end()
+            if 0 < dist < 3000 and dist < nearest_dist:
+                nearest_age = int(age_m.group(1))
+                nearest_dist = dist
+        if lid not in lookup or nearest_age is not None:
+            lookup[lid] = nearest_age
+    return lookup
+
+def _parse_glassdoor_item(item, age_lookup, seen_urls):
+    """Parse one JSON-LD item dict into a job dict, or None if filtered out.
+
+    Handles URL dedup (seen_urls), age filtering (ageInDays == 0 only —
+    Glassdoor SSR ignores fromAge param), company extraction from URL slug,
+    and title/experience/location filters.
+    """
+    job_url = item.get('url', '')
+    if not job_url or job_url in seen_urls:
+        return None
+    seen_urls.add(job_url)
+
+    title = html_mod.unescape(item.get('name', '').strip())
+    if not title:
+        return None
+
+    # Extract jl ID to look up ageInDays
+    jl_m = re.search(r'jl=(\d+)', job_url)
+    if not jl_m:
+        return None
+    jl_id = jl_m.group(1)
+
+    # Filter by ageInDays — only keep jobs posted today (ageInDays == 0).
+    # GLASSDOOR EXCEPTION: Unlike other platforms where "no date = include"
+    # (false positives > false negatives), Glassdoor's SSR IGNORES the
+    # fromAge URL param and serves unfiltered results. The ageInDays filter
+    # is the ONLY barrier against stale jobs. Jobs missing from age_lookup
+    # are from an unfiltered result set and more likely old than fresh.
+    age_in_days = age_lookup.get(jl_id)
+    if age_in_days is None:
+        return None  # can't verify freshness — skip (Glassdoor SSR is unfiltered)
+    if age_in_days > 0:
+        return None  # stale job — skip
+
+    # Extract company from URL slug using _KE{start},{end} offsets
+    company = "Unknown"
+    slug_m = re.search(r'/job-listing/(.+?)-JV_', job_url)
+    ke_m = re.search(r'_KE(\d+),(\d+)', job_url)
+    if slug_m and ke_m:
+        slug = slug_m.group(1)
+        ke_start = int(ke_m.group(1))
+        ke_end = int(ke_m.group(2))
+        if ke_end <= len(slug):
+            company_slug = slug[ke_start:ke_end]
+            company = company_slug.replace('-', ' ').strip().title()
+
+    # Location not in JSON-LD — default to Germany (search is Germany-wide)
+    location = "Germany"
+    posted_dt = datetime.now(timezone.utc) - timedelta(days=age_in_days)
+    desc = ""
+
+    is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
+    if not is_valid:
+        return None
+
+    return {
+        "language": detect_language(title),
+        "job_board": "Glassdoor",
+        "role_type": role_type_or_reason,
+        "title": title,
+        "company": company,
+        "location": location,
+        "posted_at": posted_dt.isoformat(),
+        "exp_required": "<= 2 Years",
+        "match_score": f"{compute_match_score(title)}%",
+        "job_url": job_url,
+        "description": desc
+    }
 
 def fetch_glassdoor_jobs():
     """Fetch jobs from Glassdoor.de via HTML scraping (free, no Apify).
@@ -882,52 +1035,10 @@ def fetch_glassdoor_jobs():
     jobs = []
     seen_urls = set()
     GLASSDOOR_PAGES_PER_ROLE = 3  # 30 results/page × 3 = 90 max per role
-    GLASSDOOR_MAX_RETRIES = 8     # ~40% success rate → 8 retries = 98%+ reliability
-
-    def _fetch_with_retry(url):
-        """Fetch a Glassdoor URL with fresh scraper instances and retry on Cloudflare 403."""
-        for attempt in range(GLASSDOOR_MAX_RETRIES):
-            try:
-                s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
-                r = s.get(url, timeout=20)
-                if r.status_code == 200 and 'application/ld+json' in r.text:
-                    return r.text
-            except Exception:
-                pass
-            time.sleep(2)
-        return None
-
-    def _extract_age_lookup(raw):
-        """Extract {listingId: ageInDays} from the Next.js RSC payload.
-
-        The RSC payload (self.__next_f.push) contains escaped JSON with job data.
-        Each job entry has: \\"ageInDays\\":NNN ... listingId:LLL
-        ageInDays comes BEFORE listingId in each entry. We pair them by finding
-        each listingId and searching backward for the nearest ageInDays.
-        """
-        lid_matches = list(re.finditer(r'listingId["\\]*:(\d+)', raw))
-        age_matches = list(re.finditer(r'\\"ageInDays\\":(\d+)', raw))
-
-        lookup = {}
-        for lid_m in lid_matches:
-            lid = lid_m.group(1)
-            lid_pos = lid_m.start()
-            # Find nearest ageInDays BEFORE this listingId (within 3000 chars)
-            nearest_age = None
-            nearest_dist = float('inf')
-            for age_m in age_matches:
-                dist = lid_pos - age_m.end()
-                if 0 < dist < 3000 and dist < nearest_dist:
-                    nearest_age = int(age_m.group(1))
-                    nearest_dist = dist
-            if lid not in lookup or nearest_age is not None:
-                lookup[lid] = nearest_age
-        return lookup
 
     for role in SEARCH_ROLES:
         role_fresh = 0
         role_raw = 0
-        role_stale = 0
 
         for page in range(1, GLASSDOOR_PAGES_PER_ROLE + 1):
             url = (
@@ -937,7 +1048,7 @@ def fetch_glassdoor_jobs():
                 f"&page={page}"
             )
 
-            raw = _fetch_with_retry(url)
+            raw = _glassdoor_fetch_with_retry(url)
             if not raw:
                 print(f"[!] Glassdoor/{role} page {page}: blocked by Cloudflare after {GLASSDOOR_MAX_RETRIES} retries")
                 break
@@ -969,83 +1080,18 @@ def fetch_glassdoor_jobs():
                 job_url = item.get('url', '')
                 if not job_url or job_url in seen_urls:
                     continue
-                seen_urls.add(job_url)
                 role_raw += 1
-
-                title = html_mod.unescape(item.get('name', '').strip())
-                if not title:
-                    continue
-
-                # Extract jl ID to look up ageInDays
-                jl_m = re.search(r'jl=(\d+)', job_url)
-                if not jl_m:
-                    continue
-                jl_id = jl_m.group(1)
-
-                # Filter by ageInDays — only keep jobs posted today (ageInDays == 0).
-                # GLASSDOOR EXCEPTION: Unlike other platforms where "no date = include"
-                # (false positives > false negatives), Glassdoor's SSR IGNORES the
-                # fromAge URL param and serves unfiltered results (0/30 fresh, 16/30
-                # stale at 15-179 days old in live testing). The ageInDays filter is
-                # the ONLY barrier against stale jobs. Jobs missing from age_lookup
-                # are from an unfiltered result set and more likely old than fresh.
-                # Verified 2026-08-23: including None jobs let 42 unconfirmed jobs
-                # through with 0 confirmed fresh — all were ageInDays=None.
-                age_in_days = age_lookup.get(jl_id)
-                if age_in_days is None:
-                    continue  # can't verify freshness — skip (Glassdoor SSR is unfiltered)
-                if age_in_days > 0:
-                    role_stale += 1
-                    continue  # stale job — skip
-
-                # Extract company from URL slug using _KE{start},{end} offsets
-                company = "Unknown"
-                slug_m = re.search(r'/job-listing/(.+?)-JV_', job_url)
-                ke_m = re.search(r'_KE(\d+),(\d+)', job_url)
-                if slug_m and ke_m:
-                    slug = slug_m.group(1)
-                    ke_start = int(ke_m.group(1))
-                    ke_end = int(ke_m.group(2))
-                    if ke_end <= len(slug):
-                        company_slug = slug[ke_start:ke_end]
-                        company = company_slug.replace('-', ' ').strip().title()
-
-                # Location not in JSON-LD — default to Germany (search is Germany-wide)
-                location = "Germany"
-
-                # posted_at based on ageInDays (0 = today, always int here — None was filtered above)
-                posted_dt = datetime.now(timezone.utc) - timedelta(days=age_in_days)
-                posted_at_str = posted_dt.isoformat()
-
-                # Description not available from search page
-                desc = ""
-
-                # Apply existing filters (title relevance, seniority, experience, location)
-                is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
-                if not is_valid:
-                    continue
-
-                jobs.append({
-                    "language": detect_language(title),
-                    "job_board": "Glassdoor",
-                    "role_type": role_type_or_reason,
-                    "title": title,
-                    "company": company,
-                    "location": location,
-                    "posted_at": posted_at_str,
-                    "exp_required": "<= 2 Years",
-                    "match_score": f"{compute_match_score(title)}%",
-                    "job_url": job_url,
-                    "description": desc
-                })
-                page_fresh += 1
-                role_fresh += 1
+                job = _parse_glassdoor_item(item, age_lookup, seen_urls)
+                if job:
+                    jobs.append(job)
+                    page_fresh += 1
+                    role_fresh += 1
 
             # Stop paginating if no fresh jobs on this page
             if page_fresh == 0:
                 break
 
-        print(f"    Glassdoor/{role}: {role_fresh} fresh (of {role_raw} raw, {role_stale} stale)")
+        print(f"    Glassdoor/{role}: {role_fresh} fresh (of {role_raw} raw)")
 
     return jobs
 
@@ -1283,6 +1329,58 @@ def fetch_linkedin_jobs_free():
             jobs.append(job)
 
     return jobs
+def _parse_linkedin_date(posted_raw):
+    """Parse LinkedIn postedAt string into a timezone-aware datetime.
+
+    LinkedIn postedAt is date-only (YYYY-MM-DD) — treat as end-of-day (23:59:59)
+    to avoid false rejections of jobs posted late on the previous day.
+    Returns None if the string is empty or unparseable.
+    """
+    if not posted_raw:
+        return None
+    try:
+        posted_dt = datetime.fromisoformat(posted_raw.replace("Z", "+00:00"))
+        if posted_dt.tzinfo is None:
+            posted_dt = posted_dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        try:
+            posted_dt = datetime.strptime(posted_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+    # Date-only timestamps: shift to end-of-day for a generous freshness check
+    if ":" not in posted_raw and posted_dt.hour == 0:
+        posted_dt = posted_dt.replace(hour=23, minute=59, second=59)
+    return posted_dt
+
+def _parse_linkedin_item(item, cutoff):
+    """Parse one Apify LinkedIn item dict into a job dict, or None if filtered out."""
+    title = item.get("title", "")
+    desc = item.get("descriptionText") or item.get("descriptionHtml") or ""
+    loc = item.get("location", "Germany")
+
+    is_valid, role_type_or_reason = check_experience_and_location(title, desc, loc)
+    if not is_valid:
+        return None
+
+    # Safety-net post-filter: reject stale jobs even if f_TPR=r86400 lets one through.
+    posted_raw = item.get("postedAt", "")
+    posted_dt = _parse_linkedin_date(posted_raw)
+    if posted_dt and posted_dt < cutoff:
+        return None
+
+    return {
+        "language": detect_language(f"{title} {desc}"),
+        "job_board": "LinkedIn",
+        "role_type": role_type_or_reason,
+        "title": title,
+        "company": item.get("companyName", "Unknown"),
+        "location": loc,
+        "posted_at": posted_raw or "Last 24h",
+        "exp_required": "<= 2 Years",
+        "match_score": f"{compute_match_score(f'{title} {desc}')}%",
+        "job_url": item.get("link") or item.get("applyUrl") or "",
+        "description": desc[:500]
+    }
 
 def fetch_linkedin_jobs():
     """Fetch LinkedIn jobs via curious_coder/linkedin-jobs-scraper using search URLs (f_TPR=r86400 = last 24h).
@@ -1300,48 +1398,9 @@ def fetch_linkedin_jobs():
     # Cost: $1.00/1K results ⇒ ~$0.50/run. maxTotalChargeUsd=0.60 is a safety cap for aborted runs.
     items = run_apify_actor(ACTOR_LINKEDIN, {"urls": urls, "count": 500}, label="LinkedIn Scraper", max_charge_usd=0.60)
     for item in items:
-        title = item.get("title", "")
-        desc = item.get("descriptionText") or item.get("descriptionHtml") or ""
-        loc = item.get("location", "Germany")
-
-        is_valid, role_type_or_reason = check_experience_and_location(title, desc, loc)
-        if not is_valid:
-            continue
-
-        # Safety-net post-filter: reject stale jobs even if f_TPR=r86400 lets one through.
-        # LinkedIn postedAt is date-only (YYYY-MM-DD) — treat as end-of-day (23:59:59) to
-        # avoid false rejections of jobs posted late on the previous day.
-        posted_raw = item.get("postedAt", "")
-        posted_dt = None
-        if posted_raw:
-            try:
-                posted_dt = datetime.fromisoformat(posted_raw.replace("Z", "+00:00"))
-                if posted_dt.tzinfo is None:
-                    posted_dt = posted_dt.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                try:
-                    posted_dt = datetime.strptime(posted_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                except (ValueError, TypeError):
-                    pass
-            # Date-only timestamps: shift to end-of-day for a generous freshness check
-            if posted_dt and ":" not in posted_raw and posted_dt.hour == 0:
-                posted_dt = posted_dt.replace(hour=23, minute=59, second=59)
-        if posted_dt and posted_dt < cutoff:
-            continue  # stale job — skip
-
-        jobs.append({
-            "language": detect_language(f"{title} {desc}"),
-            "job_board": "LinkedIn",
-            "role_type": role_type_or_reason,
-            "title": title,
-            "company": item.get("companyName", "Unknown"),
-            "location": loc,
-            "posted_at": posted_raw or "Last 24h",
-            "exp_required": "<= 2 Years",
-            "match_score": f"{compute_match_score(f'{title} {desc}')}%",
-            "job_url": item.get("link") or item.get("applyUrl") or "",
-            "description": desc[:500]
-        })
+        job = _parse_linkedin_item(item, cutoff)
+        if job:
+            jobs.append(job)
     return jobs
 
 def fetch_indeed_jobs():
@@ -1414,6 +1473,30 @@ def fetch_indeed_jobs():
                 print(f"[!] Indeed role fetch error: {e}", flush=True)
     return jobs
 
+def _style_xlsx_header(ws, header_fill, header_font, center):
+    """Apply fill, font, and center alignment to the header row."""
+    for c in ws[1]:
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = center
+
+def _format_xlsx_cells(ws, url_col, score_col, link_font, center):
+    """Format the last appended row: hyperlink the URL cell, numericize the score cell."""
+    r = ws.max_row
+    if url_col:
+        cell = ws.cell(row=r, column=url_col)
+        url = cell.value or ""
+        if url:
+            cell.hyperlink = url
+            cell.font = link_font
+    if score_col:
+        cell = ws.cell(row=r, column=score_col)
+        v = cell.value
+        if isinstance(v, str) and v.endswith("%") and v[:-1].strip().isdigit():
+            cell.value = int(v[:-1].strip())
+            cell.number_format = '0"%"'
+            cell.alignment = center
+
 def convert_csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
     """Convert the exported CSV to XLSX: frozen header, autofilter (easy sorting),
     numeric match_score, and clickable job_url hyperlinks. Requires openpyxl."""
@@ -1442,30 +1525,14 @@ def convert_csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
     center = Alignment(horizontal="center", vertical="center")
 
     ws.append(header)
-    for c in ws[1]:
-        c.fill = header_fill
-        c.font = header_font
-        c.alignment = center
+    _style_xlsx_header(ws, header_fill, header_font, center)
 
     url_col = header.index("job_url") + 1 if "job_url" in header else None
     score_col = header.index("match_score") + 1 if "match_score" in header else None
 
     for row in data:
         ws.append(row)
-        r = ws.max_row
-        if url_col:
-            cell = ws.cell(row=r, column=url_col)
-            url = cell.value or ""
-            if url:
-                cell.hyperlink = url
-                cell.font = link_font
-        if score_col:
-            cell = ws.cell(row=r, column=score_col)
-            v = cell.value
-            if isinstance(v, str) and v.endswith("%") and v[:-1].strip().isdigit():
-                cell.value = int(v[:-1].strip())
-                cell.number_format = '0"%"'
-                cell.alignment = center
+        _format_xlsx_cells(ws, url_col, score_col, link_font, center)
 
     for idx in range(1, len(header) + 1):
         letter = get_column_letter(idx)
