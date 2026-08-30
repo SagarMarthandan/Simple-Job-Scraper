@@ -17,9 +17,8 @@ Visits EVERY job URL (including LinkedIn + Indeed) to:
   5. Recalculate match score from actual JD text
   6. Enrich with: detail_language, detail_exp_years, detail_salary, detail_remote
 
-Output: Job_Search_<date>_verified.xlsx with 2 sheets:
+Output: Job_Search_<date>_verified.xlsx with 1 sheet:
   - "Job Search": applicable jobs (passed all filters)
-  - "Reposted":   LinkedIn jobs flagged as reposted (for manual review)
 
 Usage:
   # Run inside eval sandbox (LLM classification available):
@@ -35,12 +34,12 @@ Note: German level + experience classification uses LLM (smol model, batch of 5
 JDs per call) via completion(). Requires OMP eval runtime — no regex fallback.
 """
 import argparse
+from collections import Counter
 import csv
 import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -96,13 +95,6 @@ TECH_KEYWORDS = [
     "bigquery", "aws", "azure", "databricks", "docker", "kafka",
     "postgresql", "snowflake",
 ]
-
-# LinkedIn job ID growth rate (~530K new IDs/day globally, verified Aug 23-27)
-LINKEDIN_DAILY_ID_GROWTH = 530000
-
-# Repost detection thresholds
-REPOST_CROSS_RUN_DAYS = 7      # appeared in a run >7 days ago
-REPOST_JOB_ID_AGE_DAYS = 14    # job ID suggests >14 days old
 
 # ── Salary Extraction ────────────────────────────────────────────────────────
 
@@ -262,166 +254,6 @@ def _extract_description_text(html: str) -> tuple[str, dict | None]:
     return text.strip(), jsonld
 
 
-# ── Reposted Detection (LinkedIn only) ───────────────────────────────────────
-
-def _find_previous_run_dirs(job_search_dir: Path, today_str: str) -> list[Path]:
-    """Return previous run directories sorted by date, excluding today and non-date dirs."""
-    prev_dirs = []
-    for run_dir in sorted(job_search_dir.iterdir()):
-        if not run_dir.is_dir() or not run_dir.name.startswith("2026-"):
-            continue
-        if run_dir.name >= today_str:
-            continue
-        try:
-            datetime.strptime(run_dir.name, "%Y-%m-%d")
-        except ValueError:
-            continue
-        prev_dirs.append(run_dir)
-    return prev_dirs
-
-
-def _load_urls_from_csv(csv_path: Path) -> set[str]:
-    """Return set of normalized job URLs from a CSV file."""
-    urls = set()
-    try:
-        with open(csv_path, newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                url = _normalize_url(row.get("job_url", ""))
-                if url:
-                    urls.add(url)
-    except Exception:
-        pass
-    return urls
-
-
-def _load_linkedin_title_keys_from_csv(csv_path: Path) -> set[str]:
-    """Return set of normalize_key(company, title) for LinkedIn rows from a CSV file."""
-    import sys
-    skill_dir = Path("/home/sagar/Skills/Jobscraper")
-    if str(skill_dir) not in sys.path:
-        sys.path.insert(0, str(skill_dir))
-    from apify_job_search import normalize_key
-
-    keys = set()
-    try:
-        with open(csv_path, newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                if row.get("job_board") != "LinkedIn":
-                    continue
-                key = normalize_key(row.get("company", ""), row.get("title", ""))
-                if key:
-                    keys.add(key)
-    except Exception:
-        pass
-    return keys
-
-
-def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
-    """Load reposted detection data from previous runs.
-
-    Returns:
-        old_title_keys: normalize_key(company, title) from runs >7 days ago
-        recent_urls: job URLs from the most recent previous run (carryovers)
-    """
-    cutoff = datetime.strptime(today_str, "%Y-%m-%d") - timedelta(days=REPOST_CROSS_RUN_DAYS)
-    old_title_keys = set()
-    recent_urls = set()
-
-    if not job_search_dir.exists():
-        return old_title_keys, recent_urls
-
-    prev_dirs = _find_previous_run_dirs(job_search_dir, today_str)
-
-    # Load URLs from the most recent previous run (carryover detection)
-    if prev_dirs:
-        most_recent = prev_dirs[-1]
-        csvs = [c for c in most_recent.glob("Job_Search_*.csv")
-                if "_verified" not in c.name and "_deduped" not in c.name]
-        if csvs:
-            recent_urls = _load_urls_from_csv(csvs[0])
-
-    # Load title keys from runs older than 7 days (repost detection)
-    for run_dir in prev_dirs:
-        try:
-            run_date = datetime.strptime(run_dir.name, "%Y-%m-%d")
-        except ValueError:
-            continue
-        if run_date >= cutoff:
-            continue
-        csvs = [c for c in run_dir.glob("Job_Search_*.csv")
-                if "_verified" not in c.name and "_deduped" not in c.name]
-        if not csvs:
-            continue
-        old_title_keys |= _load_linkedin_title_keys_from_csv(csvs[0])
-
-    return old_title_keys, recent_urls
-
-
-def _normalize_url(url: str) -> str:
-    """Normalize URL for cross-run comparison: strip query params + trailing slash."""
-    url = url or ""
-    # Drop query string first (LinkedIn tracking params like ?refId=... change per run)
-    if "?" in url:
-        url = url.split("?", 1)[0]
-    # Then strip trailing slash
-    url = url.rstrip("/")
-    return url
-
-
-def _extract_linkedin_job_id(url: str) -> int:
-    """Extract numeric job ID from LinkedIn URL. Returns 0 if not found."""
-    m = re.search(r'-(\d+)$', url or "")
-    return int(m.group(1)) if m else 0
-
-
-def detect_reposted(job: dict, today_str: str, old_title_keys: set,
-                    today_max_linkedin_id: int, recent_urls: set | None = None) -> bool:
-    """Check if a LinkedIn job is likely reposted.
-
-    Two signals:
-    1. Cross-run history: company::title appeared in a run >7 days ago
-    2. Job ID age gap: job ID suggests >14 days old (based on ~530K IDs/day)
-
-    Job ID override: if the job ID is fresh (<14 days old), signal 1 is
-    suppressed — a fresh ID means it's a new posting, not a repost,
-    even if the same company+title appeared in an old run.
-
-    Carryover exception: if the job URL appeared in the most recent previous
-    run, skip signal 1 (cross-run title match) — it's likely a 24h window
-    overlap, not a repost. But signal 2 (job ID age gap) is NOT suppressed —
-    a 277-day-old job ID is a repost regardless of carryover.
-    """
-    if job.get("job_board") != "LinkedIn":
-        return False
-
-    url = _normalize_url(job.get("job_url", ""))
-    is_carryover = bool(recent_urls and url in recent_urls)
-
-    # Check job ID age first — fresh ID overrides title match
-    job_id = _extract_linkedin_job_id(url)
-    is_fresh = False
-    if job_id and today_max_linkedin_id:
-        age_days = (today_max_linkedin_id - job_id) / LINKEDIN_DAILY_ID_GROWTH
-        is_fresh = age_days <= REPOST_JOB_ID_AGE_DAYS
-        if age_days > REPOST_JOB_ID_AGE_DAYS:
-            return True
-
-    # Signal 1: cross-run history (suppressed by carryover OR fresh job ID)
-    if not is_carryover and not is_fresh:
-        import sys
-        from pathlib import Path as _P
-        skill_dir = _P("/home/sagar/Skills/Jobscraper")
-        if str(skill_dir) not in sys.path:
-            sys.path.insert(0, str(skill_dir))
-        from apify_job_search import normalize_key
-
-        key = normalize_key(job.get("company", ""), job.get("title", ""))
-        if key and key in old_title_keys:
-            return True
-
-    return False
-
-
 # ── Per-Platform Verifiers ───────────────────────────────────────────────────
 
 def _empty_result() -> dict:
@@ -429,7 +261,6 @@ def _empty_result() -> dict:
         "verified_active": "",
         "detail_language": "",
         "detail_exp_years": "",
-        "detail_reposted": "",
         "detail_salary": "",
         "detail_remote": "",
     }
@@ -946,7 +777,7 @@ INPUT_FIELDS = [
 ]
 OUTPUT_FIELDS = INPUT_FIELDS + [
     "verified_active", "detail_language", "detail_exp_years",
-    "detail_reposted", "detail_salary", "detail_remote",
+    "detail_salary", "detail_remote",
 ]
 
 
@@ -973,26 +804,19 @@ def load_csv(path: Path) -> list[dict]:
         return list(reader)
 
 
-def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict]) -> None:
-    """Write verified XLSX with 2 sheets: 'Job Search' and 'Reposted'.
+def save_xlsx(path: Path, main_rows: list[dict]) -> None:
+    """Write verified XLSX with 1 sheet: 'Job Search'.
 
     Same formatting as pipeline's convert_csv_to_xlsx: frozen header,
     autofilter, clickable URL hyperlinks, numeric match_score.
     """
     if not HAS_OPENPYXL:
         print("[!] openpyxl not installed — falling back to CSV")
-        # Fallback: write two CSVs
         csv_main = path.with_suffix(".csv")
         with open(csv_main, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(main_rows)
-        if reposted_rows:
-            csv_repost = path.parent / f"{path.stem}_reposted.csv"
-            with open(csv_repost, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
-                writer.writeheader()
-                writer.writerows(reposted_rows)
         print(f"[✓] CSV exported to: {csv_main}")
         return
 
@@ -1042,11 +866,6 @@ def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict]) -> N
     # Sheet 1: Job Search (main)
     ws_main = wb.active
     _write_sheet(ws_main, main_rows, "Job Search")
-
-    # Sheet 2: Reposted
-    if reposted_rows:
-        ws_repost = wb.create_sheet("Reposted")
-        _write_sheet(ws_repost, reposted_rows, "Reposted")
 
     wb.save(path)
     print(f"[✓] XLSX exported to: {path}")
@@ -1387,23 +1206,6 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         count = len(platform_groups[platform])
         print(f"    {platform}: {count} URL(s)")
 
-    # ── Reposted detection setup (LinkedIn only) ──
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    print(f"\n[*] Loading cross-run history for reposted detection...")
-    old_title_keys, recent_urls = _load_repost_data(JOB_SEARCH_DIR, today_str)
-    print(f"    Loaded {len(old_title_keys)} title keys from runs >{REPOST_CROSS_RUN_DAYS} days ago")
-    print(f"    Loaded {len(recent_urls)} URLs from most recent previous run (carryover detection)")
-
-    # Find today's max LinkedIn job ID for age-gap estimation
-    today_max_linkedin_id = 0
-    for _, row in to_verify:
-        if row.get("job_board") == "LinkedIn":
-            jid = _extract_linkedin_job_id(row.get("job_url", ""))
-            if jid > today_max_linkedin_id:
-                today_max_linkedin_id = jid
-    if today_max_linkedin_id:
-        print(f"    Today's max LinkedIn job ID: {today_max_linkedin_id}")
-
     # ── Run all platform batches in parallel ──
     all_results: dict[int, dict] = {}
 
@@ -1427,39 +1229,26 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
                 for orig_idx, _ in group:
                     all_results[orig_idx] = _empty_result()
 
-    # ── Merge results + apply reposted detection ──
+    # ── Merge results ──
     for i, row in enumerate(rows):
         result = all_results.get(i)
         if result:
             row.update(result)
-        # Reposted detection (LinkedIn only, uses CSV data — no page fetch needed)
-        is_repost = detect_reposted(row, today_str, old_title_keys, today_max_linkedin_id, recent_urls)
-        row["detail_reposted"] = "True" if is_repost else ("False" if row.get("job_board") == "LinkedIn" else "")
 
     # ── LLM batch classification (German level + experience years) ──
     llm_classify_all(rows)
 
-    # ── Apply filters and split into main + reposted ──
+    # ── Apply filters ──
     main_rows = []
-    reposted_rows = []
     closed_count = 0
     german_dropped = 0
     exp_dropped = 0
-    reposted_count = 0
     enriched_count = 0
 
     for row in rows:
         active = row.get("verified_active", "")
         lang = row.get("detail_language", "")
         exp_str = row.get("detail_exp_years", "")
-        is_repost = row.get("detail_reposted", "") == "True"
-
-        # Segregate: reposted (checked first — reposted jobs go to separate
-        # sheet regardless of German/exp filters, for manual review)
-        if is_repost:
-            reposted_count += 1
-            reposted_rows.append(row)
-            continue
 
         # Hard drop: closed
         if active == "False":
@@ -1494,7 +1283,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         stem = stem[:-len("_deduped")]
     out_path = csv_path.parent / f"{stem}_verified.xlsx"
 
-    save_xlsx(out_path, main_rows, reposted_rows)
+    save_xlsx(out_path, main_rows)
 
     # ── Summary ──
     print()
@@ -1503,7 +1292,6 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     print("=" * 60)
     print(f"  Input:                {len(rows)} jobs")
     print(f"  Kept (main sheet):    {len(main_rows)}")
-    print(f"  Reposted sheet:       {reposted_count}")
     print(f"  Closed/removed:       {closed_count}")
     print(f"  Dropped (German C1+): {german_dropped}")
     print(f"  Dropped (exp >= 3y):  {exp_dropped}")
@@ -1517,8 +1305,8 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
 def main():
     parser = argparse.ArgumentParser(
         description="Verify job listings: check if active, extract German language "
-                    "requirement, experience years, salary, remote status, detect "
-                    "reposted LinkedIn jobs, and recalculate match scores from JD text."
+                    "requirement, experience years, salary, remote status, and "
+                    "recalculate match scores from JD text."
     )
     parser.add_argument(
         "--csv", type=str, default=None,

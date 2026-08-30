@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Apify Job Fetcher, Deduplicator & Dated CSV Exporter for OMP Session
-Platforms: LinkedIn (free HTML), Indeed (Apify), Arbeitnow, Startup.jobs, Xing, Stepstone, Glassdoor, ATS Direct (Greenhouse/SmartRecruiters/Ashby)
-Filters: Freshness (<24h), Experience (<=2 yrs), Germany location guard, Working Student (Hamburg & Kiel ONLY),
+Platforms: LinkedIn (free HTML), Indeed (Apify), Arbeitnow, Xing, Stepstone, ATS Direct (Greenhouse/SmartRecruiters/Ashby)
+Filters: Freshness (<24h), Experience (<=2 yrs), Working Student (Hamburg & Kiel ONLY),
          Internships (Germany-wide), Title relevance (data/analytics/AI/SQL/Python keywords)
 Output Path: /home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/Job_Search_<Month>_<Day>_<Year>.csv
 
@@ -16,17 +16,9 @@ Changelog:
               cloudscraper, path-based URLs with ag=age_1 24h filter, data-at SSR attributes, German
               relative time parsing via parse_stepstone_timeago()). Pipeline now 6 platforms.
   2026-08-07: LinkedIn AI search rollout — actor autoConvertToAiSearch defaults true, softening
-              location=Germany into a natural-language hint. Added Germany Location Guard in
-              check_experience_and_location() (rejects 30 non-Germany countries, ambiguous locations
-              pass through). f_TPR=r86400 24h filter unaffected (stays as URL filter under AI search).
-              Removed dead prototype scripts (stepstone_scraper.py, csv_to_xlsx.py, merge_linkedin.py).
-              Added .gitignore, README.md, CHANGELOG.md.
-  2026-08-09: Added Glassdoor (free cloudscraper, JSON-LD ItemList parsing, _KE offset company
-              extraction, ageInDays filtering from Next.js RSC payload). Pipeline now 7 platforms.
-              No login required — search results are public SSR JSON-LD. CRITICAL FIX: Glassdoor's
-              fromAge=1 URL parameter is IGNORED by SSR (React app filters client-side post-hydration).
-              Without ageInDays filtering, all jobs appear as "posted today" regardless of actual age
-              (30-165 days old). Now extracts ageInDays from RSC payload and filters to ageInDays==0.
+              location=Germany into a natural-language hint. f_TPR=r86400 24h filter unaffected
+              (stays as URL filter under AI search). Removed dead prototype scripts
+              (stepstone_scraper.py, csv_to_xlsx.py, merge_linkedin.py). Added .gitignore, README.md, CHANGELOG.md.
   2026-08-09b: CRITICAL FIX: Indeed's datePosted='1' parameter is IGNORED by the API (same bug as
               Glassdoor's fromAge=1). 11/102 jobs (10.8%) were stale, including jobs 500+ days old.
               Added post-filter on datePublished in fetch_indeed_jobs() to reject jobs older than 24h.
@@ -39,7 +31,6 @@ Changelog:
               (Stepstone serves SSR HTML without anti-bot challenge). All data-at parsing unchanged.
               Also switched Xing from cloudscraper to plain requests — Xing is behind AWS CloudFront
               (not Cloudflare), so cloudscraper was unnecessary overhead with the same hang risk.
-              Startup.jobs and Glassdoor genuinely need cloudscraper (Cloudflare 403 on plain requests).
 
 See CHANGELOG.md for full version history and apify_job_search.md for detailed technical documentation.
 """
@@ -119,18 +110,12 @@ if not APIFY_TOKEN:
 ACTOR_LINKEDIN = "hKByXkMQaC5Qt9UMN"   # curious_coder/linkedin-jobs-scraper
 ACTOR_INDEED = "TrtlecxAsNRbKl1na"     # valig/indeed-jobs-scraper
 
-# Seniority & Experience Filter Regexes
+# Seniority Filter Regex
 EXCLUDED_TITLE_PATTERNS = re.compile(
     r"\b(senior|sr|lead|head|principal|staff|manager|director|architect|vp|chief|expert|team lead)\b",
     re.IGNORECASE
 )
 
-EXCLUDED_EXP_PATTERNS = [
-    re.compile(r"\b([3-9]|\d{2,})\+?\s*(?:years?|jahre?|j\.?)\b", re.IGNORECASE),
-    re.compile(r"\b(?:at least|minimum|min\.?|mindestens)\s*([3-9]|\d{2,})\s*(?:years?|jahre?)\b", re.IGNORECASE),
-    re.compile(r"\b([3-9]|\d{2,})\s*bis\s*\d+\s*jahre\b", re.IGNORECASE),
-    re.compile(r"\b(?:3|4|5|6|7|8|9)\s*\+\s*(?:jahre|years)\b", re.IGNORECASE),
-]
 
 # Core Tech Stack Keywords for Match Scoring
 TECH_KEYWORDS = ["dbt", "airflow", "spark", "pyspark", "python", "sql", "gcp", "bigquery", "aws", "azure", "databricks", "docker", "kafka", "postgresql", "snowflake"]
@@ -146,46 +131,6 @@ DOMAIN_TITLE_KEYWORDS = re.compile(
     re.IGNORECASE
 )
 
-# Countries commonly leaked by LinkedIn AI search (Aug 2026) when location=Germany
-# is softened into a natural-language hint. Used by check_experience_and_location()
-# to reject jobs whose location explicitly names a non-Germany country.
-# Ambiguous locations (city-only, "Remote") pass through to avoid false rejections.
-NON_GERMANY_COUNTRIES = (
-    "austria", "österreich", "switzerland", "schweiz", "suisse",
-    "netherlands", "niederlande", "holland",
-    "france", "frankreich",
-    "united kingdom", "england", "scotland", "wales",
-    "ireland", "irland",
-    "poland", "polen",
-    "czech", "tschech",
-    "spain", "spanien", "españa",
-    "italy", "italien", "italia",
-    "portugal",
-    "belgium", "belgien",
-    "sweden", "schweden",
-    "norway", "norwegen",
-    "denmark", "dänemark",
-    "finland", "finnland",
-    "united states", "usa",
-    "canada", "india", "indien",
-    "luxembourg", "luxemburg",
-    "liechtenstein",
-    "romania", "rumänien",
-    "hungary", "ungarn",
-)
-
-# Foreign CITIES seen leaking through city-only location strings (LinkedIn/
-# Stepstone/Xing return e.g. "London", "Bern", "Amsterdam"). Only consulted
-# when the location lacks a germany/deutschland marker. Word-boundary matched
-# so German lookalikes ("Bernau bei Berlin") are NOT rejected.
-NON_GERMANY_CITIES = re.compile(
-    r"\b(london|amsterdam|rotterdam|the\s+hague|antwerp\w*|brussels?|bruxelles|"
-    r"bern|basel|z(?:ü|ue|u)rich|gen[eè]ve|genf|graz|vienna|wien|paris|milan|milano|"
-    r"rome|roma|madrid|barcelona|lisbon|lisboa|dublin|copenhagen|københavn|kopenhagen|"
-    r"stockholm|oslo|helsinki|warsaw|warszawa|prague|prag|praha|budapest|"
-    r"s[aã]o\s+paulo|new\s+york)\b",
-    re.IGNORECASE,
-)
 
 def is_relevant_title(title: str) -> bool:
     """Check if the job title contains at least one core data/analytics/AI keyword.
@@ -216,40 +161,19 @@ def classify_role_type(title: str, description: str) -> str:
         return "Full-Time / Entry-Level"
 
 def check_experience_and_location(title: str, description: str, location: str) -> tuple[bool, str]:
-    """
-    Validates role against seniority ceiling and location constraints.
+    """Validates role against seniority ceiling and location constraints.
     Returns (is_valid, role_type_or_reason)
     """
-    # 0. Title Relevance Check — reject jobs with no data/analytics/AI keywords in title
-    # This catches all actor false positives (Indeed returns "Nachtwächter" for "Data Engineer" search)
     if not is_relevant_title(title):
         return False, "Title not relevant to data/analytics/AI"
 
-    # 1. Seniority Check
     if EXCLUDED_TITLE_PATTERNS.search(title):
         return False, "Seniority title excluded"
 
-    for pattern in EXCLUDED_EXP_PATTERNS:
-        if pattern.search(description):
-            return False, "Requires >2 years experience"
-
-    # 2. Role Type & Location Filter
     role_type = classify_role_type(title, description)
     loc_clean = location.lower()
 
-    # 2a. Germany Location Guard — LinkedIn AI search (Aug 2026) softened
-    # location=Germany into a natural-language hint, so non-Germany jobs can
-    # leak through. Reject any job whose location explicitly names a non-Germany
-    # country. Ambiguous locations (city-only, "Remote") pass to avoid false
-    # rejections of valid German jobs. Also catches Indeed's known Germany drift.
-    if "germany" not in loc_clean and "deutschland" not in loc_clean:
-        for country in NON_GERMANY_COUNTRIES:
-            if country in loc_clean:
-                return False, f"Location outside Germany ({location})"
-        if NON_GERMANY_CITIES.search(location):
-            return False, f"Location outside Germany ({location})"
-
-    # 2b. Working Student — strictly restricted to Hamburg & Kiel
+    # Working Student — strictly restricted to Hamburg & Kiel
     if role_type == "Working Student":
         if not ("hamburg" in loc_clean or "kiel" in loc_clean):
             return False, f"Working student outside Hamburg/Kiel ({location})"
@@ -291,97 +215,13 @@ def normalize_key(company: str, title: str) -> str:
     seniority/gender markers, and REF codes for cross-platform matching)."""
     return f"{_norm_company(company)}::{_norm_title(title)}"
 
-def _company_tokens(c: str) -> set:
-    """Distinctive tokens from company name for overlap matching."""
-    c = _norm_company(c)
-    GENERIC = {"the", "und", "and", "de", "solutions", "consulting", "services"}
-    return {t for t in c.split() if t not in GENERIC and len(t) > 2}
-
-def _title_similarity(t1: str, t2: str) -> float:
-    """Jaccard similarity of normalized title token sets."""
-    s1 = set(_norm_title(t1).split())
-    s2 = set(_norm_title(t2).split())
-    if not s1 or not s2:
-        return 0.0
-    return len(s1 & s2) / len(s1 | s2)
-
-def _location_match(l1: str, l2: str) -> bool:
-    """Check if two location strings refer to the same city."""
-    CITY_ALIASES = {
-        "munich": "munich", "münchen": "munich",
-        "cologne": "cologne", "köln": "cologne",
-        "frankfurt": "frankfurt", "frankfurt am main": "frankfurt",
-        "nuremberg": "nuremberg", "nürnberg": "nuremberg",
-        "hannover": "hannover", "hanover": "hannover",
-    }
-    def _norm_loc(l):
-        l = l.lower()
-        for alias, canonical in CITY_ALIASES.items():
-            if alias in l:
-                return canonical
-        return " ".join(re.sub(r"[^\w\s]", "", l).split())
-    return _norm_loc(l1) == _norm_loc(l2)
-
-def cross_platform_dedup(jobs: list) -> tuple[list, int]:
-    """Remove cross-platform duplicates via fuzzy company+title+location matching.
-
-    Only compares jobs across different job_board values. A job is a duplicate if:
-    - company token overlap >= 0.5 (min-set denominator)
-    - title Jaccard similarity >= 0.6
-    - location match
-    Keeps the first occurrence by platform priority order.
-
-    Returns (deduped_jobs, removed_count).
-    """
-    PLATFORM_PRIORITY = {"LinkedIn": 0, "Xing": 1, "Stepstone": 2, "Indeed": 3}
-    # Sort by platform priority so the preferred platform's job is kept first.
-    priority = lambda job: PLATFORM_PRIORITY.get(job["job_board"], 99)
-    ordered = sorted(jobs, key=priority)
-    kept = []
-    removed = 0
-    # Track signatures of kept jobs for comparison
-    kept_sigs = []  # list of (job, company_tokens, norm_title, loc_key)
-
-    for job in ordered:
-        ct = _company_tokens(job["company"])
-        nt = _norm_title(job["title"])
-        is_dup = False
-        for kept_job, kept_ct, kept_nt, kept_loc in kept_sigs:
-            # Only compare across different platforms
-            if job["job_board"] == kept_job["job_board"]:
-                continue
-            # Company token overlap
-            if not ct or not kept_ct:
-                continue
-            overlap = len(ct & kept_ct) / min(len(ct), len(kept_ct))
-            if overlap < 0.5:
-                continue
-            # Title similarity
-            s1, s2 = set(nt.split()), set(kept_nt.split())
-            if not s1 or not s2:
-                continue
-            tsim = len(s1 & s2) / len(s1 | s2)
-            if tsim < 0.6:
-                continue
-            # Location match
-            if not _location_match(job["location"], kept_loc):
-                continue
-            # Confirmed dup — skip this job
-            is_dup = True
-            removed += 1
-            break
-        if not is_dup:
-            kept.append(job)
-            kept_sigs.append((job, ct, nt, job["location"]))
-
-    return kept, removed
 
 def normalize_job_url(url: str) -> str:
     """Normalize a job URL into a stable cross-run identity key.
 
     LinkedIn URLs carry per-run tracking params (position/pageNum/refId/trackingId)
     while the job ID lives in the path — drop the query string there.
-    Indeed (?jk=) and Glassdoor (?jl=) carry their job IDs in the query — keep it.
+    Indeed (?jk=) carries its job ID in the query — keep it.
     """
     url = (url or "").strip()
     if not url:
@@ -390,57 +230,20 @@ def normalize_job_url(url: str) -> str:
         url = url.split("?", 1)[0]
     return url.rstrip("/").lower()
 
-def load_previous_run_keys(now: datetime) -> tuple[set, set, int, int]:
-    """Load dedup keys from the single most recent previous run folder.
-
-    Compares today's run against only the immediate previous run (e.g. Friday vs
-    Thursday, or vs Wednesday if Thursday was skipped). For same-day reruns, the
-    most recent folder is today's own earlier run.
-
-    Returns (url_keys, title_keys, runs_scanned, jobs_scanned):
-      - url_keys: normalized job URLs from that one run.
-      - title_keys: normalize_key(company, title) from that same run.
-        Catches LinkedIn re-lists (new URL per run, same job) and cross-platform
-        duplicates (same job on LinkedIn vs Indeed).
-    """
-    url_keys = set()
-    title_keys = set()
-    runs_scanned = 0
-    jobs_scanned = 0
-
-    # Find the most recent dated run folder (<= today)
-    prev_folder = None
-    for folder in sorted(JOB_SEARCH_DIR.iterdir(), reverse=True):
-        if not folder.is_dir():
-            continue
-        try:
-            run_date = datetime.strptime(folder.name, "%Y-%m-%d").date()
-        except ValueError:
-            continue
-        if run_date > now.date():
-            continue
-        if any(folder.glob("Job_Search_*.csv")):
-            prev_folder = folder
-            break
-
-    if not prev_folder:
-        return url_keys, title_keys, runs_scanned, jobs_scanned
-
-    for csv_file in sorted(prev_folder.glob("Job_Search_*.csv")):
+def load_previous_run_urls(now: datetime) -> set:
+    """Load job URLs from yesterday's CSV folder for cross-run dedup."""
+    yesterday = JOB_SEARCH_DIR / (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    urls = set()
+    for csv_file in yesterday.glob("Job_Search_*.csv"):
         try:
             with open(csv_file, newline="", encoding="utf-8-sig") as f:
-                rows = list(csv.DictReader(f))
+                for row in csv.DictReader(f):
+                    url = normalize_job_url(row.get("job_url", ""))
+                    if url:
+                        urls.add(url)
         except Exception:
             continue
-        runs_scanned += 1
-        jobs_scanned += len(rows)
-        for row in rows:
-            url = normalize_job_url(row.get("job_url", ""))
-            if url:
-                url_keys.add(url)
-            title_keys.add(normalize_key(row.get("company", ""), row.get("title", "")))
-
-    return url_keys, title_keys, runs_scanned, jobs_scanned
+    return urls
 
 def fetch_arbeitnow_jobs():
     """Fetch jobs from Arbeitnow API across all search roles."""
@@ -487,110 +290,6 @@ def fetch_arbeitnow_jobs():
         print(f"[!] Error fetching Arbeitnow: {e}")
     return jobs
 
-# startup.jobs pages to scrape (free, no Apify needed — uses cloudscraper to bypass Cloudflare)
-# The main Germany page catches all jobs; category pages provide targeted results.
-STARTUPJOBS_PAGES = [
-    "https://startup.jobs/locations/germany",           # all jobs in Germany
-    "https://startup.jobs/locations/germany/data-engineer",
-    "https://startup.jobs/locations/germany/data-analyst",
-    "https://startup.jobs/locations/germany/ai-engineer",
-    "https://startup.jobs/locations/germany/data-scientist",
-    "https://startup.jobs/locations/germany/business-analyst",
-    "https://startup.jobs/locations/germany/analytics-engineer",
-]
-
-def _parse_startupjobs_page(raw, cutoff, seen_urls):
-    """Parse one startup.jobs page HTML and return a list of job dicts.
-
-    Extracts companies, titles, locations, and timestamps from data-post-template-target
-    attributes, enforces 24h freshness, and applies title/experience/location filters.
-    Deduplicates via seen_urls.
-    """
-    jobs = []
-    companies = re.findall(r'data-post-template-target="companyName"[^>]*>([^<]+)<', raw)
-    titles = re.findall(r'data-post-template-target="title"[^>]*href="([^"]+)"[^>]*>.*?<div[^>]*>([^<]+)</div>', raw, re.DOTALL)
-    loc_blocks = re.findall(r'data-post-template-target="location"[^>]*>(.*?)</div>', raw, re.DOTALL)
-    locations = []
-    for block in loc_blocks:
-        parts = re.findall(r'>([^<]+)<', block)
-        loc_str = ", ".join(p.strip() for p in parts if p.strip() and p.strip() != ",")
-        locations.append(loc_str)
-    timestamps = re.findall(r'data-post-template-target="timestamp"[^>]*>([^<]*)<', raw)
-
-    for i, (job_url, title) in enumerate(titles):
-        if job_url in seen_urls:
-            continue
-        seen_urls.add(job_url)
-
-        title = html_mod.unescape(title.strip())
-        company = html_mod.unescape(companies[i].strip()) if i < len(companies) else "Unknown"
-        location = html_mod.unescape(locations[i].strip()) if i < len(locations) else "Germany"
-        posted_str = html_mod.unescape(timestamps[i].strip()) if i < len(timestamps) else ""
-
-        # Parse date and enforce 24h freshness
-        posted_dt = None
-        if posted_str:
-            try:
-                posted_dt = datetime.strptime(posted_str, "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
-                if posted_dt < cutoff:
-                    continue
-            except ValueError:
-                pass
-
-        # No description available from listing page — use title for filtering
-        desc = ""
-        is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
-        if not is_valid:
-            continue
-
-        jobs.append({
-            "language": detect_language(title),
-            "job_board": "Startup.jobs",
-            "role_type": role_type_or_reason,
-            "title": title,
-            "company": company,
-            "location": location,
-            "posted_at": posted_str or "Last 24h",
-            "exp_required": "<= 2 Years",
-            "match_score": f"{compute_match_score(title)}%",
-            "job_url": f"https://startup.jobs{job_url}",
-            "description": ""
-        })
-
-    return jobs
-
-def fetch_startupjobs_jobs():
-    """Fetch jobs from startup.jobs via HTML scraping (free, no Apify).
-    Uses cloudscraper to bypass Cloudflare challenge. Fetches category pages
-    and parses job listings from server-rendered HTML using data-post-template-target attributes.
-    """
-    if not cloudscraper:
-        print("[!] cloudscraper not installed — skipping startup.jobs. Install with: pip install cloudscraper")
-        return []
-
-    jobs = []
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=FRESHNESS_HOURS)
-    scraper = cloudscraper.create_scraper()
-    seen_urls = set()  # dedup across all pages
-
-    for page_url in STARTUPJOBS_PAGES:
-        label = page_url.split("/germany/")[-1] if "/germany/" in page_url else "all"
-        try:
-            r = scraper.get(page_url, timeout=15)
-            if r.status_code != 200:
-                print(f"[!] startup.jobs/{label}: HTTP {r.status_code}")
-                continue
-            raw = r.text
-        except Exception as e:
-            print(f"[!] startup.jobs/{label} fetch error: {e}")
-            continue
-
-        page_jobs = _parse_startupjobs_page(raw, cutoff, seen_urls)
-        jobs.extend(page_jobs)
-        print(f"    startup.jobs/{label}: {len(page_jobs)} new jobs (total seen: {len(seen_urls)})")
-
-    return jobs
 
 def _parse_xing_card(card, cutoff, seen_urls):
     """Parse one Xing job card HTML into a job dict, or None if filtered out.
@@ -901,199 +600,6 @@ def fetch_stepstone_jobs():
 
     return jobs
 
-GLASSDOOR_MAX_RETRIES = 8  # ~40% success rate → 8 retries = 98%+ reliability
-
-def _glassdoor_fetch_with_retry(url):
-    """Fetch a Glassdoor URL with fresh scraper instances and retry on Cloudflare 403."""
-    for attempt in range(GLASSDOOR_MAX_RETRIES):
-        try:
-            s = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
-            r = s.get(url, timeout=20)
-            if r.status_code == 200 and 'application/ld+json' in r.text:
-                return r.text
-        except Exception:
-            pass
-        time.sleep(2)
-    return None
-
-def _extract_age_lookup(raw):
-    """Extract {listingId: ageInDays} from the Next.js RSC payload.
-
-    The RSC payload (self.__next_f.push) contains escaped JSON with job data.
-    Each job entry has: \\"ageInDays\\":NNN ... listingId:LLL
-    ageInDays comes BEFORE listingId in each entry. We pair them by finding
-    each listingId and searching backward for the nearest ageInDays.
-    """
-    lid_matches = list(re.finditer(r'listingId["\\]*:(\d+)', raw))
-    age_matches = list(re.finditer(r'\\"ageInDays\\":(\d+)', raw))
-
-    lookup = {}
-    for lid_m in lid_matches:
-        lid = lid_m.group(1)
-        lid_pos = lid_m.start()
-        # Find nearest ageInDays BEFORE this listingId (within 3000 chars)
-        nearest_age = None
-        nearest_dist = float('inf')
-        for age_m in age_matches:
-            dist = lid_pos - age_m.end()
-            if 0 < dist < 3000 and dist < nearest_dist:
-                nearest_age = int(age_m.group(1))
-                nearest_dist = dist
-        if lid not in lookup or nearest_age is not None:
-            lookup[lid] = nearest_age
-    return lookup
-
-def _parse_glassdoor_item(item, age_lookup, seen_urls):
-    """Parse one JSON-LD item dict into a job dict, or None if filtered out.
-
-    Handles URL dedup (seen_urls), age filtering (ageInDays == 0 only —
-    Glassdoor SSR ignores fromAge param), company extraction from URL slug,
-    and title/experience/location filters.
-    """
-    job_url = item.get('url', '')
-    if not job_url or job_url in seen_urls:
-        return None
-    seen_urls.add(job_url)
-
-    title = html_mod.unescape(item.get('name', '').strip())
-    if not title:
-        return None
-
-    # Extract jl ID to look up ageInDays
-    jl_m = re.search(r'jl=(\d+)', job_url)
-    if not jl_m:
-        return None
-    jl_id = jl_m.group(1)
-
-    # Filter by ageInDays — only keep jobs posted today (ageInDays == 0).
-    # GLASSDOOR EXCEPTION: Unlike other platforms where "no date = include"
-    # (false positives > false negatives), Glassdoor's SSR IGNORES the
-    # fromAge URL param and serves unfiltered results. The ageInDays filter
-    # is the ONLY barrier against stale jobs. Jobs missing from age_lookup
-    # are from an unfiltered result set and more likely old than fresh.
-    age_in_days = age_lookup.get(jl_id)
-    if age_in_days is None:
-        return None  # can't verify freshness — skip (Glassdoor SSR is unfiltered)
-    if age_in_days > 0:
-        return None  # stale job — skip
-
-    # Extract company from URL slug using _KE{start},{end} offsets
-    company = "Unknown"
-    slug_m = re.search(r'/job-listing/(.+?)-JV_', job_url)
-    ke_m = re.search(r'_KE(\d+),(\d+)', job_url)
-    if slug_m and ke_m:
-        slug = slug_m.group(1)
-        ke_start = int(ke_m.group(1))
-        ke_end = int(ke_m.group(2))
-        if ke_end <= len(slug):
-            company_slug = slug[ke_start:ke_end]
-            company = company_slug.replace('-', ' ').strip().title()
-
-    # Location not in JSON-LD — default to Germany (search is Germany-wide)
-    location = "Germany"
-    posted_dt = datetime.now(timezone.utc) - timedelta(days=age_in_days)
-    desc = ""
-
-    is_valid, role_type_or_reason = check_experience_and_location(title, desc, location)
-    if not is_valid:
-        return None
-
-    return {
-        "language": detect_language(title),
-        "job_board": "Glassdoor",
-        "role_type": role_type_or_reason,
-        "title": title,
-        "company": company,
-        "location": location,
-        "posted_at": posted_dt.isoformat(),
-        "exp_required": "<= 2 Years",
-        "match_score": f"{compute_match_score(title)}%",
-        "job_url": job_url,
-        "description": desc
-    }
-
-def fetch_glassdoor_jobs():
-    """Fetch jobs from Glassdoor.de via HTML scraping (free, no Apify).
-    Uses cloudscraper with chrome emulation to bypass Cloudflare. Glassdoor SSR
-    embeds job listings as JSON-LD <script type="application/ld+json"> ItemList
-    tags (titles + URLs) and ageInDays in the Next.js RSC payload.
-
-    CRITICAL: Glassdoor's fromAge URL parameter is IGNORED by SSR — the React app
-    applies date filtering client-side after hydration. The SSR HTML always returns
-    unfiltered results (mostly 30-165 days old). We extract ageInDays from the RSC
-    payload and filter server-side: only ageInDays == 0 (posted today) passes.
-
-    Company names are extracted from URL slugs using _KE{start},{end} character
-    offsets (Glassdoor's KO/KE encoding). Location defaults to "Germany" (search
-    uses locId=26 = Germany-wide). Cloudflare blocks ~60% of requests, so each
-    page fetch retries up to 8 times with fresh scraper instances.
-    """
-    if not cloudscraper:
-        print("[!] cloudscraper not installed — skipping Glassdoor. Install with: pip install cloudscraper")
-        return []
-
-    jobs = []
-    seen_urls = set()
-    GLASSDOOR_PAGES_PER_ROLE = 3  # 30 results/page × 3 = 90 max per role
-
-    for role in SEARCH_ROLES:
-        role_fresh = 0
-        role_raw = 0
-
-        for page in range(1, GLASSDOOR_PAGES_PER_ROLE + 1):
-            url = (
-                f"https://www.glassdoor.de/Job/jobs.htm"
-                f"?sc.keyword={urllib.parse.quote(role)}"
-                f"&locT=C&locId=26"   # locT=C (country), locId=26 (Germany)
-                f"&page={page}"
-            )
-
-            raw = _glassdoor_fetch_with_retry(url)
-            if not raw:
-                print(f"[!] Glassdoor/{role} page {page}: blocked by Cloudflare after {GLASSDOOR_MAX_RETRIES} retries")
-                break
-
-            # Extract JSON-LD ItemList (contains job titles + URLs)
-            json_scripts = re.findall(
-                r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-                raw, re.DOTALL
-            )
-
-            page_items = []
-            for js in json_scripts:
-                try:
-                    data = json.loads(js)
-                    if data.get('@type') == 'ItemList':
-                        page_items = data.get('itemListElement', [])
-                        break
-                except (json.JSONDecodeError, KeyError):
-                    continue
-
-            if not page_items:
-                break  # no JSON-LD data on this page
-
-            # Extract ageInDays lookup from RSC payload
-            age_lookup = _extract_age_lookup(raw)
-
-            page_fresh = 0
-            for item in page_items:
-                job_url = item.get('url', '')
-                if not job_url or job_url in seen_urls:
-                    continue
-                role_raw += 1
-                job = _parse_glassdoor_item(item, age_lookup, seen_urls)
-                if job:
-                    jobs.append(job)
-                    page_fresh += 1
-                    role_fresh += 1
-
-            # Stop paginating if no fresh jobs on this page
-            if page_fresh == 0:
-                break
-
-        print(f"    Glassdoor/{role}: {role_fresh} fresh (of {role_raw} raw)")
-
-    return jobs
 
 def fetch_last_run_dataset(actor_id: str):
     try:
@@ -1201,9 +707,8 @@ def fetch_linkedin_jobs_free():
     Multi-city (6 locations) gives 184/role (3.1x more coverage).
 
     Tradeoff vs paid Apify actor:
-    - No job descriptions (search page only). Description-based seniority filter
-      (EXCLUDED_EXP_PATTERNS) can't match — MORE permissive, not less. Title-based
-      EXCLUDED_TITLE_PATTERNS still catches Senior/Lead/Manager in titles.
+    - No job descriptions (search page only). Title-based EXCLUDED_TITLE_PATTERNS
+      catches Senior/Lead/Manager in titles.
     - No pagination, but multi-city strategy recovers more jobs than the paid actor's
       count=500 cap in practice (184-211 unique/role vs 500 total across all roles).
     """
@@ -1550,9 +1055,9 @@ def main():
     print("=== Apify Job Fetcher & Dated CSV Exporter ===")
     print(f"    LinkedIn: FREE HTML scraping (no Apify, $0, 10 roles parallel)")
     print(f"    Indeed: title=<role>, limit=50, parallel (10 roles)")
-    print(f"    Xing/Stepstone/Glassdoor/Startup.jobs: free HTML scraping (parallel)")
+    print(f"    Xing/Stepstone: free HTML scraping (parallel)")
     print(f"    ATS Direct: Greenhouse/SmartRecruiters/Ashby (free public APIs)")
-    print(f"    All 9 platforms run in parallel via ThreadPoolExecutor")
+    print(f"    All 6 platforms run in parallel via ThreadPoolExecutor")
 
     from ats_scraper import fetch_all_ats
 
@@ -1562,10 +1067,8 @@ def main():
     # no shared mutable state, results collected after all complete.
     PLATFORM_FETCHERS = [
         ("Arbeitnow",    fetch_arbeitnow_jobs),
-        ("Startup.jobs", fetch_startupjobs_jobs),
         ("Xing",         fetch_xing_jobs),
         ("Stepstone",    fetch_stepstone_jobs),
-        ("Glassdoor",    fetch_glassdoor_jobs),
         ("LinkedIn",     fetch_linkedin_jobs_free),
         ("Indeed",       fetch_indeed_jobs),
         ("ATS Direct",   fetch_all_ats),
@@ -1613,28 +1116,20 @@ def main():
             continue
         seen_keys.add(key)
         deduped_jobs.append(job)
-    # --- Cross-platform fuzzy dedup ---
-    deduped_jobs, cross_platform_count = cross_platform_dedup(deduped_jobs)
-    print(f"Cross-platform dedup: removed {cross_platform_count} cross-platform duplicate(s)")
 
-    # Cross-run deduplication: drop jobs already exported by previous runs
-    # (24h freshness windows of consecutive runs overlap when run times drift).
+    # Cross-run deduplication: drop jobs already in yesterday's export
     now = datetime.now()
-    prev_url_keys, prev_title_keys, runs_scanned, jobs_scanned = load_previous_run_keys(now)
-    cross_run_duplicates = 0
-    if prev_url_keys or prev_title_keys:
-        final_jobs = []
-        for job in deduped_jobs:
-            if normalize_job_url(job["job_url"]) in prev_url_keys or \
-               normalize_key(job["company"], job["title"]) in prev_title_keys:
-                cross_run_duplicates += 1
-                continue
-            final_jobs.append(job)
-        deduped_jobs = final_jobs
+    prev_urls = load_previous_run_urls(now)
+    if prev_urls:
+        before = len(deduped_jobs)
+        deduped_jobs = [j for j in deduped_jobs if normalize_job_url(j["job_url"]) not in prev_urls]
+        cross_run_duplicates = before - len(deduped_jobs)
+    else:
+        cross_run_duplicates = 0
 
     print(f"Per-platform: {platform_counts}")
-    print(f"Cross-run dedup: compared against previous run ({jobs_scanned} jobs), removed {cross_run_duplicates} already-seen job(s)")
-    print(f"Est. Apify cost: ~${0.04:.3f} (Indeed only) + LinkedIn/Arbeitnow/Startup.jobs/Xing/Stepstone/Glassdoor/ATS Direct ALL FREE")
+    print(f"Cross-run dedup: compared against yesterday ({len(prev_urls)} jobs), removed {cross_run_duplicates} already-seen job(s)")
+    print(f"Est. Apify cost: ~${0.04:.3f} (Indeed only) + LinkedIn/Arbeitnow/Xing/Stepstone/ATS Direct ALL FREE")
 
     # Format Date String: e.g. Aug_4_2026
     date_str = now.strftime("%b_%d_%Y").replace("_0", "_")
@@ -1647,22 +1142,6 @@ def main():
     csv_path = date_folder / csv_filename
     json_path = date_folder / f"Job_Search_{date_str}.json"
     report_path = date_folder / "JOB_OPENINGS_LAST_24H.md"
-
-    # 1. Write Dated Sortable CSV File (UTF-8 BOM for Excel compatibility)
-    fieldnames = ["language", "job_board", "role_type", "title", "company", "location", "posted_at", "exp_required", "match_score", "job_url"]
-
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for j in deduped_jobs:
-            row = {k: j[k] for k in fieldnames}
-            writer.writerow(row)
-
-    # 2. Write JSON
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(deduped_jobs, f, indent=2, ensure_ascii=False)
-
-    # 3. Write Markdown Report
     report_md = f"""# Daily Job Openings Report (Last 24 Hours)
 
 **Generated:** {now.strftime("%Y-%m-%d %H:%M")}  

@@ -1,15 +1,15 @@
 ---
 name: Jobscraper
 description: >-
-  Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "startup.jobs", "arbeitnow", "xing jobs", "stepstone jobs", "glassdoor jobs", "apify jobs", "job pipeline", "run job search".
-dependencies: python>=3.10, cloudscraper, requests, openpyxl
+  Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, and ATS Direct for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates against yesterday's run, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "arbeitnow", "xing jobs", "stepstone jobs", "apify jobs", "job pipeline", "run job search".
+dependencies: python>=3.10, requests, openpyxl
 ---
 
 # Jobscraper Pipeline
 
 > **Instructions for Oh My Pi (OMP) Session:**
 > When this skill is invoked, execute the automated job search pipeline below.
-> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Startup.jobs**, **Xing**, **Stepstone**, and **Glassdoor** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp.
+> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Xing**, **Stepstone**, and **ATS Direct** (Greenhouse/SmartRecruiters/Ashby) across all target role profiles, applies location-aware working student rules, deduplicates against yesterday's run, and outputs a sortable **CSV + XLSX** with the current execution date/time stamp.
 
 ## Execution
 
@@ -39,7 +39,7 @@ def tinyfish_fetch(urls):
 with open('/home/sagar/Skills/Jobscraper/verify_jobs.py') as f:
     exec(compile(f.read(), 'verify_jobs.py', 'exec'), globals())
 
-csv_path = Path('/home/sagar/Skills/Jobscraper/Job Search/2026-08-29/Job_Search_Aug_29_2026.csv')
+csv_path = Path('/home/sagar/Skills/Jobscraper/Job Search/2026-08-30/Job_Search_Aug_30_2026.csv')
 run_verification(csv_path, force=True)
 ```
 
@@ -47,8 +47,8 @@ TinyFish descriptions are cached to `tinyfish_cache.json` in the run
 directory — interrupts and re-runs load the cache and skip already-fetched
 URLs (no wallet re-spend).
 
-Dependencies: `cloudscraper` (for Startup.jobs and Glassdoor — Cloudflare bypass), `requests` (for Xing and Stepstone — no anti-bot), `openpyxl` (for XLSX export).
-Install: `pip install cloudscraper requests openpyxl`
+Dependencies: `requests` (for Xing and Stepstone), `openpyxl` (for XLSX export).
+Install: `pip install requests openpyxl`
 
 ## Context
 
@@ -65,13 +65,12 @@ Install: `pip install cloudscraper requests openpyxl`
 
 1. **Freshness Window:** Strictly posted within the **last 24 hours**.
 2. **Target Platforms:**
-   - **LinkedIn** (Apify — curious_coder/linkedin-jobs-scraper, ~$0.015/run)
-   - **Indeed** (Apify — valig/indeed-jobs-scraper, ~$0.025/run)
+   - **LinkedIn** (free HTML scraping, no Apify, $0)
+   - **Indeed** (Apify — valig/indeed-jobs-scraper, ~$0.04/run)
    - **Arbeitnow** (free API, no Apify)
-   - **Startup.jobs** (free HTML scraping via cloudscraper, no Apify)
-   - **Xing** (free HTML scraping via plain `requests`, no Apify — AWS CloudFront, no anti-bot)
-   - **Stepstone** (free HTML scraping via plain `requests`, no Apify — Akamai CDN, cloudscraper hangs)
-   - **Glassdoor** (free HTML scraping via cloudscraper, JSON-LD parsing, no Apify)
+   - **Xing** (free HTML scraping via plain `requests`, no Apify)
+   - **Stepstone** (free HTML scraping via plain `requests`, no Apify)
+   - **ATS Direct** (Greenhouse/SmartRecruiters/Ashby public APIs, free)
 3. **Title Relevance Filter:** Universal post-filter `is_relevant_title()` rejects any job whose title doesn't contain at least one data/analytics/AI/SQL/Python keyword.
 4. **Role Types & Location Constraints:**
    - **Full-Time / Part-Time / Entry-Level / Junior (0–2 yrs exp):** Germany-wide.
@@ -85,7 +84,7 @@ Install: `pip install cloudscraper requests openpyxl`
    4. Business Analyst
    5. SQL Developer
    6. Praktikum Data, Werkstudent Data, Werkstudent Business Intelligence
-7. **Cross-Run Deduplication:** After within-run dedup, jobs already in the **immediate previous run** are removed (e.g. Friday vs Thursday, or vs Wednesday if Thursday was skipped). URL match (URLs are unique) + company+title fuzzy match (catches LinkedIn re-lists and cross-platform dups). Prevents duplicates across consecutive daily sheets when 24h freshness windows overlap. Same-day reruns also handled.
+7. **Cross-Run Deduplication:** After within-run dedup, jobs already in yesterday's CSV are removed by URL match. Prevents duplicates across consecutive daily sheets when 24h freshness windows overlap.
 
 ## Output
 
@@ -97,9 +96,9 @@ Files written to `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`:
 
 ### Step 2 Output (verify)
 
-- `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 2 sheets: "Job Search" (live, apply-ready) + "Reposted" (stale re-lists). Enriched with German requirement, experience years, salary, remote/hybrid, recalculated match score.
+- `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 1 sheet: "Job Search" (live, apply-ready). Enriched with German requirement, experience years, salary, remote/hybrid.
 - `tinyfish_cache.json` — cached JD descriptions (survives interrupts, re-runs skip already-fetched URLs)
 
 ## Cost
 
-~$0.55/run Apify (LinkedIn ~$0.50 + Indeed ~$0.05). Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor are free. See `apify_job_search.md` Section 5 for the full cost breakdown. Verify step: TinyFish fetch is free; LLM classification uses `completion(model="smol")` (minimal cost). Cache prevents re-fetching on re-runs.
+~$0.04/run Apify (Indeed only). LinkedIn, Arbeitnow, Xing, Stepstone, and ATS Direct are free. Verify step: TinyFish fetch is free; LLM classification uses `completion(model="smol")` (minimal cost). Cache prevents re-fetching on re-runs.

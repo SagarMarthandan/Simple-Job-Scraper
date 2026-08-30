@@ -1,3 +1,29 @@
+## [2026-08-30b]
+
+### Removed
+- **Glassdoor scraper** (~200 lines) — `fetch_glassdoor_jobs()`, `_glassdoor_fetch_with_retry()`, `_extract_age_lookup()`, `_parse_glassdoor_item()`, `GLASSDOOR_MAX_RETRIES`. 1.1 jobs/run average across 10 runs. Most complex scraper in the pipeline (RSC payload parsing, JSON-LD, KE offset company extraction, 8x Cloudflare retry) for negligible yield.
+- **Startup.jobs scraper** (~90 lines) — `fetch_startupjobs_jobs()`, `_parse_startupjobs_page()`, `STARTUPJOBS_PAGES`. 1.1 jobs/run average. Same yield as Glassdoor.
+- **Cross-platform fuzzy dedup** (~83 lines) — `cross_platform_dedup()`, `_company_tokens()`, `_title_similarity()`, `_location_match()`. Removed 0 jobs in recent runs — URL dedup already handles cross-platform duplicates.
+- **Reposted detection** (~160 lines in verify_jobs.py) — `detect_reposted()`, `_load_repost_data()`, `_find_previous_run_dirs()`, `_load_linkedin_title_keys_from_csv()`, `_extract_linkedin_job_id()`, `_normalize_url()`, `_load_urls_from_csv()`, `LINKEDIN_DAILY_ID_GROWTH`, `REPOST_CROSS_RUN_DAYS`, `REPOST_JOB_ID_AGE_DAYS`. Second dedup system overlapping with step 1's cross-run URL dedup. Reposted sheet removed — nobody acted on it.
+- **Germany geo-filter** (~40 lines) — `NON_GERMANY_COUNTRIES` (30-country tuple), `NON_GERMANY_CITIES` regex. Workaround for LinkedIn AI search bug that no longer applies (free HTML scraper uses explicit URL params).
+- **Experience regex patterns** (~6 lines) — `EXCLUDED_EXP_PATTERNS` (4 regexes). LLM classification in verify step 2 is the authoritative filter.
+- **Total: 676 lines removed** (3657 → 2981).
+
+### Fixed
+- **Cross-run dedup bug** — `load_previous_run_keys()` (50 lines, scanned 3 days, picked today's own folder as 'previous run') replaced with `load_previous_run_urls()` (14 lines, reads yesterday's CSV, returns URL set). Bug: dedup compared today's scrape against today's morning folder (112 jobs) instead of yesterday (374 jobs), letting 252/295 duplicates through (85%). Fix: simple — load yesterday's URLs, drop matches.
+
+### Changed
+- **Pipeline: 8 → 6 platforms** — LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, ATS Direct (Greenhouse/SmartRecruiters/Ashby).
+- **Dedup: 3 tiers → 2 tiers** — within-run (company::title) + cross-run (URL vs yesterday). Cross-platform fuzzy dedup removed.
+- **Verify output: 2-sheet → 1-sheet** — Reposted sheet removed. `save_xlsx()` writes single 'Job Search' sheet.
+- **`check_experience_and_location()` simplified** — removed exp regex loop + Germany geo-filter. Keeps: title relevance, seniority ceiling, working-student city restriction.
+- **Cost: ~$0.55 → ~$0.04/run** — LinkedIn now free HTML scraping (was Apify paid). Only Indeed uses Apify.
+
+### Verification
+- Pipeline: 373 raw → 222 deduped vs yesterday → 43 new jobs, 0 duplicates with yesterday
+- 6 platforms, 52s runtime
+
+
 ## [2026-08-30]
 
 ### Changed
