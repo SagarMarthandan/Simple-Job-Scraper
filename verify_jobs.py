@@ -1053,7 +1053,7 @@ def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict]) -> N
 
 # ── LLM Batch Classification (German + Experience) ──────────────────────────
 
-LLM_BATCH_SIZE = 5
+LLM_BATCH_SIZE = 10
 
 _LLM_CLASSIFY_PROMPT = """Classify German language requirement and minimum experience years for each job.
 
