@@ -1,3 +1,29 @@
+## [2026-08-30]
+
+### Changed
+- **Architecture refactor: kill `_jd_text`** — removed the hidden transport field that flowed through verifier result dicts → `row.update()` → `llm_classify_all()`. LLM classification now reads `row["description"]` directly. Eliminates the silent data loss bug where 229/238 jobs had empty `detail_language` because `_jd_text` wasn't set when verifiers hit exception paths.
+- **`_process_result` simplified** — only extracts salary + remote + match score. No longer sets `_jd_text` for downstream classification. German/exp classification fully decoupled from verification stage.
+- **LLM batch size 5→10** — Gemini 3.1 Flash Lite handles 10 JDs per call (~4000 tokens) within context window. Halves LLM calls: 37 batches instead of 74 for ~370 jobs.
+- **Description acquisition stats** — prints `X/Y jobs acquired descriptions` with per-platform breakdown of missing jobs after TinyFish stage. Makes data gaps visible before classification runs.
+- **Classification coverage stats** — prints `X/Y jobs classified (Z skipped — no description)` in `llm_classify_all()`. Makes LLM coverage visible in run output.
+- **TinyFish disk cache** — `tinyfish_cache.json` saved after every batch (survives interrupts). Re-runs load cache and skip already-fetched URLs (no wallet re-spend).
+- **SKILL.md updated** — documents two-step execution (scrape via bash, verify via eval). Explains why verify must run in OMP eval sandbox (TinyFish + LLM injection).
+
+### Removed
+- **Legacy regex German detection** — `detect_german_requirement()`, `GERMAN_REQUIRED_PATTERNS` (29 patterns), `GERMAN_SOFT_PATTERNS` (10 patterns), `_REQUIRED_RE`, `_SOFT_RE`, `_split_sentences()`. 95 lines. Replaced by LLM classification in [2026-08-28b], regex was fallback-only.
+- **Legacy regex exp extraction** — `extract_exp_years()`, `_EXP_PATTERNS` (5 patterns). 30 lines. Same — LLM replaces this.
+- **Regex fallback wrappers** — `_regex_german_level()`, `_regex_exp_years()`. 19 lines. `llm_classify_batch()` now returns `{"german": "none", "exp_years": None}` defaults on LLM failure instead of falling back to inaccurate regex.
+- **Regex fallback paths in `llm_classify_batch()` and `_parse_llm_response()`** — all `if "completion" not in globals()` regex branches removed. LLM-only classification, no silent degraded mode.
+- **Total: 166 lines removed** (1714→1548). No regex fallback means no inaccurate silent degradation — if LLM is unavailable, defaults are explicit and visible in output.
+
+### Fixed
+- **Misplaced shebang/imports** — `from collections import Counter` and `from datetime import datetime` were before `#!/usr/bin/env python3` and the module docstring. Reordered: shebang → docstring → imports.
+
+### Verification
+- 374 input → 258 kept, 75 reposted, 3 closed, 25 C1+ dropped, 13 exp dropped, 216 enriched (with mock LLM; real LLM expected to classify more accurately)
+- Description acquisition: 372/374 (99.5%) — 2 Xing URLs missing from cache
+- LLM classification coverage: 369/374 (98.7%) — 5 skipped (no description)
+
 # Changelog
 
 All notable changes to the Jobscraper pipeline are documented here.

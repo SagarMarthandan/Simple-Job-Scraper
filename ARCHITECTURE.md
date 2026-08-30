@@ -26,7 +26,7 @@ graph TD
     K --> K2[Cross-platform fuzzy dedup]
     K2 --> L[Cross-run dedup vs previous run]
     L --> M[Export CSV + JSON + MD + XLSX]
-    M --> N[verify_jobs.py — TinyFish JD fetch, LLM classification, filters, 2-sheet XLSX]
+    M --> N[verify_jobs.py — TinyFish JD fetch + cache → platform verify → LLM classify → filters → 2-sheet XLSX]
 ```
 
 ### Parallelization
@@ -94,7 +94,7 @@ All platforms run in parallel via `ThreadPoolExecutor` (1 thread per platform). 
 
 When `tinyfish_fetch` is injected, all JD-dependent platforms (LinkedIn, Indeed, Xing, Stepstone, Startup.jobs, Glassdoor) are pre-fetched via TinyFish in the **main thread** before platform verification starts. TinyFish MCP tool is not thread-safe — calling `tool.*` from `ThreadPoolExecutor` worker threads raises `RuntimeError: Missing session/run/name`. ATS platforms and Arbeitnow are skipped (public APIs with 100% accuracy).
 
-JDs are fetched in batches of 2 URLs (TinyFish response truncates at ~25K chars with larger batches), injected into `row["description"]`. Each platform verifier checks for a pre-fetched description (>50 chars) and calls `_process_result` directly. Falls back to the platform's native method when no pre-fetched description is available.
+JDs are fetched in batches of 2 URLs (TinyFish response truncates at ~25K chars with larger batches), injected into `row["description"]`. Fetched JDs are cached to `tinyfish_cache.json` in the run directory after every batch — re-runs load the cache and skip already-fetched URLs (no wallet re-spend). Each platform verifier checks for a pre-fetched description (>50 chars) and calls `_process_result` directly. Falls back to the platform's native method when no pre-fetched description is available.
 
 **Auth-wall detection** (LinkedIn): if TinyFish returns only LinkedIn boilerplate (Similar jobs, People also viewed, Referrals increase) without real JD markers (requirements, responsibilities, Aufgaben, etc.), the job is flagged with `detail_language = "AUTH WALL — review manually"` and left unverified. ~11% of LinkedIn jobs affected.
 
@@ -102,7 +102,7 @@ JDs are fetched in batches of 2 URLs (TinyFish response truncates at ~25K chars 
 
 ### LLM Classification
 
-German level and experience years are classified by an LLM (smol model via `completion()`) in batches of 5 JDs per call. Output format is plain-text `N|level|years` per line (not JSON schema — JSON caused response shape mismatches across models). The parser uses `_LLM_LINE_RE = re.compile(r'^(\d+)\s*\|\s*(C1\+|B1/B2|preferred|none)\s*\|\s*(\d*)\s*$', re.IGNORECASE)`. Partial results fill gaps with regex fallback. When `completion()` is not available (standalone mode), regex-based `detect_german_requirement()` and `extract_exp_years()` are used.
+German level and experience years are classified by an LLM (smol model via `completion()`) in batches of 10 JDs per call. Output format is plain-text `N|level|years` per line (not JSON schema — JSON caused response shape mismatches across models). The parser uses `_LLM_LINE_RE = re.compile(r'^(\d+)\s*\|\s*(C1\+|B1/B2|preferred|none)\s*\|\s*(\d*)\s*$', re.IGNORECASE)`. Unparsed lines get `{"german": "none", "exp_years": None}` defaults. No regex fallback — if `completion()` is unavailable, all jobs get defaults and the run output shows "LLM not available — skipping classification". Current smol model: Gemini 3.1 Flash Lite.
 
 ### Reposted LinkedIn Detection
 
@@ -187,7 +187,7 @@ Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ 
 
 | Function | Purpose |
 |---|---|
-| `run_verification()` | Main entry: load CSV, TinyFish pre-fetch, verify per-platform, LLM classify, filter, write 2-sheet XLSX |
+| `run_verification()` | Main entry: load CSV, TinyFish pre-fetch + cache, verify per-platform, LLM classify, filter, write 2-sheet XLSX. Prints description acquisition + classification coverage stats |
 | `verify_linkedin()` | Uses pre-fetched TinyFish description or falls back to `requests` + JSON-LD. Auth-wall detection for boilerplate-only responses |
 | `verify_indeed()` | Uses Apify JSON description or TinyFish pre-fetch |
 | `verify_xing()` / `verify_stepstone()` | Pre-fetched description or native requests fallback |
@@ -195,8 +195,8 @@ Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ 
 | `verify_greenhouse()` / `verify_smartrecruiters()` / `verify_ashby()` | ATS API verification — 404/empty = closed. Ashby delegates to `_find_ashby_posting()`, `_extract_ashby_desc()` |
 | `verify_arbeitnow()` | Free API verification |
 | `detect_reposted()` | Cross-run history (>7d) + job ID age gap (>14d), with job ID override and carryover exception |
-| `llm_classify_batch()` | LLM batch classification (5 JDs/call, plain-text format). Delegates parsing to `_parse_llm_response()` |
-| `llm_classify_all()` | Orchestrates LLM classification across all rows with JD text |
+| `llm_classify_batch()` | LLM batch classification (10 JDs/call, plain-text `N|level|years` format). Returns `{"german": "none", "exp_years": None}` defaults on failure — no regex fallback. Delegates parsing to `_parse_llm_response()` |
+| `llm_classify_all()` | Orchestrates LLM classification across all rows. Reads `row["description"]` directly (no `_jd_text` transport field). Prints coverage stats |
 | `extract_salary()` | Salary from JSON-LD `baseSalary` or body text regex. Delegates to `_extract_salary_jsonld()`, `_detect_salary_period()` |
 | `extract_remote()` | Remote/hybrid/onsite detection from JD text |
 | `compute_match_score_from_jd()` | Recalculates match score from full JD text |
