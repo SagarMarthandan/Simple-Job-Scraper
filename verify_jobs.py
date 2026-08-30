@@ -581,14 +581,14 @@ def _extract_signals(text: str, jsonld: dict | None = None) -> dict:
 
 
 def _process_result(result: dict, desc_text: str, jsonld: dict | None = None) -> dict:
-    """Fill in signals + recalculated match score from JD text.
+    """Fill in salary + remote + recalculated match score from JD text.
 
-    Stores desc_text for later LLM batch classification of German + exp.
+    German language and experience are classified later by llm_classify_all,
+    which reads row["description"] directly — no hidden transport field.
     """
     signals = _extract_signals(desc_text, jsonld)
     result.update(signals)
     result["match_score"] = f"{compute_match_score_from_jd(desc_text)}%"
-    result["_jd_text"] = desc_text  # stored for LLM batch, removed before export
     return result
 
 
@@ -1354,19 +1354,20 @@ def llm_classify_all(rows: list[dict]) -> None:
     """Batch-classify German + exp for all rows with JD text.
 
     Mutates rows in-place: sets detail_language and detail_exp_years.
-    Removes _jd_text field after classification.
     """
     # Collect rows that have JD text and need classification
     to_classify = []
     for i, row in enumerate(rows):
-        jd = row.pop("_jd_text", None)
-        if not jd:
-            # No JD text — skip (already has regex/empty values from verifier)
+        jd = row.get("description", "")
+        if len(jd) < 50:
             continue
         to_classify.append((i, jd))
 
     if not to_classify:
+        print(f"[*] LLM classification: 0/{len(rows)} jobs classified (no description)")
         return
+
+    print(f"[*] LLM classification: {len(to_classify)}/{len(rows)} jobs classified ({len(rows)-len(to_classify)} skipped — no description)")
 
     # One-time check: warn if LLM not available (regex fallback is less accurate)
     if "completion" not in globals():
@@ -1435,49 +1436,93 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Pre-fetch LinkedIn JDs via TinyFish (main thread — tool.* not thread-safe)
-    # TinyFish renders JS-heavy LinkedIn pages that plain requests can't.
-    if "tinyfish_fetch" in globals():
-        # Pre-fetch JDs via TinyFish for all platforms that need page rendering.
-        # Skip ATS (Greenhouse/SmartRecruiters/Ashby) — they use public JSON APIs.
-        # Skip Arbeitnow — free API already provides descriptions.
-        # Skip jobs that already have a description (from Apify JSON injection).
-        TINYFISH_PLATFORMS = {"LinkedIn", "Indeed", "Xing", "Stepstone",
-                              "Startup.jobs", "Glassdoor"}
-        tf_jobs = [r for r in rows
-                   if r.get("job_board") in TINYFISH_PLATFORMS
-                   and not r.get("description")]
-        if tf_jobs:
-            print(f"[*] Pre-fetching {len(tf_jobs)} JDs via TinyFish "
-                  f"({', '.join(sorted({r['job_board'] for r in tf_jobs}))})...")
-            tf_batch_size = 2  # keep response under truncation limit
-            tf_injected = 0
-            tf_auth_wall = 0
-            for batch_start in range(0, len(tf_jobs), tf_batch_size):
-                batch = tf_jobs[batch_start:batch_start + tf_batch_size]
-                urls = [j.get("job_url", "") for j in batch if j.get("job_url")]
-                if not urls:
-                    continue
-                try:
-                    resp = tinyfish_fetch(urls)
-                    for item in resp.get("results", []):
-                        u = item.get("url", "")
-                        text = item.get("text", "")
-                        if not text:
-                            continue
-                        for row in rows:
-                            if row.get("job_url") == u:
-                                row["description"] = text
-                                tf_injected += 1
-                                break
-                except Exception as exc:
-                    print(f"  [!] TinyFish batch {batch_start // tf_batch_size + 1} failed: {exc}")
-                batch_num = batch_start // tf_batch_size + 1
-                total_batches = (len(tf_jobs) + tf_batch_size - 1) // tf_batch_size
-                print(f"    TinyFish batch {batch_num}/{total_batches} done "
-                      f"({tf_injected} JDs so far)", flush=True)
-            print(f"[*] TinyFish injected {tf_injected} descriptions")
+    # Pre-fetch JDs via TinyFish (main thread — tool.* not thread-safe)
+    # TinyFish renders JS-heavy pages (LinkedIn auth-walls, Xing, Stepstone, etc.)
+    # that plain requests can't. Caches to disk so interrupts don't waste money.
+    TINYFISH_PLATFORMS = {"LinkedIn", "Indeed", "Xing", "Stepstone",
+                          "Startup.jobs", "Glassdoor"}
+    tf_jobs = [r for r in rows
+               if r.get("job_board") in TINYFISH_PLATFORMS
+               and not r.get("description")]
 
+    if tf_jobs:
+        if "tinyfish_fetch" not in globals():
+            print(f"[!] WARNING: tinyfish_fetch not available (not running in OMP eval).")
+            print(f"[!] {len(tf_jobs)} jobs will have NO JD text — German/exp/salary")
+            print(f"[!] detection will be inaccurate. Run via eval, not bash.")
+        else:
+            # ── Load disk cache so re-runs skip already-fetched URLs ──
+            cache_path = csv_path.parent / "tinyfish_cache.json"
+            cache: dict[str, str] = {}
+            if cache_path.exists():
+                try:
+                    with open(cache_path, encoding="utf-8") as f:
+                        cache = json.load(f)
+                    print(f"[*] Loaded TinyFish cache: {len(cache)} descriptions")
+                except (json.JSONDecodeError, OSError):
+                    pass
+
+            # Inject cached descriptions
+            cache_hits = 0
+            for row in tf_jobs:
+                url = row.get("job_url", "")
+                if url in cache and cache[url]:
+                    row["description"] = cache[url]
+                    cache_hits += 1
+            if cache_hits:
+                print(f"[*] Cache hits: {cache_hits}/{len(tf_jobs)} (skipping re-fetch)")
+
+            # Only fetch jobs not in cache
+            to_fetch = [r for r in tf_jobs if r.get("job_url") not in cache]
+            if to_fetch:
+                print(f"[*] Pre-fetching {len(to_fetch)} JDs via TinyFish "
+                      f"({', '.join(sorted({r['job_board'] for r in to_fetch}))})...")
+                tf_batch_size = 2  # keep response under truncation limit
+                tf_injected = 0
+                for batch_start in range(0, len(to_fetch), tf_batch_size):
+                    batch = to_fetch[batch_start:batch_start + tf_batch_size]
+                    urls = [j.get("job_url", "") for j in batch if j.get("job_url")]
+                    if not urls:
+                        continue
+                    try:
+                        resp = tinyfish_fetch(urls)
+                        for item in resp.get("results", []):
+                            u = item.get("url", "")
+                            text = item.get("text", "")
+                            if not text:
+                                continue
+                            cache[u] = text  # add to cache
+                            for row in rows:
+                                if row.get("job_url") == u:
+                                    row["description"] = text
+                                    tf_injected += 1
+                                    break
+                    except Exception as exc:
+                        print(f"  [!] TinyFish batch {batch_start // tf_batch_size + 1} failed: {exc}")
+                    # ── Save cache to disk after every batch (survive interrupts) ──
+                    try:
+                        with open(cache_path, "w", encoding="utf-8") as f:
+                            json.dump(cache, f, ensure_ascii=False)
+                    except OSError:
+                        pass
+                    batch_num = batch_start // tf_batch_size + 1
+                    total_batches = (len(to_fetch) + tf_batch_size - 1) // tf_batch_size
+                    print(f"    TinyFish batch {batch_num}/{total_batches} done "
+                          f"({tf_injected} new JDs, {len(cache)} cached)", flush=True)
+                print(f"[*] TinyFish injected {tf_injected} new descriptions "
+                      f"({len(cache)} total in cache)")
+            else:
+                print(f"[*] All {len(tf_jobs)} JDs found in cache — no TinyFish fetch needed")
+
+    # Print acquisition stats
+    desc_count = sum(1 for r in rows if r.get("description", "").strip())
+    print(f"\n[*] Description acquisition: {desc_count}/{len(rows)} jobs acquired descriptions")
+    if desc_count < len(rows):
+        missing = [r for r in rows if not r.get("description", "").strip()]
+        missing_platforms = Counter(r.get("job_board", "Unknown") for r in missing)
+        print(f"    {len(missing)} missing by platform:")
+        for p, c in missing_platforms.most_common():
+            print(f"      {p}: {c}")
     # Idempotency: skip rows already verified unless --force
     to_verify: list[tuple[int, dict]] = []
     already_verified = 0

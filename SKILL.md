@@ -13,11 +13,39 @@ dependencies: python>=3.10, cloudscraper, requests, openpyxl
 
 ## Execution
 
-Run the pipeline script:
+### Step 1: Scrape (bash)
 
 ```bash
 cd /home/sagar/Skills/Jobscraper && python3 apify_job_search.py
 ```
+
+### Step 2: Verify (eval — requires OMP runtime for TinyFish + LLM)
+
+The verify step MUST run through `eval` (OMP Python kernel), not `bash`.
+It needs `tinyfish_fetch` and `completion` — OMP-injected functions that
+don't exist in a standalone `python3` process. Running via bash silently
+skips TinyFish JD pre-fetch and LLM classification, producing inaccurate
+German/experience/salary detection.
+
+```python
+# eval cell (language: py)
+import json
+from pathlib import Path
+
+def tinyfish_fetch(urls):
+    raw = tool.mcp__tinyfish_fetch_content({"urls": urls})
+    return json.loads(raw["text"])
+
+with open('/home/sagar/Skills/Jobscraper/verify_jobs.py') as f:
+    exec(compile(f.read(), 'verify_jobs.py', 'exec'), globals())
+
+csv_path = Path('/home/sagar/Skills/Jobscraper/Job Search/2026-08-29/Job_Search_Aug_29_2026.csv')
+run_verification(csv_path, force=True)
+```
+
+TinyFish descriptions are cached to `tinyfish_cache.json` in the run
+directory — interrupts and re-runs load the cache and skip already-fetched
+URLs (no wallet re-spend).
 
 Dependencies: `cloudscraper` (for Startup.jobs and Glassdoor — Cloudflare bypass), `requests` (for Xing and Stepstone — no anti-bot), `openpyxl` (for XLSX export).
 Install: `pip install cloudscraper requests openpyxl`
@@ -67,6 +95,11 @@ Files written to `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`:
 - `Job_Search_<Month>_<Day>_<Year>.xlsx` — autofilter + clickable links
 - `JOB_OPENINGS_LAST_24H.md` — markdown summary
 
+### Step 2 Output (verify)
+
+- `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 2 sheets: "Job Search" (live, apply-ready) + "Reposted" (stale re-lists). Enriched with German requirement, experience years, salary, remote/hybrid, recalculated match score.
+- `tinyfish_cache.json` — cached JD descriptions (survives interrupts, re-runs skip already-fetched URLs)
+
 ## Cost
 
-~$0.55/run Apify (LinkedIn ~$0.50 + Indeed ~$0.05). Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor are free. See `apify_job_search.md` Section 5 for the full cost breakdown.
+~$0.55/run Apify (LinkedIn ~$0.50 + Indeed ~$0.05). Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor are free. See `apify_job_search.md` Section 5 for the full cost breakdown. Verify step: TinyFish fetch is free; LLM classification uses `completion(model="smol")` (minimal cost). Cache prevents re-fetching on re-runs.
