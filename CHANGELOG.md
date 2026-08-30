@@ -1,4 +1,10 @@
+## [2026-08-30c]
+
+### Reinstated
+- **Reposted detection in verify_jobs.py** — restored `detect_reposted()`, `_load_repost_data()`, `_find_previous_run_dirs()`, `_load_urls_from_csv()`, `_load_linkedin_title_keys_from_csv()`, `_normalize_url()`, `_extract_linkedin_job_id()`, and constants (`LINKEDIN_DAILY_ID_GROWTH`, `REPOST_CROSS_RUN_DAYS`, `REPOST_JOB_ID_AGE_DAYS`). Restored 2-sheet XLSX output (Job Search + Reposted). This is a pure computation tool (no LLM tokens, no TinyFish) that flags stale LinkedIn re-lists via cross-run history + job ID age gaps. Was incorrectly removed in [2026-08-30b] — it's separate from the cross-run dedup simplification in apify_job_search.py.
+
 ## [2026-08-30b]
+
 
 ### Removed
 - **Glassdoor scraper** (~200 lines) — `fetch_glassdoor_jobs()`, `_glassdoor_fetch_with_retry()`, `_extract_age_lookup()`, `_parse_glassdoor_item()`, `GLASSDOOR_MAX_RETRIES`. 1.1 jobs/run average across 10 runs. Most complex scraper in the pipeline (RSC payload parsing, JSON-LD, KE offset company extraction, 8x Cloudflare retry) for negligible yield.

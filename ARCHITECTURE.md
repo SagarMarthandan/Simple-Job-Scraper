@@ -21,7 +21,7 @@ graph TD
     J --> K[Within-run dedup by company::title]
     K --> L[Cross-run dedup vs yesterday]
     L --> M[Export CSV + JSON + MD + XLSX]
-    M --> N[verify_jobs.py — TinyFish JD fetch + cache → platform verify → LLM classify → filters → 1-sheet XLSX]
+    M --> N[verify_jobs.py — TinyFish JD fetch + cache → platform verify → reposted detection → LLM classify → filters → 2-sheet XLSX]
 
 ### Parallelization
 
@@ -86,25 +86,38 @@ JDs are fetched in batches of 2 URLs (TinyFish response truncates at ~25K chars 
 
 German level and experience years are classified by an LLM (smol model via `completion()`) in batches of 10 JDs per call. Output format is plain-text `N|level|years` per line (not JSON schema — JSON caused response shape mismatches across models). The parser uses `_LLM_LINE_RE = re.compile(r'^(\d+)\s*\|\s*(C1\+|B1/B2|preferred|none)\s*\|\s*(\d*)\s*$', re.IGNORECASE)`. Unparsed lines get `{"german": "none", "exp_years": None}` defaults. No regex fallback — if `completion()` is unavailable, all jobs get defaults and the run output shows "LLM not available — skipping classification". Current smol model: Gemini 3.1 Flash Lite.
 
+### Reposted LinkedIn Detection
+
+Two signals (pure computation — no LLM tokens, no TinyFish):
+1. **Cross-run history** — same `company::title` appeared in a run >7 days ago
+2. **Job ID age gap** — LinkedIn creates ~530K IDs/day; if job ID suggests >14 days old, flag as reposted
+
+**Job ID override**: if the job ID is fresh (<14 days old), signal 1 is suppressed — a fresh ID means it's a new posting, not a repost, even if the same company+title appeared in an old run.
+
+**Carryover exception**: if the job URL appeared in the most recent previous run, it's a carryover (not a repost) — skip signal 1.
+
+URLs normalized (trailing slash + query params stripped) before comparison. `datePosted` is reset on repost, so it can't be used.
 
 ### Verified XLSX Output
 
-`Job_Search_<date>_verified.xlsx` — 1-sheet Excel workbook:
+`Job_Search_<date>_verified.xlsx` — 2-sheet Excel workbook:
 
 | Sheet | Content |
 |---|---|
-| **Job Search** | Jobs that passed all filters (active, German ≤B2, exp <3y) |
+| **Job Search** | Jobs that passed all filters (active, German ≤B2, exp <3y, not reposted) |
+| **Reposted** | LinkedIn jobs flagged as reposted (for manual review — not dropped) |
 
 | Column | Values |
 |---|---|
 | `verified_active` | `True` / `False` / empty (unknown) |
 | `detail_language` | `German C1+ required` (dropped) / `German preferred` (flagged) / `German B1/B2 OK` (kept) / `AUTH WALL — review manually` / empty |
 | `detail_exp_years` | Integer (minimum years required) or empty |
+| `detail_reposted` | `True` / `False` (LinkedIn only) / empty |
 | `detail_salary` | e.g. `45000-60000 EUR/year` or empty |
 | `detail_remote` | `remote` / `hybrid` / `onsite` / empty |
 | `match_score` | Recalculated from JD text (0-100%) |
 
-Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ required"` OR `detail_exp_years >= 3`.
+Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ required"` OR `detail_exp_years >= 3`. Reposted jobs are segregated to the Reposted sheet (not dropped).
 
 ## Target Role Profiles
 
@@ -153,15 +166,17 @@ Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ 
 
 | Function | Purpose |
 |---|---|
-| `run_verification()` | Main entry: load CSV, TinyFish pre-fetch + cache, verify per-platform, LLM classify, filter, write 1-sheet XLSX. Prints description acquisition + classification coverage stats |
+| `run_verification()` | Main entry: load CSV, TinyFish pre-fetch + cache, verify per-platform, reposted detection, LLM classify, filter, write 2-sheet XLSX. Prints description acquisition + classification coverage stats |
 | `verify_linkedin()` | Uses pre-fetched TinyFish description or falls back to `requests` + JSON-LD. Auth-wall detection for boilerplate-only responses |
 | `verify_indeed()` | Uses Apify JSON description or TinyFish pre-fetch |
 | `verify_xing()` / `verify_stepstone()` | Pre-fetched description or native requests fallback |
 | `verify_greenhouse()` / `verify_smartrecruiters()` / `verify_ashby()` | ATS API verification — 404/empty = closed. Ashby delegates to `_find_ashby_posting()`, `_extract_ashby_desc()` |
 | `verify_arbeitnow()` | Free API verification |
+| `detect_reposted()` | Cross-run history (>7d) + job ID age gap (>14d), with job ID override and carryover exception. Pure computation — no LLM tokens |
+| `_load_repost_data()` | Loads repost detection data. Delegates to `_find_previous_run_dirs()`, `_load_urls_from_csv()`, `_load_linkedin_title_keys_from_csv()` |
 | `llm_classify_batch()` | LLM batch classification (10 JDs/call, plain-text `N|level|years` format). Returns `{"german": "none", "exp_years": None}` defaults on failure — no regex fallback. Delegates parsing to `_parse_llm_response()` |
-| `llm_classify_all()` | Orchestrates LLM classification across all rows. Reads `row["description"]` directly (no `_jd_text` transport field). Prints coverage stats |
+| `llm_classify_all()` | Orchestrates LLM classification across all rows. Reads `row["description"]` directly. Prints coverage stats |
 | `extract_salary()` | Salary from JSON-LD `baseSalary` or body text regex. Delegates to `_extract_salary_jsonld()`, `_detect_salary_period()` |
 | `extract_remote()` | Remote/hybrid/onsite detection from JD text |
 | `compute_match_score_from_jd()` | Recalculates match score from full JD text |
-| `save_xlsx()` | 1-sheet XLSX export (Job Search) |
+| `save_xlsx()` | 2-sheet XLSX export (Job Search + Reposted) |
