@@ -26,18 +26,14 @@ Usage:
   import verify_jobs; verify_jobs.completion = completion
   verify_jobs.run_verification(Path("Job Search/YYYY-MM-DD/Job_Search_*.csv"), force=True)
 
-  # Or standalone (falls back to regex for German/exp if no LLM):
+  # Or standalone (no LLM — German/exp classification skipped):
   python3 verify_jobs.py                  # auto-finds most recent CSV
   python3 verify_jobs.py --csv path.csv   # specify input
   python3 verify_jobs.py --force          # re-verify all (ignore prior results)
 
 Note: German level + experience classification uses LLM (smol model, batch of 5
-JDs per call) when completion() is available. Falls back to regex patterns
-when running standalone without an LLM client. LLM catches all phrasing variants
-("sehr gut Deutsch, mind. auf Level C1", "fließend in Wort und Schrift", etc.)
-that regex misses.
+JDs per call) via completion(). Requires OMP eval runtime — no regex fallback.
 """
-
 import argparse
 import csv
 import json
@@ -107,135 +103,6 @@ LINKEDIN_DAILY_ID_GROWTH = 530000
 # Repost detection thresholds
 REPOST_CROSS_RUN_DAYS = 7      # appeared in a run >7 days ago
 REPOST_JOB_ID_AGE_DAYS = 14    # job ID suggests >14 days old
-
-# ── German Language Detection ────────────────────────────────────────────────
-
-# Hard requirement: C1/C2/fließend/Muttersprache/verhandlungssicher → DROP
-GERMAN_REQUIRED_PATTERNS = [
-    # Explicit CEFR level: "C1 Deutsch", "Deutsch C1", "mindestens C1"
-    r'(?:mindestens|min\.|ab)\s*C[12]\s*(?:Deutsch|German|in\s+Deutsch)',
-    r'C[12]\s*[-/]?\s*(?:Deutsch|German)',
-    r'(?:Deutsch|German)\s+C[12]',
-    r'(?:Deutsch|German)\s+(?:auf\s+)?C[12](?:\s*[-–]?\s*Niveau|\s+level)?',
-    # "Fließend" / "fluent" — implies C1+ regardless of explicit level
-    # Handles ß, ss (ASCII transliteration), and single s
-    r'flie(?:ß|ss|s)end\s*(?:Deutsch|German|in\s+Deutsch|Deutschkenntnisse)',
-    r'(?:Deutsch|German)\s+flie(?:ß|ss|s)end',
-    # "Muttersprache" / native speaker
-    r'Muttersprache\s+Deutsch',
-    r'(?:Deutsch|German)\s+as\s+a\s+(?:first\s+)?native\s+language',
-    # "Sehr gute Deutschkenntnisse" (standalone) — C1+, DROP
-    # Does NOT match suspended compound "sehr gute Deutsch- und Englischkenntnisse" (false positive, keep)
-    r'sehr\s+gute\s+Deutsch(?:kenntnisse|sprachkenntnisse)',
-    # "Verhandlungssicher" — business-fluent, C1+
-    r'(?:Deutsch|German)\s+verhandlungssicher',
-    r'verhandlungssicher\s+in\s+Deutsch',
-    # "Business fluent in German" (English postings)
-    r'business\s+fluent\s+(?:in\s+)?German',
-    r'fluent\s+German\s+(?:required|mandatory|must)',
-    # "Muttersprachlich" (adjective form)
-    r'muttersprachlich(?:e|er|es|em)?\s*(?:Deutsch|German)',
-    # "Deutsch auf muttersprachlichem Niveau"
-    r'(?:Deutsch|German)\s+.*muttersprachlich',
-    # "Fachfließend" / "verhandlungssicher" variants
-    r'fachflie[ßss]end\s*(?:Deutsch|German)',
-]
-
-# Soft requirement: German helpful but not required → KEEP + flag
-GERMAN_SOFT_PATTERNS = [
-    r'Deutsch(?:kenntnisse)?\s+(?:w(?:[üu]|au|ue)nschenswert|von\s+Vorteil|idealerweise)',
-    r'German\s+(?:is\s+a\s+plus|preferred|nice\s+to\s+have|a\s+bonus)',
-    r'idealerweise\s+Deutsch',
-    # B1/B2 explicit — these are OK, Sagar has B2
-    r'B[12]\s*[-/]?\s*(?:Deutsch|German)',
-    r'(?:Deutsch|German)\s+B[12]',
-    # "Grundkenntnisse" / "basic German" — fine
-    r'(?:Grund|Basis)kenntnisse\s+(?:Deutsch|German)',
-    r'basic\s+German',
-]
-
-_REQUIRED_RE = [re.compile(p, re.IGNORECASE) for p in GERMAN_REQUIRED_PATTERNS]
-_SOFT_RE = [re.compile(p, re.IGNORECASE) for p in GERMAN_SOFT_PATTERNS]
-
-
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences on . ! ? followed by whitespace or end."""
-    parts = re.split(r'(?<=[.!?])\s+', text)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def detect_german_requirement(text: str) -> str:
-    """Detect German language requirement from job description text.
-
-    Returns:
-        "German C1+ required" — hard requirement, row should be DROPPED.
-        "German preferred"    — soft/preferred, keep row but flag.
-        "German B1/B2 OK"     — B1/B2 explicit, keep row.
-        ""                    — no German requirement detected.
-    """
-    if not text:
-        return ""
-
-    # Check for B1/B2 explicit first (these are OK, not a drop reason)
-    # Filter to SOFT patterns that contain 'B[12]' in their pattern string,
-    # then check if any of those patterns match the text.
-    b_level_patterns = [rx for rx in _SOFT_RE if 'B[12]' in rx.pattern]
-    b_level = any(rx.search(text) for rx in b_level_patterns)
-
-    sentences = _split_sentences(text)
-
-    # Priority 1: find a sentence where a REQUIRED pattern matches AND no SOFT
-    # pattern contradicts it in the same sentence.
-    for sentence in sentences:
-        req_match = any(rx.search(sentence) for rx in _REQUIRED_RE)
-        if not req_match:
-            continue
-        soft_match = any(rx.search(sentence) for rx in _SOFT_RE)
-        if not soft_match:
-            return "German C1+ required"
-
-    # Priority 2: B1/B2 explicit — keep, note it
-    if b_level:
-        return "German B1/B2 OK"
-
-    # Priority 3: soft/preferred only — keep, flag.
-    if any(rx.search(text) for rx in _SOFT_RE):
-        return "German preferred"
-
-    return ""
-
-
-# ── Experience Extraction ────────────────────────────────────────────────────
-
-_EXP_PATTERNS = [
-    re.compile(r'(\d+)\s*(?:\+\s*)?Jahre?\s*(?:Berufs)?[eE]rfahrung'),
-    re.compile(r'(\d+)\s*\+?\s*years?\s*(?:of\s*)?(?:professional\s*)?experience', re.IGNORECASE),
-    re.compile(r'min\.\s*(\d+)\s*Jahre?', re.IGNORECASE),
-    re.compile(r'(?:at\s+least|minimum)\s*(\d+)\s*years?', re.IGNORECASE),
-    re.compile(r'(\d+)\s*Jahre\s*(?:berufliche|praktische)\s*(?:Erfahrung|Kenntnisse)', re.IGNORECASE),
-]
-
-
-def extract_exp_years(text: str) -> str:
-    """Extract minimum experience years from job description text.
-
-    Returns the minimum years found (smallest number, since that's the
-    actual requirement). Empty string if no match.
-    """
-    if not text:
-        return ""
-    years = []
-    for rx in _EXP_PATTERNS:
-        for m in rx.finditer(text):
-            try:
-                years.append(int(m.group(1)))
-            except (ValueError, IndexError):
-                pass
-    if not years:
-        return ""
-    # Return the minimum — "1-3 Jahre Erfahrung" means 1 year minimum
-    return str(min(years))
-
 
 # ── Salary Extraction ────────────────────────────────────────────────────────
 
@@ -1258,7 +1125,7 @@ _LLM_LINE_RE = re.compile(
 def _parse_llm_response(text: str, jd_texts: list[str]) -> list[dict] | None:
     """Parse "N|level|years" lines from LLM output into result dicts.
 
-    Fills gaps with regex fallback. Returns None if no lines parsed at all.
+    Fills gaps with defaults. Returns None if no lines parsed at all.
     """
     parsed = {}
     for line in text.splitlines():
@@ -1280,10 +1147,10 @@ def _parse_llm_response(text: str, jd_texts: list[str]) -> list[dict] | None:
             results.append(parsed[i])
         else:
             missing += 1
-            results.append({"german": _regex_german_level(jd_texts[i-1]), "exp_years": _regex_exp_years(jd_texts[i-1])})
+            results.append({"german": "none", "exp_years": None})
 
     if missing:
-        print(f"  [!] LLM: {len(parsed)}/{len(jd_texts)} parsed, {missing} filled with regex")
+        print(f"  [!] LLM: {len(parsed)}/{len(jd_texts)} parsed, {missing} using defaults")
 
     return results
 
@@ -1292,16 +1159,14 @@ def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
     """Classify German level + experience years for a batch of JD texts via LLM.
 
     Returns list of {"german": str, "exp_years": int|None} per job.
-    Falls back to regex if LLM fails.
+    Returns "none"/None defaults if LLM is unavailable or fails.
     """
     if not jd_texts:
         return []
 
     if "completion" not in globals():
-        return [
-            {"german": _regex_german_level(t), "exp_years": _regex_exp_years(t)}
-            for t in jd_texts
-        ]
+        print("  [!] LLM not available — skipping classification")
+        return [{"german": "none", "exp_years": None} for _ in jd_texts]
 
     extracted = [_extract_relevant_sections(t) for t in jd_texts]
     jobs_block = "\n\n".join(
@@ -1319,36 +1184,11 @@ def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
         results = _parse_llm_response(text, jd_texts)
         if results is not None:
             return results
-        print(f"  [!] LLM: 0/{len(jd_texts)} parsed — falling back to regex")
+        print(f"  [!] LLM: 0/{len(jd_texts)} parsed — using defaults")
     except Exception as e:
-        print(f"  [!] LLM classification failed: {e} — falling back to regex")
+        print(f"  [!] LLM classification failed: {e} — using defaults")
 
-    return [
-        {"german": _regex_german_level(t), "exp_years": _regex_exp_years(t)}
-        for t in jd_texts
-    ]
-
-
-def _regex_german_level(text: str) -> str:
-    """Regex fallback for German level classification."""
-    result = detect_german_requirement(text)
-    if result == "German C1+ required":
-        return "C1+"
-    elif result == "German B1/B2 OK":
-        return "B1/B2"
-    elif result == "German preferred":
-        return "preferred"
-    return "none"
-
-
-def _regex_exp_years(text: str) -> int | None:
-    """Regex fallback for experience years extraction."""
-    result = extract_exp_years(text)
-    try:
-        return int(result) if result else None
-    except (ValueError, TypeError):
-        return None
-
+    return [{"german": "none", "exp_years": None} for _ in jd_texts]
 
 def llm_classify_all(rows: list[dict]) -> None:
     """Batch-classify German + exp for all rows with JD text.
@@ -1368,10 +1208,6 @@ def llm_classify_all(rows: list[dict]) -> None:
         return
 
     print(f"[*] LLM classification: {len(to_classify)}/{len(rows)} jobs classified ({len(rows)-len(to_classify)} skipped — no description)")
-
-    # One-time check: warn if LLM not available (regex fallback is less accurate)
-    if "completion" not in globals():
-        print("[!] WARNING: LLM not available — using regex fallback (less accurate)")
 
     print(f"\n[*] LLM batch classification: {len(to_classify)} jobs in batches of {LLM_BATCH_SIZE}...")
 
