@@ -50,6 +50,9 @@ URLs (no wallet re-spend).
 Dependencies: `requests` (for Xing and Stepstone), `openpyxl` (for XLSX export).
 Install: `pip install requests openpyxl`
 
+Indeed JD fallback: `playwright`, `playwright-extra`, `puppeteer-extra-plugin-stealth` (Node.js).
+Install: `cd /home/sagar/Skills/Jobscraper && npm install playwright playwright-extra puppeteer-extra-plugin-stealth && npx playwright install chromium`
+
 ## Context
 
 - **Candidate Name:** Sagar Marthandan

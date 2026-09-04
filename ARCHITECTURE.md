@@ -82,6 +82,10 @@ JDs are fetched in batches of 2 URLs (TinyFish response truncates at ~25K chars 
 
 **Runtime**: ~500 URLs → 250 batches × ~8s = ~33 min. No cost — TinyFish `fetch_content` is free.
 
+### Playwright Indeed Fallback
+
+TinyFish cannot fetch Indeed JDs (`target_http_error`). After the TinyFish pre-fetch stage, any Indeed jobs still missing descriptions are fetched via `indeed_playwright_fetch.js` — a Node.js script using `playwright-extra` + `puppeteer-extra-plugin-stealth` with a mobile user agent and mobile URL path (`/m/viewjob`). This bypasses both Cloudflare (stealth plugin) and Indeed's login wall (mobile path). Results are injected into `row["description"]` and cached in `tinyfish_cache.json`. Runs sequentially (~4s per URL). Dependencies installed in the Jobscraper directory: `playwright`, `playwright-extra`, `puppeteer-extra-plugin-stealth`, Chromium.
+
 ### LLM Classification
 
 German level and experience years are classified by an LLM (smol model via `completion()`) in batches of 10 JDs per call. Output format is plain-text `N|level|years` per line (not JSON schema — JSON caused response shape mismatches across models). The parser uses `_LLM_LINE_RE = re.compile(r'^(\d+)\s*\|\s*(C1\+|B1/B2|preferred|none)\s*\|\s*(\d*)\s*$', re.IGNORECASE)`. Unparsed lines get `{"german": "none", "exp_years": None}` defaults. No regex fallback — if `completion()` is unavailable, all jobs get defaults and the run output shows "LLM not available — skipping classification". Current smol model: Gemini 3.1 Flash Lite.

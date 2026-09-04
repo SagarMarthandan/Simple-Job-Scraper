@@ -1,3 +1,9 @@
+## [2026-09-04]
+
+### Added
+- **Playwright Indeed fallback** — `indeed_playwright_fetch.js` + `_indeed_playwright_fetch()` in verify_jobs.py. TinyFish fails on Indeed (`target_http_error`); plain requests get 401/403; vanilla headless Playwright gets Cloudflare "Request Blocked". The workaround uses `playwright-extra` with `puppeteer-extra-plugin-stealth` + mobile URL path (`/m/viewjob` instead of `/viewjob`) — bypasses both Cloudflare and Indeed's login wall. Fires after TinyFish pre-fetch for Indeed jobs still missing descriptions. Results cached alongside TinyFish cache in `tinyfish_cache.json`. Dependencies: `npm install playwright playwright-extra puppeteer-extra-plugin-stealth` + `npx playwright install chromium` (installed in Jobscraper directory). Runtime: ~4s per URL, sequential.
+
+
 ## [2026-08-30c]
 
 ### Reinstated

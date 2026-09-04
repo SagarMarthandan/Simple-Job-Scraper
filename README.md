@@ -52,7 +52,7 @@ python3 verify_jobs.py --force            # re-verify all rows
 
 ### Pipeline Stages
 
-1. **Description acquisition** — TinyFish pre-fetches JDs from all platform URLs (batch size 2, cached to `tinyfish_cache.json`). JSON injection from Apify for Indeed/Arbeitnow. Prints `X/Y jobs acquired descriptions`.
+1. **Description acquisition** — TinyFish pre-fetches JDs from all platform URLs (batch size 2, cached to `tinyfish_cache.json`). JSON injection from Apify for Indeed/Arbeitnow. Indeed fallback: Playwright stealth + mobile URL for jobs TinyFish can't fetch. Prints `X/Y jobs acquired descriptions`.
 2. **Platform verification** — each platform verifier checks if the listing is still active (404/410 = closed). Uses pre-fetched description for salary/remote extraction. Runs in parallel (1 thread per platform).
 3. **Reposted detection** — LinkedIn jobs flagged via cross-run history (>7d) + job ID age gap (>14d). No LLM tokens — pure computation.
 4. **LLM classification** — smol model (Gemini 3.1 Flash Lite) classifies German level + experience years in batches of 10. Reads `row["description"]` directly. Prints `X/Y jobs classified`.
@@ -120,6 +120,7 @@ Jobscraper/
 ├── SKILL.md                 # OMP skill definition
 ├── apify_job_search.py      # main pipeline (6 fetchers + 2-tier dedup + export)
 ├── verify_jobs.py           # post-step: TinyFish JD fetch + cache, LLM classification, reposted detection, 2-sheet XLSX
+├── indeed_playwright_fetch.js # Indeed JD fallback (Playwright stealth + mobile URL)
 ├── ats_scraper.py           # ATS direct scraping (Greenhouse/SmartRecruiters/Ashby)
 ├── dedup_existing_sheets.py # standalone retroactive dedup cleanup
 ├── apify_job_search.md      # platform-specific gotchas, actor schemas, cost analysis

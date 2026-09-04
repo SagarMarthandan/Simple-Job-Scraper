@@ -38,6 +38,7 @@ from collections import Counter
 import csv
 import json
 import re
+import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -533,14 +534,49 @@ def verify_linkedin(job: dict) -> dict:
 
 
 
-# ── Indeed Verifier (plain requests) ─────────────────────────────────────────
+# ── Indeed Playwright Fallback ───────────────────────────────────────────────
+
+INDEED_PW_SCRIPT = Path(__file__).parent / "indeed_playwright_fetch.js"
+
+
+def _indeed_playwright_fetch(urls: list[str]) -> dict[str, str]:
+    """Fetch Indeed JDs via Playwright stealth + mobile URL.
+
+    Indeed blocks TinyFish (target_http_error), plain requests (401/403),
+    and vanilla headless Playwright (Cloudflare). The workaround uses
+    playwright-extra with stealth plugin + mobile /m/viewjob path.
+
+    Returns dict of {url: jd_text} for successfully fetched URLs.
+    """
+    if not urls or not INDEED_PW_SCRIPT.exists():
+        return {}
+    try:
+        proc = subprocess.run(
+            ["node", str(INDEED_PW_SCRIPT), *urls],
+            capture_output=True, text=True, timeout=30 + 15 * len(urls),
+            cwd=str(INDEED_PW_SCRIPT.parent),
+        )
+        if proc.returncode != 0:
+            print(f"  [!] Playwright Indeed fetch failed (exit {proc.returncode}): "
+                  f"{proc.stderr[:200]}")
+            return {}
+        results = json.loads(proc.stdout)
+        return {r["url"]: r["text"] for r in results
+                if r.get("text") and len(r["text"]) > 50}
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
+        print(f"  [!] Playwright Indeed fetch error: {exc}")
+        return {}
+
+
+ # ── Indeed Verifier (plain requests) ─────────────────────────────────────────
 
 def verify_indeed(job: dict) -> dict:
     """Verify an Indeed job using pre-fetched description.
 
-    Description may come from Apify JSON (if non-empty) or TinyFish pre-fetch.
-    Indeed job pages are behind a 401/403 auth wall — both plain requests and
-    cloudscraper fail. If no description is available, the job stays unverified.
+    Description may come from Apify JSON (if non-empty), TinyFish pre-fetch,
+    or Playwright stealth fallback (mobile /m/viewjob path). Indeed job pages
+    are behind a 401/403 auth wall — plain requests and cloudscraper fail.
+    If no description is available, the job stays unverified.
     """
     result = _empty_result()
     desc = job.get("description", "")
@@ -1345,6 +1381,39 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
                       f"({len(cache)} total in cache)")
             else:
                 print(f"[*] All {len(tf_jobs)} JDs found in cache — no TinyFish fetch needed")
+
+    # ── Playwright fallback for Indeed (TinyFish can't fetch Indeed) ──────────
+    indeed_missing = [r for r in rows
+                      if r.get("job_board") == "Indeed"
+                      and not r.get("description", "").strip()]
+    if indeed_missing:
+        print(f"\n[*] Playwright Indeed fallback: {len(indeed_missing)} jobs "
+              f"still missing descriptions after TinyFish")
+        indeed_urls = [r.get("job_url", "") for r in indeed_missing
+                       if r.get("job_url")]
+        pw_results = _indeed_playwright_fetch(indeed_urls)
+        pw_injected = 0
+        for url, text in pw_results.items():
+            for row in rows:
+                if row.get("job_url") == url:
+                    row["description"] = text
+                    pw_injected += 1
+                    break
+        # Cache Playwright results alongside TinyFish cache
+        if pw_results:
+            cache_path = csv_path.parent / "tinyfish_cache.json"
+            try:
+                existing_cache = {}
+                if cache_path.exists():
+                    with open(cache_path, encoding="utf-8") as f:
+                        existing_cache = json.load(f)
+                existing_cache.update(pw_results)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(existing_cache, f, ensure_ascii=False)
+            except (json.JSONDecodeError, OSError):
+                pass
+        print(f"[*] Playwright injected {pw_injected} Indeed descriptions "
+              f"({len(indeed_missing) - pw_injected} still missing)")
 
     # Print acquisition stats
     desc_count = sum(1 for r in rows if r.get("description", "").strip())

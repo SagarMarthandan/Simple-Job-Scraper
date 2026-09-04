@@ -7,3 +7,6 @@ Job Search/
 
 # Secrets
 config.json
+
+# Node.js (Playwright Indeed fallback)
+node_modules/
