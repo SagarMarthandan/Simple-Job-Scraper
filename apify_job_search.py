@@ -1161,6 +1161,18 @@ def main():
 
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_md)
+    # Write CSV (UTF-8 BOM for Excel compatibility)
+    csv_fields = ["language", "job_board", "role_type", "title", "company",
+                  "location", "posted_at", "exp_required", "match_score", "job_url"]
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(deduped_jobs)
+
+    # Write JSON (includes description field)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(deduped_jobs, f, ensure_ascii=False, indent=2)
+
 
     print(f"[✓] CSV exported successfully to: {csv_path}")
     print(f"[✓] JSON exported to: {json_path}")

@@ -2,7 +2,7 @@
 name: Jobscraper
 description: >-
   Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, and ATS Direct for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates against yesterday's run, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "arbeitnow", "xing jobs", "stepstone jobs", "apify jobs", "job pipeline", "run job search".
-dependencies: python>=3.10, requests, openpyxl
+dependencies: python>=3.10, requests, openpyxl, beautifulsoup4, tinyfish-cli
 ---
 
 # Jobscraper Pipeline
@@ -19,27 +19,36 @@ dependencies: python>=3.10, requests, openpyxl
 cd /home/sagar/Skills/Jobscraper && python3 apify_job_search.py
 ```
 
-### Step 2: Verify (eval — requires OMP runtime for TinyFish + LLM)
+### Step 2: Verify (eval — requires OMP runtime for LLM)
 
 The verify step MUST run through `eval` (OMP Python kernel), not `bash`.
-It needs `tinyfish_fetch` and `completion` — OMP-injected functions that
-don't exist in a standalone `python3` process. Running via bash silently
-skips TinyFish JD pre-fetch and LLM classification, producing inaccurate
-German/experience/salary detection.
+It needs `completion` (OMP-injected) for LLM classification. TinyFish JD
+fetching uses the `tinyfish` CLI via subprocess. Running via bash silently
+skips LLM classification, producing inaccurate German/experience detection.
 
 ```python
 # eval cell (language: py)
-import json
+import json, subprocess
 from pathlib import Path
+from datetime import datetime
 
 def tinyfish_fetch(urls):
-    raw = tool.mcp__tinyfish_fetch_content({"urls": urls})
-    return json.loads(raw["text"])
+    result = subprocess.run(
+        ["tinyfish", "fetch", "content", "get", "--format", "markdown"] + urls,
+        capture_output=True, text=True, timeout=120
+    )
+    return json.loads(result.stdout)
+
+_completion_orig = completion
+def completion(prompt, model="smol"):
+    return _completion_orig(prompt=prompt, model=model).wait()
 
 with open('/home/sagar/Skills/Jobscraper/verify_jobs.py') as f:
     exec(compile(f.read(), 'verify_jobs.py', 'exec'), globals())
 
-csv_path = Path('/home/sagar/Skills/Jobscraper/Job Search/2026-08-30/Job_Search_Aug_30_2026.csv')
+today = datetime.now().strftime("%Y-%m-%d")
+date_str = datetime.now().strftime("%b_%d_%Y").replace("_0", "_")
+csv_path = Path(f'/home/sagar/Skills/Jobscraper/Job Search/{today}/Job_Search_{date_str}.csv')
 run_verification(csv_path, force=True)
 ```
 
@@ -47,8 +56,8 @@ TinyFish descriptions are cached to `tinyfish_cache.json` in the run
 directory — interrupts and re-runs load the cache and skip already-fetched
 URLs (no wallet re-spend).
 
-Dependencies: `requests` (for Xing and Stepstone), `openpyxl` (for XLSX export).
-Install: `pip install requests openpyxl`
+Dependencies: `requests`, `openpyxl`, `beautifulsoup4` (for ATS scraper), `tinyfish` CLI (for JD fetching).
+Install: `pip install requests openpyxl beautifulsoup4` and `npm install -g @tiny-fish/cli`
 
 Indeed JD fallback: `playwright`, `playwright-extra`, `puppeteer-extra-plugin-stealth` (Node.js).
 Install: `cd /home/sagar/Skills/Jobscraper && npm install playwright playwright-extra puppeteer-extra-plugin-stealth && npx playwright install chromium`
@@ -99,7 +108,7 @@ Files written to `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`:
 
 ### Step 2 Output (verify)
 
-- `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 1 sheet: "Job Search" (live, apply-ready). Enriched with German requirement, experience years, salary, remote/hybrid.
+- `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 2 sheets: "Job Search" (live, apply-ready, enriched with German requirement, experience years, salary, remote/hybrid) and "Reposted" (LinkedIn reposts for manual review)
 - `tinyfish_cache.json` — cached JD descriptions (survives interrupts, re-runs skip already-fetched URLs)
 
 ## Cost
