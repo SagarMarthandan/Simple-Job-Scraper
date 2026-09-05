@@ -1,3 +1,27 @@
+## [2026-09-05b]
+
+### Changed
+- **Indeed: Apify actor → GraphQL API** — `fetch_indeed_jobs()` now uses Indeed's public GraphQL API (`apis.indeed.com/graphql`) instead of the paid Apify actor (`valig/indeed-jobs-scraper`, ~$0.04/run). The API is the same endpoint used by the Indeed iOS app — hardcoded API key, mobile user-agent, `indeed-co: DE` header for Germany. Returns full job descriptions (HTML, stripped to plain text via BeautifulSoup). Server-side `dateOnIndeed` 24h filter + safety-net post-filter. 10 roles in parallel (5 workers). Runtime: ~2s (was ~30s with Apify polling). Discovered via JobSpy (speedyapply/JobSpy) source code.
+- **Pipeline cost: ~$0.04 → $0.00/run** — all 6 platforms now free. Apify completely eliminated.
+- **Module docstring** — updated from "Apify Job Fetcher" to "Jobscraper Pipeline — 100% Free".
+- **main() banner** — updated to show GraphQL API for Indeed, $0 cost.
+
+### Removed
+- **APIFY_TOKEN loading** (19 lines) — env var, `config.json`, and `~/.apify/auth.json` fallback chain. No longer needed.
+- **ACTOR_LINKEDIN / ACTOR_INDEED constants** (2 lines) — Apify actor IDs for curious_coder/linkedin-jobs-scraper and valig/indeed-jobs-scraper.
+- **`fetch_last_run_dataset()`** (28 lines) — fetched latest Apify actor run dataset. Unused dead code.
+- **`run_apify_actor()`** (58 lines) — started Apify actor, polled status, fetched dataset items. Core Apify infrastructure.
+- **`fetch_linkedin_jobs()`** (20 lines) — dead Apify-based LinkedIn scraper, replaced by `fetch_linkedin_jobs_free()` on 2026-08-23. Still referenced `ACTOR_LINKEDIN` and `run_apify_actor()`.
+- **`_parse_linkedin_item()`** (29 lines) — parsed Apify LinkedIn item dicts. Only used by dead `fetch_linkedin_jobs()`.
+- **`_parse_linkedin_date()`** (22 lines) — parsed LinkedIn postedAt strings. Only used by `_parse_linkedin_item()`.
+- **Total: 178 lines removed** (1251 → 1073 after all changes).
+
+### Verification
+- Pipeline: 619 raw → 483 after cross-run dedup. Indeed: 51 jobs via GraphQL in 1.9s.
+- Cost: $0.00 (all platforms free)
+- Runtime: 37s total (Indeed was 1.9s, was ~30s with Apify polling)
+
+
 ## [2026-09-05]
 
 ### Added

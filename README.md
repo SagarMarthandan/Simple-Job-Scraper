@@ -24,12 +24,12 @@ Output is written to `Job Search/YYYY-MM-DD/`.
 | Platform | Cost/run | Method |
 |---|---|---|
 | LinkedIn | $0.00 | Free HTML scraping, 6 locations × 10 roles, `f_TPR=r86400` 24h filter |
-| Indeed | ~$0.04 | Apify actor, 10 roles parallel, post-filter on `datePublished` |
+| Indeed | $0.00 | GraphQL API (`apis.indeed.com/graphql`), 10 roles parallel, `dateOnIndeed` 24h filter, full descriptions |
 | Arbeitnow | $0.00 | Free REST API |
 | Xing | $0.00 | `requests` HTML, AWS CloudFront (no anti-bot) |
 | Stepstone | $0.00 | `requests` HTML, Akamai (plain requests work) |
 | ATS Direct | $0.00 | Greenhouse/SmartRecruiters/Ashby public JSON APIs, 17 companies |
-| **Total** | **~$0.04** | |
+| **Total** | **$0.00** | |
 
 ### Output Files
 
@@ -87,17 +87,10 @@ A hyperlink smoke test runs automatically after export — verifies cell value =
 
 ## Configuration
 
-### Apify Token
-
-Only needed for Indeed (~$0.04/run). Read from (in order of precedence):
-1. `APIFY_TOKEN` environment variable
-2. `config.json` in the skill root
-3. `~/.apify_token` (Apify CLI auth)
-
 ### Dependencies
 
 ```bash
-pip install cloudscraper requests openpyxl
+pip install cloudscraper requests openpyxl beautifulsoup4
 ```
 
 ### Customization
@@ -125,8 +118,7 @@ Jobscraper/
 ├── indeed_playwright_fetch.js # Indeed JD fallback (Playwright stealth + mobile URL)
 ├── ats_scraper.py           # ATS direct scraping (Greenhouse/SmartRecruiters/Ashby)
 ├── dedup_existing_sheets.py # standalone retroactive dedup cleanup
-├── apify_job_search.md      # platform-specific gotchas, actor schemas, cost analysis
-├── config.json              # Apify token (gitignored)
+├── apify_job_search.md      # platform-specific gotchas, cost analysis, Indeed GraphQL API docs
 └── Job Search/              # output directory (gitignored)
 ```
 
@@ -135,4 +127,4 @@ Jobscraper/
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — filter chain, dedup tiers, freshness filtering, verification internals, function reference
 - [`CHANGELOG.md`](CHANGELOG.md) — version history
 - [`SKILL.md`](SKILL.md) — OMP skill trigger definition
-- [`apify_job_search.md`](apify_job_search.md) — actor schemas, platform gotchas, cost optimization
+- [`apify_job_search.md`](apify_job_search.md) — platform gotchas, Indeed GraphQL API, cost analysis

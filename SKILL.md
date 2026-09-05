@@ -1,7 +1,7 @@
 ---
 name: Jobscraper
 description: >-
-  Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, and ATS Direct for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates against yesterday's run, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "arbeitnow", "xing jobs", "stepstone jobs", "apify jobs", "job pipeline", "run job search".
+  Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, and ATS Direct for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates against yesterday's run, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "arbeitnow", "xing jobs", "stepstone jobs", "job pipeline", "run job search".
 dependencies: python>=3.10, requests, openpyxl, beautifulsoup4, tinyfish-cli
 ---
 
@@ -154,7 +154,7 @@ Install: `cd /home/sagar/Skills/Jobscraper && npm install playwright playwright-
 - **Base Resumes Directory:** `/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/base_files`
 - **Portfolio Directory:** `/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/portfolio`
 - **Target Output Directory:** `/home/sagar/Skills/Jobscraper/Job Search`
-- **Apify Token:** read from the `APIFY_TOKEN` environment variable or `config.json`
+- **Cost:** $0.00/run (all platforms free — no Apify)
 - **Script:** `/home/sagar/Skills/Jobscraper/apify_job_search.py`
 - **Full documentation:** `/home/sagar/Skills/Jobscraper/apify_job_search.md`
 
@@ -198,4 +198,4 @@ Files written to `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`:
 
 ## Cost
 
-~$0.04/run Apify (Indeed only). LinkedIn, Arbeitnow, Xing, Stepstone, and ATS Direct are free. Verify step: TinyFish fetch is free; LLM classification uses `completion(model="smol")` (minimal cost). Cache prevents re-fetching on re-runs.
+$0.00/run — all 6 platforms free (no Apify). Indeed uses a public GraphQL API; LinkedIn uses free HTML scraping; Arbeitnow/Xing/Stepstone use free HTML/REST; ATS Direct uses free public JSON APIs. Verify step: TinyFish fetch is free; LLM classification uses `completion(model="smol")` (minimal cost). Cache prevents re-fetching on re-runs.

@@ -2,9 +2,9 @@
 
 > **Instructions for Oh My Pi (OMP) Session:**
 > When this file is uploaded/run in an OMP session, execute the automated job search pipeline below.
-> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Startup.jobs**, **Xing**, **Stepstone**, and **Glassdoor** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp into `/home/sagar/Skills/Jobscraper/Job Search/`.
+> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Xing**, **Stepstone**, and **ATS Direct** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp into `/home/sagar/Skills/Jobscraper/Job Search/`.
 
-> **Cost-optimized 2026-08-05:** ~$0.55/run Apify (LinkedIn ~$0.50 + Indeed ~$0.05). Arbeitnow, Startup.jobs, Xing, Stepstone, and Glassdoor are free. See Section 5 for details.
+> **100% Free (2026-09-05):** $0.00/run — all platforms free. Indeed uses a public GraphQL API; LinkedIn uses free HTML scraping. No Apify.
 
 ---
 
@@ -15,8 +15,8 @@
 - **Base Resumes Directory:** `/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/base_files`
 - **Portfolio Directory:** `/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/portfolio`
 - **Target Output Directory:** `/home/sagar/Skills/Jobscraper/Job Search`
-- **Apify Token:** read from the `APIFY_TOKEN` environment variable or `config.json` (never hardcode it in this file; the token was previously pasted here and is now rotated)
-- **Dependency:** `cloudscraper` (for startup.jobs and Glassdoor HTML scraping — bypasses Cloudflare/anti-bot), `requests` (for Xing — AWS CloudFront, and Stepstone — Akamai CDN; neither has anti-bot challenge). Install: `pip install cloudscraper requests`
+- **Cost:** $0.00/run (all platforms free — no Apify)
+- **Dependency:** `requests` (for Xing, Stepstone, Indeed GraphQL API), `beautifulsoup4` (for HTML parsing), `openpyxl` (for XLSX export), `cloudscraper` (optional, not currently used). Install: `pip install requests beautifulsoup4 openpyxl`
 - **Target Role Profiles (Consolidated 10 core roles — search engines cover variants):**
   1. **Core Data & Pipeline Engineering:** `Data Engineer`, `Analytics Engineer`
   2. **Business Intelligence & Analytics:** `Data Analyst`
@@ -31,14 +31,15 @@
 
 1. **Freshness Window:** Strictly posted within the **last 24 hours** (timestamp within 86,400 seconds).
 2. **Target Platforms:**
-   - **LinkedIn** (Apify — curious_coder/linkedin-jobs-scraper, ~$0.015/run)
-   - **Indeed** (Apify — valig/indeed-jobs-scraper, ~$0.025/run)
-   - **Arbeitnow** (free API, no Apify)
-   - **Startup.jobs** (free HTML scraping via cloudscraper, no Apify)
-   - **Xing** (free HTML scraping via plain `requests`, no Apify — Xing is behind AWS CloudFront, not Cloudflare; parses server-rendered job cards using `data-testid` attributes and `<time dateTime>` ISO timestamps; 3 pages per role, sponsored listings skipped)
-   - **Stepstone** (free HTML scraping via plain `requests`, no Apify — uses path-based URLs `/jobs/{slug}/in-deutschland?sort=2&ag=age_1`; parses SSR job cards with `data-at` attributes; 3 pages per role, 24h freshness pre-filter via `ag=age_1`. Stepstone is behind Akamai, not Cloudflare — cloudscraper hangs on Akamai, plain requests works)
-   - **Glassdoor** (free HTML scraping via cloudscraper, no Apify — parses JSON-LD `<script type="application/ld+json">` ItemList tags from SSR HTML; company names extracted from URL slugs using `_KE{start},{end}` character offsets; `fromAge=1` pre-filters to last 24h; chrome emulation + 8x retry for Cloudflare bypass; 3 pages per role)
-   - ~~Kununu~~ (DROPPED — shahidirfan/kununu-jobs-scraper returns 0 results as of 2026-08-05; all 8 Apify store kununu actors are review scrapers, not job listing scrapers)
+   - **LinkedIn** (free HTML scraping, $0 — 6 locations × 10 roles, `f_TPR=r86400` 24h filter)
+   - **Indeed** (free GraphQL API, $0 — `apis.indeed.com/graphql`, mobile user-agent, `dateOnIndeed` 24h filter, full descriptions)
+   - **Arbeitnow** (free REST API, $0)
+   - **Xing** (free HTML scraping via plain `requests`, $0 — AWS CloudFront, no anti-bot; parses `data-testid` attributes and `<time dateTime>` ISO timestamps; 3 pages per role)
+   - **Stepstone** (free HTML scraping via plain `requests`, $0 — Akamai, plain requests work; path-based URLs with `ag=age_1` 24h filter; parses SSR `data-at` attributes; 3 pages per role)
+   - **ATS Direct** (free public JSON APIs, $0 — Greenhouse/SmartRecruiters/Ashby, 17 German tech companies)
+   - ~~Startup.jobs~~ (DROPPED — 1.1 jobs/run average, negligible yield)
+   - ~~Glassdoor~~ (DROPPED — 1.1 jobs/run average, most complex scraper for negligible yield)
+   - ~~Kununu~~ (DROPPED — all Apify store kununu actors are review scrapers, not job listings)
 3. **Title Relevance Filter:** Universal post-filter `is_relevant_title()` rejects any job whose title doesn't contain at least one data/analytics/AI/SQL/Python keyword. Catches actor false positives (Indeed returning "Nachtwächter" for "Data Engineer" searches, etc.).
 4. **Role Types & Location Constraints:**
    - **Full-Time / Part-Time / Entry-Level / Junior (0–2 yrs exp):** Germany-wide (Kiel, Hamburg, Berlin, Munich, Frankfurt, Remote, etc.).
@@ -64,8 +65,8 @@ Run it with:
 cd "/home/sagar/Skills/Jobscraper" && python3 apify_job_search.py
 ```
 
-Dependencies: `cloudscraper` (for startup.jobs and Glassdoor), `requests` (for Xing and Stepstone), `openpyxl` (for XLSX export).
-Install: `pip install cloudscraper requests openpyxl`
+Dependencies: `requests` (for Xing, Stepstone, Indeed GraphQL API), `beautifulsoup4` (for HTML parsing), `openpyxl` (for XLSX export).
+Install: `pip install requests beautifulsoup4 openpyxl`
 
 The full source code is in `apify_job_search.py` — this .md file no longer embeds a duplicate copy to avoid drift between the two.
 
@@ -98,57 +99,41 @@ After within-run dedup, `load_previous_run_keys()` loads keys from the **single 
 
 Same-day reruns: today's own earlier CSV is the most recent folder, so a second run on the same day suppresses everything already exported.
 
----
-## 5. Cost Optimization & Actor Status (last updated 2026-08-07)
+## 5. Cost & Platform Details (last updated 2026-09-05)
 
 ### Cost Breakdown (per full pipeline run)
 
 | Platform | Source | Cost/run | Notes |
 |---|---|---|---|
-| LinkedIn | Apify: `curious_coder/linkedin-jobs-scraper` | ~$0.50 | Uses `count=500` (total cap across all 10 role URLs). `maxTotalChargeUsd=$0.60` safety cap. $0.001/result. |
-| Indeed | Apify: `valig/indeed-jobs-scraper` | ~$0.05 | `limit=50` per role, 10 roles parallel. $0.0001/result. Actor sometimes returns 0 results for Germany — actor-side issue. |
+| LinkedIn | Free HTML scraping | $0.00 | 6 locations × 10 roles, `f_TPR=r86400` 24h filter. 5 workers, 3s backoff on 429. ~237 jobs/run. |
+| Indeed | Free GraphQL API | $0.00 | `apis.indeed.com/graphql` — same endpoint as Indeed iOS app. Hardcoded API key, mobile user-agent, `indeed-co: DE`. `dateOnIndeed` 24h server-side filter. Full descriptions (HTML stripped to text). 5 workers, ~50 jobs/run. |
 | Arbeitnow | Free REST API | $0.00 | `https://www.arbeitnow.com/api/job-board-api` |
-| Startup.jobs | Free HTML scraping | $0.00 | `cloudscraper` bypasses Cloudflare. 6 category pages: data-engineer, data-analyst, ai-engineer, data-scientist, business-analyst, analytics-engineer. |
-| Xing | Free HTML scraping | $0.00 | `cloudscraper` bypasses anti-bot. 10 search roles × 3 pages. Parses `data-testid` attributes + `<time dateTime>` ISO timestamps. Sponsored listings (no dateTime) skipped. ~8% of raw results are <24h fresh. |
-| Stepstone | Free HTML scraping | $0.00 | `cloudscraper` bypasses anti-bot. 10 search roles × 3 pages. Path-based URLs `/jobs/{slug}/in-deutschland?sort=2&ag=age_1`. Parses SSR `data-at` attributes + `<time>` relative timestamps. `ag=age_1` pre-filters to last 24h. |
-| Glassdoor | Free HTML scraping | $0.00 | `cloudscraper` with chrome emulation. 10 search roles × 3 pages. Parses JSON-LD ItemList from SSR HTML. Company from URL slug `_KE` offsets. `fromAge=1` = last 24h. Cloudflare blocks ~60% → 8x retry with fresh instances (~98% reliability). |
-| ~~Kununu~~ | DROPPED | $0.00 | `shahidirfan/kununu-jobs-scraper` returns 0 results (broken). All 8 Apify store kununu actors are review scrapers, not job listing scrapers. |
-| **Total** | | **~$0.55** | **Was $1.50-3.00** (82% reduction) |
+| Xing | Free HTML scraping | $0.00 | Plain `requests` (AWS CloudFront, no anti-bot). 10 roles × 3 pages. `data-testid` attributes + `<time dateTime>`. ~275 jobs/run. |
+| Stepstone | Free HTML scraping | $0.00 | Plain `requests` (Akamai, no anti-bot). 10 roles × 3 pages. Path-based URLs with `ag=age_1` 24h filter. `data-at` attributes. ~45 jobs/run. |
+| ATS Direct | Free public JSON APIs | $0.00 | Greenhouse/SmartRecruiters/Ashby, 17 German tech companies. ~4 jobs/run. |
+| **Total** | | **$0.00** | **100% free — no Apify** |
 
-### What was costing $2.50-3.00/run
-1. **LinkedIn `maxItems` bug**: The code sent `maxItems: 30` but the actor uses `count` (default 100). So it scraped 100 results × 24 URLs = ~1070 results × $0.001 = **$1.07/run**. Fixed: use `count` parameter directly.
-2. **ABORTED LinkedIn runs**: Two aborted runs cost $1.24 + $1.36 = **$2.60** — aborted runs still charge for results scraped before abort. Fixed: `maxTotalChargeUsd=$0.60` cap prevents runaway costs.
-3. **24 redundant SEARCH_ROLES**: Each role triggered a separate Indeed/Kununu run. Consolidated to 10 core roles.
-4. **LinkedIn count regression (2026-08-05)**: Temporarily set to `count=15` which returned only 16 jobs total. Restored to `count=500` (~$0.50/run at $0.001/result) for adequate coverage.
+### Indeed GraphQL API Details
+
+The Indeed scraper uses Indeed's public GraphQL API at `apis.indeed.com/graphql`. This is the same endpoint used by the Indeed iOS app:
+
+- **API key**: hardcoded in the Indeed mobile app (`161092c2017b5bbab13edb12461a62d5a833871e7cad6d9d475304573de67ac8`)
+- **Headers**: mobile user-agent (`Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Indeed App 193.1`), `indeed-co: DE` for Germany, `indeed-app-info` for app version
+- **Query**: GraphQL `jobSearch` with `what` (role), `location` (Germany), `limit: 50`, `sort: RELEVANCE`, `filters: { date: { field: "dateOnIndeed", start: "24h" } }`
+- **Response**: full job data including `key` (job ID), `title`, `description.html` (full JD), `employer.name`, `location.formatted.long`, `dateOnIndeed` (epoch ms)
+- **Job URL**: constructed as `https://de.indeed.com/viewjob?jk={key}`
+- **No Cloudflare, no auth, no rate limiting observed** at 5 concurrent workers
+- **Discovered via**: [JobSpy](https://github.com/speedyapply/JobSpy) open-source library (MIT license)
 
 ### Quality Filters
 
-- **`is_relevant_title(title)`**: Universal post-filter requiring at least one data/analytics/AI/SQL/Python keyword in the job title. Applied to ALL platforms via `check_experience_and_location()`. Catches:
-  - Indeed returning "Nachtwächter" (night watchman) for "Data Engineer" searches
-  - Indeed returning "Kita Standortleitung" (daycare manager) for "Business Analyst" searches
-  - Arbeitnow returning "Schlosser / Metallbauer" (metalworker) — was caused by substring matching "bi" in description
-  - LinkedIn returning "Junior Software Engineer" — no data keywords in title
-- **Germany Location Guard** (`check_experience_and_location()` §2a): Rejects any job whose location string explicitly names a non-Germany country (Austria, Switzerland, Netherlands, France, UK, etc. — 30 countries in EN/DE). Added 2026-08-07 after LinkedIn rolled out AI-powered job search (actor `autoConvertToAiSearch` now defaults `true`), which softens `location=Germany` from a hard URL filter into a natural-language search hint. Ambiguous locations (city-only, "Remote") pass through to avoid false rejections. The `f_TPR=r86400` (24h date-posted) filter is unaffected — it remains a supported URL filter under AI search.
-
-### Verified Actor Input Schemas
-
-| Platform | Actor | Actor ID | Key input params | Pricing |
-|---|---|---|---|---|
-| LinkedIn | `curious_coder/linkedin-jobs-scraper` | `hKByXkMQaC5Qt9UMN` | `urls[]`, `count` (NOT `maxItems`), `scrapeCompany`, `autoConvertToAiSearch` (default `true` — converts unsupported classic filters like `location` into natural-language search terms; `f_TPR` date-posted filter stays as URL filter) | $0.001/result (PAY_PER_EVENT) |
-| Indeed | `valig/indeed-jobs-scraper` | `TrtlecxAsNRbKl1na` | `country`, `title`, `location`, `limit`, `datePosted` | $0.0001/result (PAY_PER_EVENT) |
-| Arbeitnow | — | — | Free REST API: `https://www.arbeitnow.com/api/job-board-api` | Free |
-| Xing | — | — | HTML scraping via plain `requests` (Xing is behind AWS CloudFront, not Cloudflare — no anti-bot). URL: `xing.com/search/in/jobs?keywords=<role>&location=germany&page=<N>`. Parses `data-testid="job-teaser-list-title"`, `aria-label` on `<img>`, `<time dateTime>` for 24h filter. | Free |
-| Stepstone | — | — | HTML scraping via plain `requests` (Stepstone is behind Akamai, not Cloudflare — cloudscraper hangs, plain requests works). URL: `stepstone.de/jobs/{slug}/in-deutschland?sort=2&ag=age_1&page=<N>`. Path-based URLs required — query-param `?keyword=` returns generic results. Parses `data-at="job-item-title"`, `data-at="job-item-company-name"`, `data-at="job-item-location"`, `data-at="job-item-timeago"` (`<time>` tag). `ag=age_1` = last 24h filter. | Free |
-| Glassdoor | — | — | HTML scraping via `cloudscraper` (chrome emulation). URL: `glassdoor.de/Job/jobs.htm?sc.keyword=<role>&locT=C&locId=26&fromAge=1&page=<N>`. Parses JSON-LD `<script type="application/ld+json">` ItemList (30 jobs/page). Company extracted from URL slug using `_KE{start},{end}` character offsets. `fromAge=1` = last 24h. `locId=26` = Germany. No posted-date in JSON-LD — `fromAge=1` guarantees freshness. | Free |
+- **`is_relevant_title(title)`**: Universal post-filter requiring at least one data/analytics/AI/SQL/Python keyword in the job title. Applied to ALL platforms via `check_experience_and_location()`. Catches Indeed fuzzy search false positives ("Nachtwächter" for "Data Engineer", "Kita Standortleitung" for "Business Analyst").
 
 ### Notes / Gotchas
 - **Output layout**: each run writes its files into `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`.
 - **XLSX export**: requires `openpyxl`. If missing, script skips XLSX with a warning.
-- **Startup.jobs**: uses `cloudscraper` to bypass Cloudflare challenge. Install: `pip install cloudscraper`. Parses `data-post-template-target` attributes from server-rendered HTML.
-- **Xing**: uses plain `requests` (NOT `cloudscraper`). Xing is behind **AWS CloudFront** (not Cloudflare) — no anti-bot challenge, so `cloudscraper` was unnecessary overhead. Server-rendered HTML with `data-testid` attributes (stable test IDs, not styled-components hashes). No date filter URL parameter — must fetch all results and filter by `<time dateTime>` ISO timestamp post-hoc. Sponsored listings lack `dateTime` and are skipped. ~8% of raw results are <24h fresh. Stops paginating when a page yields 0 fresh jobs.
-- **Stepstone**: uses plain `requests` (NOT `cloudscraper`). Stepstone is behind **Akamai** (not Cloudflare) — `cloudscraper`'s challenge-solving hangs on Akamai, causing `ReadTimeout` on port 443. Plain `requests` with a browser User-Agent works (Stepstone serves SSR HTML without anti-bot challenge). Server-side rendered HTML (React hydration) with `data-at` attributes. **Critical**: must use path-based URLs (`/jobs/{slug}/in-deutschland`) — the query-param format (`?keyword=...`) returns generic results regardless of the search term. `<style>` and `<svg>` blocks must be stripped before regex parsing (they contain CSS/paths that interfere with `data-at` attribute matching). Company name is nested inside a `<div>` within the TEXT span (unlike location which is plain text). The `ag=age_1` parameter pre-filters to last 24h ('Neuer als 24h'). `sort=2` sorts by date (Datum). Timeago strings are German relative format ('vor 49 Minuten', 'vor 3 Stunden') parsed by `parse_stepstone_timeago()`.
-- **Glassdoor**: uses `cloudscraper` with chrome browser emulation to bypass Cloudflare. Glassdoor is a React SPA but SSR-embeds job listings as JSON-LD `<script type="application/ld+json">` ItemList tags (30 jobs/page) — no React hydration needed for titles/URLs. Company names are extracted from URL slugs using `_KE{start},{end}` character offsets (Glassdoor's KO/KE encoding: KO = keyword offset, KE = employer offset). **CRITICAL: `fromAge=1` URL parameter is IGNORED by SSR** — Glassdoor's React app applies date filtering client-side after hydration. The SSR HTML always returns unfiltered results (jobs 30-165 days old). Without `ageInDays` filtering, all jobs appear as "posted today". Fixed by extracting `ageInDays` from the Next.js RSC payload (`self.__next_f.push`): each job entry has `\"ageInDays\":NNN` paired with `listingId:LLL` (which matches the `jl` parameter in JSON-LD URLs). Only `ageInDays == 0` (posted today) passes the filter. Jobs with unverified age (`None`) are skipped. Location defaults to "Germany" (`locId=26`). Cloudflare blocks ~60% of requests — 8x retry with fresh instances (~98% reliability). No login required. **Yield warning**: in testing, 0/269 raw listings had `ageInDays == 0` — Glassdoor's SSR returns predominantly stale jobs. Fresh yield is expected to be very low compared to other platforms.
-- **Indeed actor**: sometimes returns 0 results for Germany — this is an actor-side issue, not our code. The `title` param does fuzzy search, not exact match, so the `is_relevant_title` post-filter is essential.
-- **LinkedIn AI search (2026-08-07)**: LinkedIn rolled out AI-powered job search, removing most classic URL filters (experience, job type, workplace, salary, sort). The actor's `autoConvertToAiSearch` (default `true`) converts unsupported filters into natural-language search terms appended to keywords. Only date posted (`f_TPR`), company, easy apply, and under-10-applicants remain as URL filters. `location=Germany` is softened to a search hint — the Germany Location Guard in `check_experience_and_location()` catches leakage. To force exact classic URL behavior, set `autoConvertToAiSearch: false` in the actor call (not recommended — LinkedIn forces AI search server-side). To use the pre-AI actor, select `last-v6` build under Run options on Apify.
-- **Token**: read from env var `APIFY_TOKEN` or `config.json`. Rotate if exposed.
-- Rejected/tested: `misceres/indeed-scraper` (weak output), `borderline/indeed-scraper` (run failed), all 8 Apify store kununu actors (review scrapers, not job listings, or broken).
+- **Indeed GraphQL**: the `what` parameter does fuzzy search (searches description too), so `is_relevant_title` post-filter is essential. Use `-` to exclude terms, `""` for exact match.
+- **LinkedIn rate limiting**: 5 concurrent workers × 6 locations = ~30 requests over ~14s. 429 rate limiting on ~5% of requests; 3s backoff retry catches most. 3 workers would eliminate 429s but double runtime.
+- **Xing**: plain `requests` (NOT `cloudscraper`). AWS CloudFront — no anti-bot. `data-testid` attributes + `<time dateTime>` ISO timestamps. Sponsored listings (no dateTime) skipped. ~8% of raw results are <24h fresh.
+- **Stepstone**: plain `requests` (NOT `cloudscraper`). Akamai — cloudscraper hangs, plain requests works. Path-based URLs required (`/jobs/{slug}/in-deutschland`) — query-param `?keyword=` returns generic results. `ag=age_1` = last 24h filter.
+- **ATS Direct**: Greenhouse (`boards-api.greenhouse.io/v1/boards/{slug}/jobs`), SmartRecruiters (`api.smartrecruiters.com/v1/companies/{slug}/postings`), Ashby (`jobs.ashbyhq.com/{slug}` with embedded `__appData` JSON). Slug is case-sensitive (e.g. `BoschGroup` not `boschgroup`).

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Apify Job Fetcher, Deduplicator & Dated CSV Exporter for OMP Session
-Platforms: LinkedIn (free HTML), Indeed (Apify), Arbeitnow, Xing, Stepstone, ATS Direct (Greenhouse/SmartRecruiters/Ashby)
+Jobscraper Pipeline — 100% Free Job Fetcher, Deduplicator & Dated CSV Exporter
+Platforms: LinkedIn (free HTML), Indeed (GraphQL API), Arbeitnow, Xing, Stepstone, ATS Direct (Greenhouse/SmartRecruiters/Ashby)
 Filters: Freshness (<24h), Experience (<=2 yrs), Working Student (Hamburg & Kiel ONLY),
          Internships (Germany-wide), Title relevance (data/analytics/AI/SQL/Python keywords)
 Output Path: /home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/Job_Search_<Month>_<Day>_<Year>.csv
@@ -86,29 +86,6 @@ SEARCH_ROLES = [
 MAX_EXP_YEARS = 2
 FRESHNESS_HOURS = 24
 
-APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
-if not APIFY_TOKEN:
-    config_file = JOB_SEARCH_DIR.parent / "config.json"
-    if config_file.exists():
-        try:
-            with open(config_file, encoding="utf-8") as f:
-                cfg = json.load(f)
-                APIFY_TOKEN = cfg.get("APIFY_TOKEN") or cfg.get("apify_token") or cfg.get("APIFY_API_KEY") or ""
-        except Exception:
-            pass
-if not APIFY_TOKEN:
-    apify_cli_auth = Path.home() / ".apify" / "auth.json"
-    if apify_cli_auth.exists():
-        try:
-            with open(apify_cli_auth, encoding="utf-8") as f:
-                cfg = json.load(f)
-                APIFY_TOKEN = cfg.get("token", "")
-        except Exception:
-            pass
-
-# Verified Apify actor IDs (alphanumeric form, public store actors)
-ACTOR_LINKEDIN = "hKByXkMQaC5Qt9UMN"   # curious_coder/linkedin-jobs-scraper
-ACTOR_INDEED = "TrtlecxAsNRbKl1na"     # valig/indeed-jobs-scraper
 
 # Seniority Filter Regex
 EXCLUDED_TITLE_PATTERNS = re.compile(
@@ -601,93 +578,6 @@ def fetch_stepstone_jobs():
     return jobs
 
 
-def fetch_last_run_dataset(actor_id: str):
-    try:
-        runs_url = f"https://api.apify.com/v2/acts/{actor_id}/runs?desc=1&limit=1&token={APIFY_TOKEN}"
-        req = urllib.request.Request(runs_url)
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-            items = data.get("data", {}).get("items", [])
-            if items:
-                dataset_id = items[0].get("defaultDatasetId")
-                status = items[0].get("status")
-                for _ in range(30):
-                    if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
-                        break
-                    time.sleep(10)
-                    try:
-                        with urllib.request.urlopen(req, timeout=30) as r2:
-                            items = json.loads(r2.read().decode()).get("data", {}).get("items", [])
-                            if items:
-                                status = items[0].get("status")
-                    except Exception:
-                        pass
-                if dataset_id:
-                    ds_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&clean=true"
-                    with urllib.request.urlopen(urllib.request.Request(ds_url), timeout=60) as resp2:
-                        return json.loads(resp2.read().decode())
-    except Exception as err:
-        print(f"[!] Error fetching fallback dataset for actor {actor_id}: {err}")
-    return []
-
-def run_apify_actor(actor_id: str, run_input: dict, label: str = "Apify Actor", max_charge_usd: float = 0.50):
-    """Start an Apify actor asynchronously, poll with live status logs, and return dataset items."""
-    if not APIFY_TOKEN:
-        return []
-
-    start_url = f"https://api.apify.com/v2/acts/{actor_id}/runs?token={APIFY_TOKEN}&maxTotalChargeUsd={max_charge_usd}"
-    req_data = json.dumps(run_input).encode("utf-8")
-    req = urllib.request.Request(start_url, data=req_data, headers={"Content-Type": "application/json"})
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            run_info = json.loads(resp.read().decode()).get("data", {})
-    except Exception as e:
-        print(f"[!] Failed to start {label} ({actor_id}): {e}", flush=True)
-        return []
-
-    run_id = run_info.get("id")
-    dataset_id = run_info.get("defaultDatasetId")
-    if not run_id or not dataset_id:
-        print(f"[!] {label} returned invalid run info", flush=True)
-        return []
-
-    print(f"[➔] Started {label} (Run ID: {run_id}). Polling status...", flush=True)
-
-    poll_url = f"https://api.apify.com/v2/acts/{actor_id}/runs/{run_id}?token={APIFY_TOKEN}"
-    start_time = time.time()
-    max_poll_seconds = 300  # safety cap: Apify actors should finish well within 5 min
-    while True:
-        try:
-            with urllib.request.urlopen(urllib.request.Request(poll_url), timeout=30) as resp:
-                status_data = json.loads(resp.read().decode()).get("data", {})
-                status = status_data.get("status")
-                elapsed = int(time.time() - start_time)
-
-                if status in ("SUCCEEDED", "FINISHED"):
-                    print(f"[✓] {label} completed in {elapsed}s. Fetching dataset...", flush=True)
-                    break
-                elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-                    print(f"[!] {label} run failed with status '{status}' after {elapsed}s", flush=True)
-                    return []
-                elif elapsed >= max_poll_seconds:
-                    print(f"[!] {label} exceeded {max_poll_seconds}s poll timeout (status={status}); giving up", flush=True)
-                    return []
-                else:
-                    print(f"    ... {label} status: {status} ({elapsed}s elapsed)", flush=True)
-        except Exception as e:
-            print(f"    ... warning checking {label} status: {e}", flush=True)
-        time.sleep(6)
-
-    ds_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={APIFY_TOKEN}&clean=true"
-    try:
-        with urllib.request.urlopen(urllib.request.Request(ds_url), timeout=60) as resp:
-            items = json.loads(resp.read().decode())
-            print(f"[✓] Received {len(items)} items from {label}.", flush=True)
-            return items
-    except Exception as e:
-        print(f"[!] Failed to fetch dataset items for {label}: {e}", flush=True)
-        return []
 
 def fetch_linkedin_jobs_free():
     """Fetch LinkedIn jobs via free HTML scraping (no Apify, $0 cost).
@@ -834,124 +724,115 @@ def fetch_linkedin_jobs_free():
             jobs.append(job)
 
     return jobs
-def _parse_linkedin_date(posted_raw):
-    """Parse LinkedIn postedAt string into a timezone-aware datetime.
-
-    LinkedIn postedAt is date-only (YYYY-MM-DD) — treat as end-of-day (23:59:59)
-    to avoid false rejections of jobs posted late on the previous day.
-    Returns None if the string is empty or unparseable.
-    """
-    if not posted_raw:
-        return None
-    try:
-        posted_dt = datetime.fromisoformat(posted_raw.replace("Z", "+00:00"))
-        if posted_dt.tzinfo is None:
-            posted_dt = posted_dt.replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        try:
-            posted_dt = datetime.strptime(posted_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
-            return None
-    # Date-only timestamps: shift to end-of-day for a generous freshness check
-    if ":" not in posted_raw and posted_dt.hour == 0:
-        posted_dt = posted_dt.replace(hour=23, minute=59, second=59)
-    return posted_dt
-
-def _parse_linkedin_item(item, cutoff):
-    """Parse one Apify LinkedIn item dict into a job dict, or None if filtered out."""
-    title = item.get("title", "")
-    desc = item.get("descriptionText") or item.get("descriptionHtml") or ""
-    loc = item.get("location", "Germany")
-
-    is_valid, role_type_or_reason = check_experience_and_location(title, desc, loc)
-    if not is_valid:
-        return None
-
-    # Safety-net post-filter: reject stale jobs even if f_TPR=r86400 lets one through.
-    posted_raw = item.get("postedAt", "")
-    posted_dt = _parse_linkedin_date(posted_raw)
-    if posted_dt and posted_dt < cutoff:
-        return None
-
-    return {
-        "language": detect_language(f"{title} {desc}"),
-        "job_board": "LinkedIn",
-        "role_type": role_type_or_reason,
-        "title": title,
-        "company": item.get("companyName", "Unknown"),
-        "location": loc,
-        "posted_at": posted_raw or "Last 24h",
-        "exp_required": "<= 2 Years",
-        "match_score": f"{compute_match_score(f'{title} {desc}')}%",
-        "job_url": item.get("link") or item.get("applyUrl") or "",
-        "description": desc[:500]
-    }
-
-def fetch_linkedin_jobs():
-    """Fetch LinkedIn jobs via curious_coder/linkedin-jobs-scraper using search URLs (f_TPR=r86400 = last 24h).
-    f_TPR=r86400 is LinkedIn's native server-side 24h filter (verified: 727/727 jobs within 24h).
-    Post-filters on postedAt as defense-in-depth safety net."""
-    jobs = []
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=FRESHNESS_HOURS)
-    urls = [
-        f"https://www.linkedin.com/jobs/search?keywords={urllib.parse.quote(role)}&location=Germany&f_TPR=r86400"
-        for role in SEARCH_ROLES
-    ]
-    # 'count' is a TOTAL cap across all URLs (NOT per-URL — verified via actor docs + live runs).
-    # count=500 gives ~500 raw jobs; after is_relevant_title + seniority filters, ~200 survive.
-    # Cost: $1.00/1K results ⇒ ~$0.50/run. maxTotalChargeUsd=0.60 is a safety cap for aborted runs.
-    items = run_apify_actor(ACTOR_LINKEDIN, {"urls": urls, "count": 500}, label="LinkedIn Scraper", max_charge_usd=0.60)
-    for item in items:
-        job = _parse_linkedin_item(item, cutoff)
-        if job:
-            jobs.append(job)
-    return jobs
 
 def fetch_indeed_jobs():
-    """Fetch Indeed jobs via valig/indeed-jobs-scraper (Germany, last 24h).
-    datePosted='1' is unreliable — Indeed's API ignores it (~11% of listings are stale,
-    some 500+ days old). Post-filters on datePublished to enforce 24h freshness."""
+    """Fetch Indeed jobs via Indeed's public GraphQL API (Germany, last 24h).
+
+    Uses the same mobile API endpoint as the Indeed iOS app
+    (apis.indeed.com/graphql) with a hardcoded API key. No Cloudflare,
+    no auth, no Apify — completely free. Returns full job descriptions.
+
+    The API's dateOnIndeed filter enforces 24h freshness server-side.
+    Post-filters on datePublished as a safety net.
+    """
+    from bs4 import BeautifulSoup
+
+    API_URL = "https://apis.indeed.com/graphql"
+    API_HEADERS = {
+        "Host": "apis.indeed.com",
+        "content-type": "application/json",
+        "indeed-api-key": "161092c2017b5bbab13edb12461a62d5a833871e7cad6d9d475304573de67ac8",
+        "accept": "application/json",
+        "indeed-locale": "en-US",
+        "accept-language": "en-US,en;q=0.9",
+        "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Indeed App 193.1",
+        "indeed-app-info": "appv=193.1; appid=com.indeed.jobsearch; osv=16.6.1; os=ios; dtype=phone",
+        "indeed-co": "DE",
+    }
+
+    QUERY_TEMPLATE = """query GetJobData {{
+      jobSearch(
+        what: "{role}"
+        location: {{where: "Germany", radius: 50, radiusUnit: MILES}}
+        limit: 50
+        sort: RELEVANCE
+        filters: {{
+          date: {{
+            field: "dateOnIndeed",
+            start: "24h"
+          }}
+        }}
+      ) {{
+        pageInfo {{ nextCursor }}
+        results {{
+          trackingKey
+          job {{
+            key
+            title
+            datePublished
+            dateOnIndeed
+            description {{ html }}
+            location {{
+              countryName
+              countryCode
+              city
+              formatted {{ short long }}
+            }}
+            employer {{
+              name
+              relativeCompanyPageUrl
+            }}
+          }}
+        }}
+      }}
+    }}"""
+
     jobs = []
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=FRESHNESS_HOURS)
 
     def fetch_role(role):
         role_jobs = []
-        items = run_apify_actor(ACTOR_INDEED, {
-            "country": "de",
-            "title": role,
-            "limit": 50,
-            "location": "Germany",
-            "datePosted": "1"
-        }, label=f"Indeed ({role})")
-        for item in items:
-            title = item.get("title", "")
-            emp = item.get("employer") or {}
-            desc_obj = item.get("description") or {}
-            desc = desc_obj.get("text") if isinstance(desc_obj, dict) else str(desc_obj)
-            loc_obj = item.get("location") or {}
-            loc = ", ".join(filter(None, [loc_obj.get("city"), loc_obj.get("countryName")])) or "Germany"
+        query = QUERY_TEMPLATE.format(role=role.replace('"', '\\"'))
+        try:
+            resp = requests.post(API_URL, headers=API_HEADERS, json={"query": query}, timeout=15)
+            if not resp.ok:
+                print(f"[!] Indeed GraphQL API returned {resp.status_code} for '{role}'", flush=True)
+                return role_jobs
+            data = resp.json()
+            results = data.get("data", {}).get("jobSearch", {}).get("results", [])
+        except Exception as e:
+            print(f"[!] Indeed GraphQL error for '{role}': {e}", flush=True)
+            return role_jobs
+
+        for r in results:
+            j = r.get("job", {})
+            if not j:
+                continue
+            title = j.get("title", "")
+            emp = j.get("employer") or {}
+            loc_obj = j.get("location") or {}
+            loc = loc_obj.get("formatted", {}).get("long") if loc_obj.get("formatted") else None
+            loc = loc or ", ".join(filter(None, [loc_obj.get("city"), loc_obj.get("countryName")])) or "Germany"
+
+            # Strip HTML from description
+            desc_html = (j.get("description") or {}).get("html", "")
+            desc = BeautifulSoup(desc_html, "html.parser").get_text(separator=" ", strip=True) if desc_html else ""
 
             is_valid, role_type_or_reason = check_experience_and_location(title, desc, loc)
             if not is_valid:
                 continue
 
-            # Post-filter: reject stale jobs (datePosted='1' is unreliable)
-            posted_raw = item.get("datePublished", "")
+            # Safety-net freshness post-filter (API filter should already enforce 24h)
+            posted_ms = j.get("dateOnIndeed") or j.get("datePublished")
             posted_dt = None
-            if posted_raw:
+            if posted_ms:
                 try:
-                    posted_dt = datetime.fromisoformat(posted_raw.replace("Z", "+00:00"))
-                    if posted_dt.tzinfo is None:
-                        posted_dt = posted_dt.replace(tzinfo=timezone.utc)
-                except (ValueError, TypeError):
-                    try:
-                        posted_dt = datetime.strptime(posted_raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                    except (ValueError, TypeError):
-                        pass
+                    posted_dt = datetime.fromtimestamp(posted_ms / 1000, tz=timezone.utc)
+                except (ValueError, TypeError, OSError):
+                    pass
             if posted_dt and posted_dt < cutoff:
-                continue  # stale job — skip
+                continue
 
             posted_at = posted_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z") if posted_dt else "Last 24h"
             role_jobs.append({
@@ -964,12 +845,13 @@ def fetch_indeed_jobs():
                 "posted_at": posted_at,
                 "exp_required": "<= 2 Years",
                 "match_score": f"{compute_match_score(f'{title} {desc}')}%",
-                "job_url": item.get("url") or item.get("jobUrl") or "",
-                "description": desc
+                "job_url": f"https://de.indeed.com/viewjob?jk={j.get('key', '')}",
+                "description": desc,
             })
+        print(f"    Indeed GraphQL '{role}': {len(role_jobs)} jobs", flush=True)
         return role_jobs
 
-    with ThreadPoolExecutor(max_workers=8) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(fetch_role, role) for role in SEARCH_ROLES]
         for future in as_completed(futures):
             try:
@@ -1052,9 +934,9 @@ def convert_csv_to_xlsx(csv_path: Path, xlsx_path: Path) -> None:
     print(f"[✓] XLSX exported to: {xlsx_path}")
 
 def main():
-    print("=== Apify Job Fetcher & Dated CSV Exporter ===")
-    print(f"    LinkedIn: FREE HTML scraping (no Apify, $0, 10 roles parallel)")
-    print(f"    Indeed: title=<role>, limit=50, parallel (10 roles)")
+    print("=== Jobscraper Pipeline (100% Free, No Apify) ===")
+    print(f"    LinkedIn: FREE HTML scraping ($0, 10 roles × 6 locations parallel)")
+    print(f"    Indeed: GraphQL API ($0, 10 roles parallel, full descriptions)")
     print(f"    Xing/Stepstone: free HTML scraping (parallel)")
     print(f"    ATS Direct: Greenhouse/SmartRecruiters/Ashby (free public APIs)")
     print(f"    All 6 platforms run in parallel via ThreadPoolExecutor")
@@ -1129,7 +1011,7 @@ def main():
 
     print(f"Per-platform: {platform_counts}")
     print(f"Cross-run dedup: compared against yesterday ({len(prev_urls)} jobs), removed {cross_run_duplicates} already-seen job(s)")
-    print(f"Est. Apify cost: ~${0.04:.3f} (Indeed only) + LinkedIn/Arbeitnow/Xing/Stepstone/ATS Direct ALL FREE")
+    print(f"Cost: $0.00 (all platforms free — no Apify)")
 
     # Format Date String: e.g. Aug_4_2026
     date_str = now.strftime("%b_%d_%Y").replace("_0", "_")
