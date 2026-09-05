@@ -637,10 +637,10 @@ def _indeed_playwright_fetch(urls: list[str]) -> dict[str, str]:
 def verify_indeed(job: dict) -> dict:
     """Verify an Indeed job using pre-fetched description.
 
-    Description may come from Apify JSON (if non-empty), TinyFish pre-fetch,
-    or Playwright stealth fallback (mobile /m/viewjob path). Indeed job pages
-    are behind a 401/403 auth wall — plain requests and cloudscraper fail.
-    If no description is available, the job stays unverified.
+    Description comes from the Indeed GraphQL API (already in CSV from step 1),
+    or Playwright stealth fallback (mobile /m/viewjob path) for any missing.
+    Indeed job pages are behind a 401/403 auth wall — plain requests and
+    cloudscraper fail. If no description is available, the job stays unverified.
     """
     result = _empty_result()
     desc = job.get("description", "")
