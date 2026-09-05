@@ -55,16 +55,18 @@ python3 verify_jobs.py --force            # re-verify all rows
 1. **Description acquisition** — TinyFish pre-fetches JDs from all platform URLs (batch size 2, cached to `tinyfish_cache.json`). JSON injection from Apify for Indeed/Arbeitnow. Indeed fallback: Playwright stealth + mobile URL for jobs TinyFish can't fetch. Prints `X/Y jobs acquired descriptions`.
 2. **Platform verification** — each platform verifier checks if the listing is still active (404/410 = closed). Uses pre-fetched description for salary/remote extraction. Runs in parallel (1 thread per platform).
 3. **Reposted detection** — LinkedIn jobs flagged via cross-run history (>7d) + job ID age gap (>14d). No LLM tokens — pure computation.
-4. **LLM classification** — smol model (Gemini 3.1 Flash Lite) classifies German level + experience years in batches of 10. Reads `row["description"]` directly. Prints `X/Y jobs classified`.
-5. **Filter + export** — drops closed, German C1+, exp ≥3y. Segregates reposted to separate sheet. Writes 2-sheet XLSX.
+4. **LLM classification** — smol model (GLM 5.2 free via OpenRouter) classifies German level + experience years in batches of 10. Reads `row["description"]` directly. Prints `X/Y jobs classified`.
+5. **Already-applied detection** — `load_applied_job_keys()` scans `/home/sagar/Applications` (folder names) and Obsidian vault `Applications/` (.md files) for jobs already applied to. Uses `normalize_key(company, title)` for fuzzy matching. Checked first — already-applied jobs go to "Already Applied" sheet regardless of other filters.
+6. **Filter + export** — drops closed, German C1+, exp ≥3y. Segregates reposted and already-applied to separate sheets. Writes 3-sheet XLSX with hyperlink smoke test.
 
 ### Filters Applied
 
 | Filter | Action |
 |---|---|
-| Closed (404/410) | Drop |
-| Experience ≥3 years | Drop |
+| Already applied | Segregate to "Already Applied" sheet |
 | Reposted LinkedIn | Segregate to "Reposted" sheet |
+| German C1+ required | Drop |
+| Experience ≥3 years | Drop |
 | German B1/B2 | Keep + flag |
 | German preferred | Keep + flag |
 
@@ -72,16 +74,16 @@ python3 verify_jobs.py --force            # re-verify all rows
 
 The verify step MUST run inside the OMP eval sandbox — it needs `tinyfish_fetch` and `completion` (OMP-injected functions that don't exist in standalone `python3`). Running via bash silently skips JD fetching and LLM classification.
 
-```python
-# eval cell (language: py)
-import verify_jobs
-verify_jobs.completion = completion          # smol model for classification
-verify_jobs.tinyfish_fetch = tinyfish_fetch  # TinyFish bridge for JD rendering
-verify_jobs.run_verification(Path("Job Search/YYYY-MM-DD/Job_Search_*.csv"), force=True)
-```
+**Note:** The Python `completion` prelude has a recursion bug. LLM classification must be done from JS `eval` first, then injected into the Python run. See `SKILL.md` for the two-step JS+Python workflow.
 
 TinyFish descriptions are cached to `tinyfish_cache.json` — interrupts and re-runs load the cache and skip already-fetched URLs (no wallet re-spend). No regex fallback: if LLM is unavailable, jobs get `none`/empty defaults (visible in output).
-Output: `Job_Search_<date>_verified.xlsx` — 2-sheet workbook (Job Search + Reposted).
+
+Output: `Job_Search_<date>_verified.xlsx` — 3-sheet workbook:
+- **To Apply** — live, apply-ready jobs enriched with German requirement, experience years, salary, remote/hybrid
+- **Reposted** — LinkedIn reposts for manual review
+- **Already Applied** — jobs matching Applications folder or Obsidian vault
+
+A hyperlink smoke test runs automatically after export — verifies cell value == hyperlink target for all rows, plus HTTP HEAD on a random sample.
 
 ## Configuration
 
@@ -119,7 +121,7 @@ Jobscraper/
 ├── CHANGELOG.md             # version history
 ├── SKILL.md                 # OMP skill definition
 ├── apify_job_search.py      # main pipeline (6 fetchers + 2-tier dedup + export)
-├── verify_jobs.py           # post-step: TinyFish JD fetch + cache, LLM classification, reposted detection, 2-sheet XLSX
+├── verify_jobs.py           # post-step: TinyFish JD fetch + cache, LLM classification, reposted detection, already-applied detection, 3-sheet XLSX + hyperlink smoke test
 ├── indeed_playwright_fetch.js # Indeed JD fallback (Playwright stealth + mobile URL)
 ├── ats_scraper.py           # ATS direct scraping (Greenhouse/SmartRecruiters/Ashby)
 ├── dedup_existing_sheets.py # standalone retroactive dedup cleanup

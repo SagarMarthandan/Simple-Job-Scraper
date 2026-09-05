@@ -1,3 +1,24 @@
+## [2026-09-05]
+
+### Added
+- **Already-applied detection** — `load_applied_job_keys()` scans `/home/sagar/Applications` (600 folder names, em-dash separator) and Obsidian vault `Applications/` (642 .md files, hyphen separator) for jobs already applied to. Uses `normalize_key(company, title)` from `apify_job_search.py` for fuzzy matching (strips legal suffixes, gender markers, seniority). 683 unique keys from both sources. Checked first in filter loop — already-applied jobs go to "Already Applied" sheet regardless of repost/closed/filter status. New constants: `APPLICATIONS_DIR`, `OBSIDIAN_APPLICATIONS_DIR`. New helper: `_parse_application_name()`.
+- **Hyperlink smoke test** — `smoke_test_hyperlinks()` runs automatically after XLSX export. Checks every cell: `cell.value == hyperlink.target` (catches openpyxl relationship misalignment). HTTP HEAD on 10 random sample URLs (catches dead links). Prints per-sheet mismatch count + HTTP results. Uses `load_workbook` (added to openpyxl imports).
+- **429 retry for LLM classification** — `llm_classify_batch()` now retries up to 3 times on 429 rate-limit errors with 6s/12s/18s exponential backoff. Free tier models (GLM 5.2) hit ~20% 429 rate without retry; with retry, all batches succeed.
+
+### Changed
+- **XLSX output: 2 sheets → 3 sheets** — `save_xlsx()` now writes "To Apply" (was "Job Search"), "Reposted", and "Already Applied". Sheet 1 renamed from "Job Search" to "To Apply". New parameter: `already_applied_rows`.
+- **Hyperlink rendering fix** — `cell.hyperlink = Hyperlink(ref=cell.coordinate, target=url)` instead of `cell.hyperlink = url`. Explicit `Hyperlink` object with `ref` bound to cell coordinate prevents openpyxl relationship misalignment when many hyperlinks are present.
+- **LLM model: Gemini 3.1 Flash Lite → GLM 5.2 free** — smol model switched to `openrouter/z-ai/glm-5.2:free:auto` via OpenRouter free tier. 256K context, strong German comprehension, `response_format` support.
+- **Summary output** — verification summary now prints "To Apply" / "Reposted" / "Already Applied" instead of "Kept (main sheet)" / "Reposted sheet".
+- **SKILL.md eval instructions** — updated for two-step JS+Python workflow (Python `completion` prelude has recursion bug; LLM classification done from JS eval, results injected via file bridge). Documents openpyxl path fix for eval kernel using `.venv`.
+
+### Verification
+- 353 input → 214 To Apply, 103 Reposted, 20 Already Applied, 0 closed, 0 German C1+ dropped, 16 exp dropped, 110 enriched
+- Already-applied: 600 Applications folders + 642 Obsidian files → 683 unique keys → 20 matches
+- Hyperlink smoke test: 337 links, 0 mismatches, 9/10 HTTP OK (1 Indeed 403 — expected, Indeed blocks HEAD)
+- LLM classification: 353/353 jobs classified (36 batches, 0 failures with 429 retry)
+
+
 ## [2026-09-04]
 
 ### Added

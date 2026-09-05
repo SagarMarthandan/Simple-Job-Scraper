@@ -53,9 +53,10 @@ except ImportError:
     cloudscraper = None
 
 try:
-    from openpyxl import Workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
+    from openpyxl.worksheet.hyperlink import Hyperlink
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
@@ -420,6 +421,69 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
 
     return False
 
+# ── Already-Applied Detection (Applications folder + Obsidian vault) ─────────
+
+APPLICATIONS_DIR = Path("/home/sagar/Applications")
+OBSIDIAN_APPLICATIONS_DIR = Path("/home/sagar/Documents/Obsidian Vault/Job Search/Applications")
+
+
+def _parse_application_name(name: str, separator: str) -> tuple[str, str]:
+    """Parse company and title from an application folder/file name.
+
+    Strips .md extension and trailing (YYYY-MM-DD) date, then splits on
+    the first occurrence of *separator*.
+    """
+    name = name.removesuffix(".md")
+    name = re.sub(r"\s*\(\d{4}-\d{2}-\d{2}\)\s*$", "", name)
+    if separator not in name:
+        return "", ""
+    company, title = name.split(separator, 1)
+    return company.strip(), title.strip()
+
+
+def load_applied_job_keys() -> set[str]:
+    """Build a set of normalize_key(company, title) for every job already
+    applied to, scanning both local sources:
+
+    1. /home/sagar/Applications/  — folder names use ' — ' (em dash) separator
+    2. Obsidian vault Applications/ — .md file names use ' - ' (hyphen) separator
+
+    Returns a set of normalized keys; empty set if neither source exists.
+    """
+    import sys
+    skill_dir = Path("/home/sagar/Skills/Jobscraper")
+    if str(skill_dir) not in sys.path:
+        sys.path.insert(0, str(skill_dir))
+    from apify_job_search import normalize_key
+
+    keys: set[str] = set()
+    apps_count = 0
+    obsidian_count = 0
+
+    # 1. Applications folder — leaf directories with em dash in name
+    if APPLICATIONS_DIR.exists():
+        for app_dir in APPLICATIONS_DIR.rglob("*"):
+            if app_dir.is_dir() and " — " in app_dir.name:
+                company, title = _parse_application_name(app_dir.name, " — ")
+                if company and title:
+                    key = normalize_key(company, title)
+                    if key:
+                        keys.add(key)
+                        apps_count += 1
+
+    # 2. Obsidian vault — .md files with hyphen separator
+    if OBSIDIAN_APPLICATIONS_DIR.exists():
+        for md_file in OBSIDIAN_APPLICATIONS_DIR.glob("*.md"):
+            company, title = _parse_application_name(md_file.name, " - ")
+            if company and title:
+                key = normalize_key(company, title)
+                if key:
+                    keys.add(key)
+                    obsidian_count += 1
+
+    print(f"[*] Already-applied detection: {apps_count} Applications folders, "
+          f"{obsidian_count} Obsidian files → {len(keys)} unique keys")
+    return keys
 # ── Per-Platform Verifiers ───────────────────────────────────────────────────
 
 def _empty_result() -> dict:
@@ -1006,8 +1070,10 @@ def load_csv(path: Path) -> list[dict]:
         return list(reader)
 
 
-def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict] | None = None) -> None:
-    """Write verified XLSX with 2 sheets: 'Job Search' and 'Reposted'.
+def save_xlsx(path: Path, main_rows: list[dict],
+              reposted_rows: list[dict] | None = None,
+              already_applied_rows: list[dict] | None = None) -> None:
+    """Write verified XLSX with up to 3 sheets: 'To Apply', 'Reposted', 'Already Applied'.
 
     Same formatting as pipeline's convert_csv_to_xlsx: frozen header,
     autofilter, clickable URL hyperlinks, numeric match_score.
@@ -1025,6 +1091,12 @@ def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict] | Non
                 writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(reposted_rows)
+        if already_applied_rows:
+            csv_applied = path.parent / f"{path.stem}_already_applied.csv"
+            with open(csv_applied, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(already_applied_rows)
         print(f"[✓] CSV exported to: {csv_main}")
         return
 
@@ -1050,9 +1122,12 @@ def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict] | Non
             ws.append([row.get(k, "") for k in OUTPUT_FIELDS])
             r = ws.max_row
             cell = ws.cell(row=r, column=url_col)
-            url = cell.value or ""
+            url = str(cell.value or "")
             if url:
-                cell.hyperlink = url
+                # Explicit Hyperlink object ensures ref is bound to the
+                # correct cell coordinate — avoids openpyxl relationship
+                # misalignment when many hyperlinks are present.
+                cell.hyperlink = Hyperlink(ref=cell.coordinate, target=url)
                 cell.font = link_font
             cell = ws.cell(row=r, column=score_col)
             v = cell.value
@@ -1071,17 +1146,105 @@ def save_xlsx(path: Path, main_rows: list[dict], reposted_rows: list[dict] | Non
         ws.auto_filter.ref = f"A1:{get_column_letter(len(OUTPUT_FIELDS))}{ws.max_row}"
         ws.row_dimensions[1].height = 22
 
-    # Sheet 1: Job Search (main)
+    # Sheet 1: To Apply (main)
     ws_main = wb.active
-    _write_sheet(ws_main, main_rows, "Job Search")
+    _write_sheet(ws_main, main_rows, "To Apply")
 
     # Sheet 2: Reposted
     if reposted_rows:
         ws_repost = wb.create_sheet("Reposted")
         _write_sheet(ws_repost, reposted_rows, "Reposted")
 
+    # Sheet 3: Already Applied
+    if already_applied_rows:
+        ws_applied = wb.create_sheet("Already Applied")
+        _write_sheet(ws_applied, already_applied_rows, "Already Applied")
+
     wb.save(path)
     print(f"[✓] XLSX exported to: {path}")
+
+# ── Hyperlink Smoke Test ─────────────────────────────────────────────────────
+
+def smoke_test_hyperlinks(path: Path, sample_size: int = 10) -> bool:
+    """Verify XLSX hyperlinks: (1) cell value == hyperlink target for every
+    row, (2) a random sample of URLs resolve via HTTP HEAD.
+
+    Returns True if all checks pass, False if any mismatch found.
+    """
+    if not HAS_OPENPYXL:
+        return True
+    wb = load_workbook(path)
+    all_ok = True
+    total_links = 0
+    total_mismatches = 0
+
+    for sn in wb.sheetnames:
+        ws = wb[sn]
+        mismatches = 0
+        urls_to_check: list[str] = []
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            url_cell = row[OUTPUT_FIELDS.index("job_url")]
+            val = str(url_cell.value or "")
+            hl = url_cell.hyperlink
+            target = hl.target if hl else None
+            if val and target:
+                total_links += 1
+                if val != target:
+                    mismatches += 1
+                    total_mismatches += 1
+                    if mismatches <= 5:
+                        print(f"  [!] {sn} row {url_cell.row}: value ≠ hyperlink")
+                        print(f"        value:  {val[:80]}")
+                        print(f"        target: {target[:80]}")
+                urls_to_check.append(val)
+            elif val and not target:
+                total_links += 1
+                total_mismatches += 1
+                all_ok = False
+                print(f"  [!] {sn} row {url_cell.row}: has URL value but no hyperlink")
+        if mismatches:
+            all_ok = False
+        print(f"  [{sn}] {ws.max_row - 1} rows, {mismatches} hyperlink mismatches")
+
+    # HTTP sample check — verify a random subset of URLs actually resolve
+    import random
+    random.seed(42)  # deterministic sample
+    all_urls: list[str] = []
+    for sn in wb.sheetnames:
+        ws = wb[sn]
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            val = str(row[OUTPUT_FIELDS.index("job_url")].value or "")
+            if val:
+                all_urls.append(val)
+
+    sample = random.sample(all_urls, min(sample_size, len(all_urls))) if all_urls else []
+    http_ok = 0
+    http_fail = 0
+    if sample:
+        print(f"\n[*] HTTP HEAD check on {len(sample)} sample URLs...")
+        for url in sample:
+            try:
+                req = requests.head(url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
+                                    allow_redirects=True)
+                if req.status_code < 400:
+                    http_ok += 1
+                else:
+                    http_fail += 1
+                    print(f"  [!] HTTP {req.status_code}: {url[:80]}")
+            except Exception as exc:
+                http_fail += 1
+                print(f"  [!] HTTP error: {url[:60]}... — {exc}")
+        print(f"  HTTP check: {http_ok}/{len(sample)} OK, {http_fail} failed")
+
+    print(f"\n[*] Hyperlink smoke test: {total_links} links, {total_mismatches} mismatches, "
+          f"{http_ok}/{len(sample)} HTTP OK")
+    if all_ok and http_fail == 0:
+        print("[✓] All hyperlinks verified")
+    elif all_ok:
+        print(f"[~] Hyperlinks structurally OK; {http_fail} HTTP failures (may be rate-limited)")
+    else:
+        print("[!] Hyperlink mismatches detected — review above")
+    return all_ok
 
 # ── LLM Batch Classification (German + Experience) ──────────────────────────
 
@@ -1206,19 +1369,29 @@ def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
     )
     prompt = _LLM_CLASSIFY_PROMPT.format(jobs=jobs_block, count=len(jd_texts))
 
-    try:
-        raw = completion(prompt=prompt, model="smol")
-        if isinstance(raw, dict):
-            text = raw.get("value") or raw.get("text") or str(raw)
-        else:
-            text = str(raw)
+    import time
+    max_retries = 3
+    for attempt in range(max_retries + 1):
+        try:
+            raw = completion(prompt=prompt, model="smol")
+            if isinstance(raw, dict):
+                text = raw.get("value") or raw.get("text") or str(raw)
+            else:
+                text = str(raw)
 
-        results = _parse_llm_response(text, jd_texts)
-        if results is not None:
-            return results
-        print(f"  [!] LLM: 0/{len(jd_texts)} parsed — using defaults")
-    except Exception as e:
-        print(f"  [!] LLM classification failed: {e} — using defaults")
+            results = _parse_llm_response(text, jd_texts)
+            if results is not None:
+                return results
+            print(f"  [!] LLM: 0/{len(jd_texts)} parsed — using defaults")
+            break  # parse failure — no point retrying
+        except Exception as e:
+            if attempt < max_retries and "429" in str(e):
+                wait = (attempt + 1) * 6  # 6s, 12s, 18s
+                print(f"  [!] 429 rate-limited, retry {attempt+1}/{max_retries} in {wait}s...")
+                time.sleep(wait)
+                continue
+            print(f"  [!] LLM classification failed: {e} — using defaults")
+            break
 
     return [{"german": "none", "exp_years": None} for _ in jd_texts]
 
@@ -1503,13 +1676,25 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     # ── LLM batch classification (German level + experience years) ──
     llm_classify_all(rows)
 
+    # ── Already-applied detection ──
+    print(f"\n[*] Loading already-applied job keys...")
+    applied_keys = load_applied_job_keys()
+
+    import sys as _sys
+    _skill_dir = Path("/home/sagar/Skills/Jobscraper")
+    if str(_skill_dir) not in _sys.path:
+        _sys.path.insert(0, str(_skill_dir))
+    from apify_job_search import normalize_key as _normalize_key
+
     # ── Apply filters ──
     main_rows = []
     reposted_rows = []
+    already_applied_rows = []
     closed_count = 0
     german_dropped = 0
     exp_dropped = 0
     reposted_count = 0
+    already_applied_count = 0
     enriched_count = 0
 
     for row in rows:
@@ -1518,8 +1703,16 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         exp_str = row.get("detail_exp_years", "")
         is_repost = row.get("detail_reposted", "") == "True"
 
-        # Segregate: reposted (checked first — reposted jobs go to separate
-        # sheet regardless of German/exp filters, for manual review)
+        # Segregate: already applied (highest priority — if you've applied,
+        # it goes to "Already Applied" regardless of repost/closed/filter status)
+        job_key = _normalize_key(row.get("company", ""), row.get("title", ""))
+        if job_key and job_key in applied_keys:
+            already_applied_count += 1
+            already_applied_rows.append(row)
+            continue
+
+        # Segregate: reposted (goes to separate sheet regardless of
+        # German/exp filters, for manual review)
         if is_repost:
             reposted_count += 1
             reposted_rows.append(row)
@@ -1558,7 +1751,11 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         stem = stem[:-len("_deduped")]
     out_path = csv_path.parent / f"{stem}_verified.xlsx"
 
-    save_xlsx(out_path, main_rows, reposted_rows)
+    save_xlsx(out_path, main_rows, reposted_rows, already_applied_rows)
+
+    # ── Hyperlink smoke test ──
+    print(f"\n[*] Running hyperlink smoke test on {out_path.name}...")
+    smoke_test_hyperlinks(out_path)
 
     # ── Summary ──
     print()
@@ -1566,8 +1763,9 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     print("  Verification Summary")
     print("=" * 60)
     print(f"  Input:                {len(rows)} jobs")
-    print(f"  Kept (main sheet):    {len(main_rows)}")
-    print(f"  Reposted sheet:       {reposted_count}")
+    print(f"  To Apply:             {len(main_rows)}")
+    print(f"  Reposted:             {reposted_count}")
+    print(f"  Already Applied:      {already_applied_count}")
     print(f"  Closed/removed:       {closed_count}")
     print(f"  Dropped (German C1+): {german_dropped}")
     print(f"  Dropped (exp >= 3y):  {exp_dropped}")
