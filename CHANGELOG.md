@@ -1,3 +1,15 @@
+## [2026-09-05c]
+
+### Fixed
+- **LinkedIn 429 rate limiting eliminated** — `fetch_linkedin_jobs_free()` reworked: 5 workers → 3 workers, single retry → 3 retries with exponential backoff (3s, 6s, 12s + random jitter), fixed 0.5s delay → jittered 0.5-1.5s. Previous run had 3/60 requests 429'd (5%); new run: 0/60 (0%). Cost: ~10s extra runtime (43s vs 33s). Yield improved: 244 jobs (was 237-241 with 429 losses).
+
+### Removed
+- **Glassdoor verifier** (~32 lines) — `verify_glassdoor()` in verify_jobs.py. Glassdoor scraper was already removed from the pipeline in [2026-08-30b] (1.1 jobs/run average); the verifier was dead code still registered in `PLATFORM_VERIFIERS` and `TINYFISH_PLATFORMS`.
+- **Startup.jobs verifier** (~32 lines) — `verify_startupjobs()` in verify_jobs.py. Same — scraper removed in [2026-08-30b], verifier was dead code.
+- **PLATFORM_VERIFIERS entries** for `"Startup.jobs"` and `"Glassdoor"` removed.
+- **TINYFISH_PLATFORMS** trimmed from 6 platforms to 4: `{"LinkedIn", "Indeed", "Xing", "Stepstone"}`.
+
+
 ## [2026-09-05b]
 
 ### Changed

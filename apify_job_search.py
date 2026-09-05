@@ -589,19 +589,11 @@ def fetch_linkedin_jobs_free():
     multiple German cities — city-level results have different rankings and
     overlap only partially with the Germany-wide search.
 
-    Parallelism: 10 search roles run in parallel via ThreadPoolExecutor (I/O bound
-    — GIL released during requests). Each role scrapes 6 locations sequentially
-    (0.5s polite delay between locations). Total time: ~14s (was 83s sequential).
-
-    Verified 2026-08-23: Germany-only gives 60/role (277 unique across 10 roles).
-    Multi-city (6 locations) gives 184/role (3.1x more coverage).
-
-    Tradeoff vs paid Apify actor:
-    - No job descriptions (search page only). Title-based EXCLUDED_TITLE_PATTERNS
-      catches Senior/Lead/Manager in titles.
-    - No pagination, but multi-city strategy recovers more jobs than the paid actor's
-      count=500 cap in practice (184-211 unique/role vs 500 total across all roles).
+    Rate-limit resilience: 3 workers (not 5) + 3 retries with exponential
+    backoff (3s, 6s, 12s) + random jitter on polite delays. Eliminates 429
+    errors that occurred at 5 workers with single retry.
     """
+    import random
     from bs4 import BeautifulSoup
     from urllib.parse import urlencode
 
@@ -617,6 +609,31 @@ def fetch_linkedin_jobs_free():
     # Multi-city search: Germany-wide + major tech hubs.
     LINKEDIN_LOCATIONS = ["Germany", "Berlin", "Munich", "Hamburg", "Frankfurt", "Cologne"]
 
+    def _fetch_with_retry(url: str) -> requests.Response | None:
+        """Fetch URL with 3 retries on 429 using exponential backoff (3s, 6s, 12s)."""
+        for attempt in range(4):
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=15)
+                if resp.status_code == 429 and attempt < 3:
+                    backoff = 3 * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"    ... LinkedIn 429 (attempt {attempt+1}/4), backing off {backoff:.1f}s", flush=True)
+                    time.sleep(backoff)
+                    continue
+                resp.raise_for_status()
+                return resp
+            except requests.exceptions.HTTPError as exc:
+                if attempt < 3 and "429" in str(exc):
+                    backoff = 3 * (2 ** attempt) + random.uniform(0, 1)
+                    print(f"    ... LinkedIn 429 (attempt {attempt+1}/4), backing off {backoff:.1f}s", flush=True)
+                    time.sleep(backoff)
+                    continue
+                print(f"[!] LinkedIn fetch error: {exc}", flush=True)
+                return None
+            except Exception as exc:
+                print(f"[!] LinkedIn fetch error: {exc}", flush=True)
+                return None
+        return None
+
     def _scrape_role(role: str) -> list[dict]:
         """Scrape one role across all locations. Returns jobs for this role only."""
         role_jobs = []
@@ -628,15 +645,8 @@ def fetch_linkedin_jobs_free():
                 "sortBy": "DD",       # date descending
             }
             url = f"https://www.linkedin.com/jobs/search/?{urlencode(params)}"
-            try:
-                resp = requests.get(url, headers=HEADERS, timeout=15)
-                if resp.status_code == 429:
-                    # Rate limited — back off and retry once
-                    time.sleep(3)
-                    resp = requests.get(url, headers=HEADERS, timeout=15)
-                resp.raise_for_status()
-            except Exception as exc:
-                print(f"[!] LinkedIn free scrape failed for '{role}' / '{loc}': {exc}")
+            resp = _fetch_with_retry(url)
+            if not resp:
                 continue
 
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -696,17 +706,16 @@ def fetch_linkedin_jobs_free():
                     "description": "",
                 })
 
-            time.sleep(0.5)  # polite delay between locations
+            time.sleep(random.uniform(0.5, 1.5))  # jittered polite delay
 
         print(f"    LinkedIn free '{role}': {len(role_jobs)} jobs (6 locations)", flush=True)
         return role_jobs
 
-    # Run roles in parallel with limited concurrency to avoid LinkedIn 429 rate
-    # limiting. 10 concurrent roles × 6 locations = 60 simultaneous requests
-    # triggers rate limiting. 5 workers keeps peak concurrency manageable
-    # (~30 requests over ~14s = ~2 req/s) while still 6x faster than sequential.
+    # 3 workers (was 5) — eliminates 429 rate limiting at the cost of ~10s
+    # extra runtime. 5 workers triggered 429 on ~5% of requests; 3 workers
+    # with exponential backoff retry achieves 0% 429s.
     all_role_jobs = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(_scrape_role, role): role for role in SEARCH_ROLES}
         for future in as_completed(futures):
             try:

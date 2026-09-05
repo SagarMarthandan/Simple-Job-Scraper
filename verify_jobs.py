@@ -730,74 +730,6 @@ def verify_stepstone(job: dict) -> dict:
     return result
 
 
-# ── Startup.jobs / Glassdoor Verifiers (cloudscraper) ────────────────────────
-
-def verify_startupjobs(job: dict) -> dict:
-    """Verify a Startup.jobs listing. Uses pre-fetched TinyFish description if
-    available, falls back to cloudscraper otherwise."""
-    result = _empty_result()
-    url = job.get("job_url", "")
-    if not url:
-        return result
-
-    # If TinyFish already injected a description, use it directly
-    prefetched = job.get("description", "")
-    if prefetched and len(prefetched) > 50:
-        result["verified_active"] = "True"
-        result = _process_result(result, prefetched)
-        return result
-    if cloudscraper is None:
-        return result
-    try:
-        scraper = cloudscraper.create_scraper(browser={"browser": "chrome"})
-        resp = scraper.get(url, timeout=REQUEST_TIMEOUT)
-        time.sleep(2.0)
-        if resp.status_code in (404, 410):
-            result["verified_active"] = "False"
-            return result
-        if resp.status_code != 200:
-            return result
-        html = _response_text(resp)
-        result["verified_active"] = "True"
-        desc, jsonld = _extract_description_text(html)
-        result = _process_result(result, desc, jsonld)
-    except Exception:
-        pass
-    return result
-
-
-def verify_glassdoor(job: dict) -> dict:
-    """Verify a Glassdoor listing. Uses pre-fetched TinyFish description if
-    available, falls back to cloudscraper otherwise."""
-    result = _empty_result()
-    url = job.get("job_url", "")
-    if not url:
-        return result
-
-    # If TinyFish already injected a description, use it directly
-    prefetched = job.get("description", "")
-    if prefetched and len(prefetched) > 50:
-        result["verified_active"] = "True"
-        result = _process_result(result, prefetched)
-        return result
-    if cloudscraper is None:
-        return result
-    try:
-        scraper = cloudscraper.create_scraper(browser={"browser": "chrome"})
-        resp = scraper.get(url, timeout=REQUEST_TIMEOUT)
-        time.sleep(2.0)
-        if resp.status_code in (404, 410):
-            result["verified_active"] = "False"
-            return result
-        if resp.status_code != 200:
-            return result
-        html = _response_text(resp)
-        result["verified_active"] = "True"
-        desc, jsonld = _extract_description_text(html)
-        result = _process_result(result, desc, jsonld)
-    except Exception:
-        pass
-    return result
 
 
 # ── ATS Verifiers (public JSON APIs) ─────────────────────────────────────────
@@ -973,8 +905,7 @@ PLATFORM_VERIFIERS = {
     "Indeed": verify_indeed,
     "Xing": verify_xing,
     "Stepstone": verify_stepstone,
-    "Startup.jobs": verify_startupjobs,
-    "Glassdoor": verify_glassdoor,
+
     "Greenhouse": verify_greenhouse,
     "SmartRecruiters": verify_smartrecruiters,
     "Ashby": verify_ashby,
@@ -1480,8 +1411,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     # Pre-fetch JDs via TinyFish (main thread — tool.* not thread-safe)
     # TinyFish renders JS-heavy pages (LinkedIn auth-walls, Xing, Stepstone, etc.)
     # that plain requests can't. Caches to disk so interrupts don't waste money.
-    TINYFISH_PLATFORMS = {"LinkedIn", "Indeed", "Xing", "Stepstone",
-                          "Startup.jobs", "Glassdoor"}
+    TINYFISH_PLATFORMS = {"LinkedIn", "Indeed", "Xing", "Stepstone"}
     tf_jobs = [r for r in rows
                if r.get("job_board") in TINYFISH_PLATFORMS
                and not r.get("description")]
