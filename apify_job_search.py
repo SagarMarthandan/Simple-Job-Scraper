@@ -268,6 +268,109 @@ def fetch_arbeitnow_jobs():
     return jobs
 
 
+def _fetch_jsonld_description(url: str, headers: dict, timeout: int = 15) -> str:
+    """Fetch a job detail page and extract the description from JSON-LD.
+
+    LinkedIn, Xing, and Stepstone all embed full job descriptions in
+    <script type="application/ld+json"> tags on their detail pages.
+    Returns the description text (HTML stripped) or empty string on failure.
+    Retries on 429 (rate limit) with exponential backoff: 2s, 4s, 8s.
+    """
+    from bs4 import BeautifulSoup
+    import random
+
+    for attempt in range(4):  # initial + 3 retries
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            if resp.status_code == 429 and attempt < 3:
+                backoff = 2 ** (attempt + 1) + random.uniform(0, 1)  # 2s, 4s, 8s + jitter
+                time.sleep(backoff)
+                continue
+            if resp.status_code != 200:
+                return ""
+            soup = BeautifulSoup(resp.text, "html.parser")
+            jsonld = soup.find("script", type="application/ld+json")
+            if jsonld and jsonld.string:
+                data = json.loads(jsonld.string)
+                desc = data.get("description", "")
+                if desc:
+                    # Strip HTML tags from description (JSON-LD descriptions contain HTML)
+                    return BeautifulSoup(desc, "html.parser").get_text(separator=" ", strip=True)
+            return ""
+        except Exception:
+            return ""
+    return ""
+
+
+def _enrich_descriptions(jobs: list[dict], platform: str, max_workers: int = 5) -> None:
+    """Fetch full job descriptions for jobs missing them, via JSON-LD on detail pages.
+
+    Mutates jobs in-place — sets job["description"] for each job that succeeds.
+    Uses ThreadPoolExecutor with rate-limited concurrency. Skips jobs that
+    already have a full description (>500 chars, e.g. from Indeed GraphQL or
+    ATS APIs). Jobs with short snippets (<500 chars, e.g. Stepstone search card
+    snippets) are enriched with full JDs from detail page JSON-LD.
+
+    Platform-specific headers are used to avoid anti-bot blocks:
+    - LinkedIn: standard browser headers, no auth needed for detail pages
+    - Xing: German Accept-Language (AWS CloudFront, no anti-bot)
+    - Stepstone: German Accept-Language + Referer (Akamai, needs Referer)
+    """
+    import random
+
+    PLATFORM_HEADERS = {
+        "LinkedIn": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "Xing": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        },
+        "Stepstone": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.stepstone.de/",
+        },
+    }
+    headers = PLATFORM_HEADERS.get(platform, {})
+    if not headers:
+        return
+
+    # Fetch jobs with missing or short descriptions (<500 chars = snippet, not full JD)
+    to_fetch = [(i, j) for i, j in enumerate(jobs) if not j.get("description", "") or len(j.get("description", "")) < 500]
+    if not to_fetch:
+        return
+
+    print(f"    {platform}: fetching {len(to_fetch)} job descriptions via JSON-LD...", flush=True)
+    fetched = 0
+    failed = 0
+
+    def _fetch_one(idx_job):
+        idx, job = idx_job
+        url = job.get("job_url", "")
+        if not url:
+            return idx, ""
+        desc = _fetch_jsonld_description(url, headers)
+        time.sleep(random.uniform(0.3, 0.8))  # jittered polite delay
+        return idx, desc
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_one, pair): pair for pair in to_fetch}
+        for future in as_completed(futures):
+            try:
+                idx, desc = future.result()
+                if desc and len(desc) > 50:
+                    jobs[idx]["description"] = desc
+                    fetched += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+
+    print(f"    {platform}: {fetched} descriptions fetched, {failed} failed", flush=True)
+
+
 def _parse_xing_card(card, cutoff, seen_urls):
     """Parse one Xing job card HTML into a job dict, or None if filtered out.
 
@@ -339,12 +442,12 @@ def _parse_xing_card(card, cutoff, seen_urls):
 def fetch_xing_jobs():
     """Fetch jobs from Xing.com via HTML scraping (free, no Apify).
     Uses plain requests — Xing is behind AWS CloudFront (not Cloudflare), so
-    no anti-bot bypass needed. cloudscraper worked but was unnecessary overhead
-    with the same Akamai-style hang risk as Stepstone if cloudscraper updates
-    its challenge handling. Fetches search result pages for each SEARCH_ROLE
+    no anti-bot bypass needed. Fetches search result pages for each SEARCH_ROLE
     and parses job listings from server-rendered HTML. Relies on data-testid
     attributes (stable test IDs) and <time dateTime> ISO timestamps for 24h
     freshness filtering. Sponsored listings (no dateTime) are skipped.
+    After collecting job cards, fetches full descriptions from detail pages
+    via JSON-LD (<script type="application/ld+json">).
     """
     if requests is None:
         print("[!] requests not installed — skipping Xing. Install with: pip install requests")
@@ -403,6 +506,7 @@ def fetch_xing_jobs():
 
         print(f"    Xing/{role}: {role_fresh} fresh (of {role_raw} raw)")
 
+    _enrich_descriptions(jobs, "Xing", max_workers=5)
     return jobs
 
 def parse_stepstone_timeago(timeago: str) -> datetime:
@@ -503,6 +607,8 @@ def fetch_stepstone_jobs():
     attributes for each field. Uses path-based URLs (/jobs/{slug}/in-deutschland)
     — the query-param format (?keyword=...) returns generic results regardless
     of the keyword. The ag=age_1 parameter pre-filters to last 24h ('Neuer als 24h').
+    After collecting job cards, fetches full descriptions from detail pages
+    via JSON-LD (<script type="application/ld+json">) with Referer header.
     """
     if requests is None:
         print("[!] requests not installed — skipping Stepstone. Install with: pip install requests")
@@ -575,8 +681,8 @@ def fetch_stepstone_jobs():
 
         print(f"    Stepstone/{role}: {role_fresh} fresh (of {role_raw} raw)")
 
+    _enrich_descriptions(jobs, "Stepstone", max_workers=3)
     return jobs
-
 
 
 def fetch_linkedin_jobs_free():
@@ -588,6 +694,10 @@ def fetch_linkedin_jobs_free():
     jobs beyond the first 60. To maximize coverage, each role is searched across
     multiple German cities — city-level results have different rankings and
     overlap only partially with the Germany-wide search.
+
+    After collecting job cards, fetches full descriptions from detail pages
+    via JSON-LD (<script type="application/ld+json">). LinkedIn detail pages
+    serve JDs to unauthenticated plain requests — no auth wall on detail pages.
 
     Rate-limit resilience: 3 workers (not 5) + 3 retries with exponential
     backoff (3s, 6s, 12s) + random jitter on polite delays. Eliminates 429
@@ -732,6 +842,7 @@ def fetch_linkedin_jobs_free():
             seen_urls.add(url)
             jobs.append(job)
 
+    _enrich_descriptions(jobs, "LinkedIn", max_workers=3)
     return jobs
 
 def fetch_indeed_jobs():

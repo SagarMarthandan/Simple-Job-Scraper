@@ -1,3 +1,25 @@
+## [2026-09-05d]
+
+### Added
+- **JSON-LD description enrichment in step 1** — LinkedIn, Xing, and Stepstone now arrive with full job descriptions (3-6K chars) instead of empty strings or short snippets. Two new helper functions in `apify_job_search.py`:
+  - `_fetch_jsonld_description(url, headers, timeout)` — fetches a job detail page, parses `<script type="application/ld+json">`, extracts the `description` field, strips HTML via BeautifulSoup. Retries on 429 with exponential backoff (2s, 4s, 8s + jitter).
+  - `_enrich_descriptions(jobs, platform, max_workers)` — finds jobs with missing or short descriptions (<500 chars), fetches detail pages in parallel via ThreadPoolExecutor, mutates `job["description"]` in-place. Platform-specific headers (Stepstone needs `Referer: https://www.stepstone.de/` for Akamai). Jittered polite delays (0.3-0.8s per request).
+- **Wired into all 3 fetchers**: `fetch_xing_jobs()` (5 workers), `fetch_stepstone_jobs()` (3 workers), `fetch_linkedin_jobs_free()` (3 workers, after cross-role URL dedup). LinkedIn uses 3 workers to stay safe with 429 rate limits.
+
+### Changed
+- **Stepstone descriptions**: search card snippets (~100-200 chars) → full JDs from detail page JSON-LD (avg 3628 chars). Enrichment threshold raised from 50→500 chars so card snippets are replaced.
+- **LinkedIn descriptions**: empty strings → full JDs from detail page JSON-LD (avg 4207 chars). LinkedIn detail pages serve JDs to unauthenticated plain requests — no auth wall.
+- **Xing descriptions**: empty strings → full JDs from detail page JSON-LD (avg 3810 chars).
+- **Fetcher docstrings** updated to document JSON-LD enrichment.
+
+### Verification
+- Xing: 275/275 fetched (100%), 0 failed, avg 3810 chars
+- Stepstone: 45/45 fetched (100%), 0 failed, avg 3628 chars
+- LinkedIn: 218/236 fetched (92%), 18 failed (429 rate-limiting), avg 4207 chars
+- Pipeline runtime: 168s (was ~37s without enrichment — detail page fetches add ~130s)
+- Cost: $0.00 (all platforms free, plain requests only)
+
+
 ## [2026-09-05c]
 
 ### Fixed
