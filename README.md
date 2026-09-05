@@ -6,7 +6,7 @@ Automated job search pipeline that fetches fresh postings (< 24 hours old) from 
 
 ```bash
 cd /home/sagar/Skills/Jobscraper
-pip install cloudscraper requests openpyxl
+pip install requests openpyxl beautifulsoup4
 python3 apify_job_search.py
 ```
 
@@ -52,12 +52,11 @@ python3 verify_jobs.py --force            # re-verify all rows
 
 ### Pipeline Stages
 
-1. **Description acquisition** — TinyFish pre-fetches JDs from all platform URLs (batch size 2, cached to `tinyfish_cache.json`). JSON injection from Apify for Indeed/Arbeitnow. Indeed fallback: Playwright stealth + mobile URL for jobs TinyFish can't fetch. Prints `X/Y jobs acquired descriptions`.
-2. **Platform verification** — each platform verifier checks if the listing is still active (404/410 = closed). Uses pre-fetched description for salary/remote extraction. Runs in parallel (1 thread per platform).
-3. **Reposted detection** — LinkedIn jobs flagged via cross-run history (>7d) + job ID age gap (>14d). No LLM tokens — pure computation.
-4. **LLM classification** — smol model (GLM 5.2 free via OpenRouter) classifies German level + experience years in batches of 10. Reads `row["description"]` directly. Prints `X/Y jobs classified`.
-5. **Already-applied detection** — `load_applied_job_keys()` scans `/home/sagar/Applications` (folder names) and Obsidian vault `Applications/` (.md files) for jobs already applied to. Uses `normalize_key(company, title)` for fuzzy matching. Checked first — already-applied jobs go to "Already Applied" sheet regardless of other filters.
-6. **Filter + export** — drops closed, German C1+, exp ≥3y. Segregates reposted and already-applied to separate sheets. Writes 3-sheet XLSX with hyperlink smoke test.
+1. **Platform verification** — each platform verifier checks if the listing is still active (404/410 = closed). Uses descriptions from step 1 (JSON-LD on detail pages for LinkedIn/Xing/Stepstone, GraphQL/API for Indeed/Arbeitnow/ATS) for salary/remote extraction. Runs in parallel (1 thread per platform).
+2. **Reposted detection** — LinkedIn jobs flagged via cross-run history (>7d) + job ID age gap (>14d). No LLM tokens — pure computation.
+3. **LLM classification** — smol model (GLM 5.2 free via OpenRouter) classifies German level + experience years in batches of 10. Reads `row["description"]` directly (already populated from step 1). Prints `X/Y jobs classified`.
+4. **Already-applied detection** — `load_applied_job_keys()` scans `/home/sagar/Applications` (folder names) and Obsidian vault `Applications/` (.md files) for jobs already applied to. Uses `normalize_key(company, title)` for fuzzy matching. Checked first — already-applied jobs go to "Already Applied" sheet regardless of other filters.
+5. **Filter + export** — drops closed, German C1+, exp ≥3y. Segregates reposted and already-applied to separate sheets. Writes 3-sheet XLSX with hyperlink smoke test.
 
 ### Filters Applied
 
@@ -70,13 +69,13 @@ python3 verify_jobs.py --force            # re-verify all rows
 | German B1/B2 | Keep + flag |
 | German preferred | Keep + flag |
 
-### TinyFish + LLM (Sandbox Mode)
+### LLM Classification (Sandbox Mode)
 
-The verify step MUST run inside the OMP eval sandbox — it needs `tinyfish_fetch` and `completion` (OMP-injected functions that don't exist in standalone `python3`). Running via bash silently skips JD fetching and LLM classification.
+The verify step MUST run inside the OMP eval sandbox — it needs `completion` (OMP-injected LLM function that doesn't exist in standalone `python3`). Running via bash silently skips LLM classification, producing inaccurate German/experience detection.
 
 **Note:** The Python `completion` prelude has a recursion bug. LLM classification must be done from JS `eval` first, then injected into the Python run. See `SKILL.md` for the two-step JS+Python workflow.
 
-TinyFish descriptions are cached to `tinyfish_cache.json` — interrupts and re-runs load the cache and skip already-fetched URLs (no wallet re-spend). No regex fallback: if LLM is unavailable, jobs get `none`/empty defaults (visible in output).
+No regex fallback: if LLM is unavailable, jobs get `none`/empty defaults (visible in output).
 
 Output: `Job_Search_<date>_verified.xlsx` — 3-sheet workbook:
 - **To Apply** — live, apply-ready jobs enriched with German requirement, experience years, salary, remote/hybrid
@@ -90,7 +89,7 @@ A hyperlink smoke test runs automatically after export — verifies cell value =
 ### Dependencies
 
 ```bash
-pip install cloudscraper requests openpyxl beautifulsoup4
+pip install requests openpyxl beautifulsoup4
 ```
 
 ### Customization
@@ -114,8 +113,7 @@ Jobscraper/
 ├── CHANGELOG.md             # version history
 ├── SKILL.md                 # OMP skill definition
 ├── apify_job_search.py      # main pipeline (6 fetchers + 2-tier dedup + export)
-├── verify_jobs.py           # post-step: TinyFish JD fetch + cache, LLM classification, reposted detection, already-applied detection, 3-sheet XLSX + hyperlink smoke test
-├── indeed_playwright_fetch.js # Indeed JD fallback (Playwright stealth + mobile URL)
+├── verify_jobs.py           # post-step: LLM classification, reposted detection, already-applied detection, 3-sheet XLSX + hyperlink smoke test
 ├── ats_scraper.py           # ATS direct scraping (Greenhouse/SmartRecruiters/Ashby)
 ├── dedup_existing_sheets.py # standalone retroactive dedup cleanup
 ├── apify_job_search.md      # platform-specific gotchas, cost analysis, Indeed GraphQL API docs

@@ -16,7 +16,7 @@
 - **Portfolio Directory:** `/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/portfolio`
 - **Target Output Directory:** `/home/sagar/Skills/Jobscraper/Job Search`
 - **Cost:** $0.00/run (all platforms free — no Apify)
-- **Dependency:** `requests` (for Xing, Stepstone, Indeed GraphQL API), `beautifulsoup4` (for HTML parsing), `openpyxl` (for XLSX export), `cloudscraper` (optional, not currently used). Install: `pip install requests beautifulsoup4 openpyxl`
+- **Dependency:** `requests` (for Xing, Stepstone, Indeed GraphQL API), `beautifulsoup4` (for HTML parsing and JSON-LD description extraction), `openpyxl` (for XLSX export). Install: `pip install requests beautifulsoup4 openpyxl`
 - **Target Role Profiles (Consolidated 10 core roles — search engines cover variants):**
   1. **Core Data & Pipeline Engineering:** `Data Engineer`, `Analytics Engineer`
   2. **Business Intelligence & Analytics:** `Data Analyst`
@@ -65,7 +65,7 @@ Run it with:
 cd "/home/sagar/Skills/Jobscraper" && python3 apify_job_search.py
 ```
 
-Dependencies: `requests` (for Xing, Stepstone, Indeed GraphQL API), `beautifulsoup4` (for HTML parsing), `openpyxl` (for XLSX export).
+Dependencies: `requests` (for Xing, Stepstone, Indeed GraphQL API), `beautifulsoup4` (for HTML parsing and JSON-LD description extraction), `openpyxl` (for XLSX export).
 Install: `pip install requests beautifulsoup4 openpyxl`
 
 The full source code is in `apify_job_search.py` — this .md file no longer embeds a duplicate copy to avoid drift between the two.
@@ -134,6 +134,6 @@ The Indeed scraper uses Indeed's public GraphQL API at `apis.indeed.com/graphql`
 - **XLSX export**: requires `openpyxl`. If missing, script skips XLSX with a warning.
 - **Indeed GraphQL**: the `what` parameter does fuzzy search (searches description too), so `is_relevant_title` post-filter is essential. Use `-` to exclude terms, `""` for exact match.
 - **LinkedIn rate limiting**: 5 concurrent workers × 6 locations = ~30 requests over ~14s. 429 rate limiting on ~5% of requests; 3s backoff retry catches most. 3 workers would eliminate 429s but double runtime.
-- **Xing**: plain `requests` (NOT `cloudscraper`). AWS CloudFront — no anti-bot. `data-testid` attributes + `<time dateTime>` ISO timestamps. Sponsored listings (no dateTime) skipped. ~8% of raw results are <24h fresh.
-- **Stepstone**: plain `requests` (NOT `cloudscraper`). Akamai — cloudscraper hangs, plain requests works. Path-based URLs required (`/jobs/{slug}/in-deutschland`) — query-param `?keyword=` returns generic results. `ag=age_1` = last 24h filter.
+- **Xing**: plain `requests`. AWS CloudFront — no anti-bot. `data-testid` attributes + `<time dateTime>` ISO timestamps. Sponsored listings (no dateTime) skipped. ~8% of raw results are <24h fresh.
+- **Stepstone**: plain `requests`. Akamai — plain requests work. Path-based URLs required (`/jobs/{slug}/in-deutschland`) — query-param `?keyword=` returns generic results. `ag=age_1` = last 24h filter.
 - **ATS Direct**: Greenhouse (`boards-api.greenhouse.io/v1/boards/{slug}/jobs`), SmartRecruiters (`api.smartrecruiters.com/v1/companies/{slug}/postings`), Ashby (`jobs.ashbyhq.com/{slug}` with embedded `__appData` JSON). Slug is case-sensitive (e.g. `BoschGroup` not `boschgroup`).

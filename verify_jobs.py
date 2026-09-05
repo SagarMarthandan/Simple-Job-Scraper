@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-verify_jobs.py v2 — Full JD Verification Post-Step
-===================================================
+verify_jobs.py v2 — Job Verification Post-Step
+================================================
 
 Standalone script that runs AFTER the Jobscraper pipeline exports its CSV.
-Visits EVERY job URL (including LinkedIn + Indeed) to:
-  1. Check if the listing is still active (not closed/filled)
-  2. Extract the full job description text
-  3. Apply three hard drop filters:
+Step 1 (apify_job_search.py) already fetches full job descriptions via JSON-LD
+on detail pages (LinkedIn, Xing, Stepstone) or platform APIs (Indeed GraphQL,
+Arbeitnow, ATS). This script loads descriptions from the sibling JSON file and:
+  1. Checks if ATS/Arbeitnow listings are still active (API 404 = closed)
+  2. Applies three hard drop filters:
      - German level > B2 (C1/C2/fließend/Muttersprache/verhandlungssicher) → DROP
      - Experience ≥ 3 years (from JD body text) → DROP
-     - Closed/inactive (404/410/redirect-to-expired) → DROP
-  4. Apply one segregation filter:
+     - Closed/inactive (ATS API 404) → DROP
+  3. Applies one segregation filter:
      - Reposted LinkedIn jobs (cross-run history >7 days or job ID age >14 days)
        → moved to "Reposted" sheet (NOT dropped)
-  5. Recalculate match score from actual JD text
-  6. Enrich with: detail_language, detail_exp_years, detail_salary, detail_remote
+  4. Recalculates match score from actual JD text
+  5. Enriches with: detail_language, detail_exp_years, detail_salary, detail_remote
 
-Output: Job_Search_<date>_verified.xlsx with 1 sheet:
-  - "Job Search": applicable jobs (passed all filters)
+Output: Job_Search_<date>_verified.xlsx with 3 sheets:
+  - "To Apply": applicable jobs (passed all filters)
+  - "Reposted": LinkedIn reposts for manual review
+  - "Already Applied": jobs matching Applications folder or Obsidian vault
 
 Usage:
   # Run inside eval sandbox (LLM classification available):
@@ -30,7 +33,7 @@ Usage:
   python3 verify_jobs.py --csv path.csv   # specify input
   python3 verify_jobs.py --force          # re-verify all (ignore prior results)
 
-Note: German level + experience classification uses LLM (smol model, batch of 5
+Note: German level + experience classification uses LLM (smol model, batch of 10
 JDs per call) via completion(). Requires OMP eval runtime — no regex fallback.
 """
 import argparse
@@ -38,7 +41,6 @@ from collections import Counter
 import csv
 import json
 import re
-import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -46,11 +48,6 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-
-try:
-    import cloudscraper
-except ImportError:
-    cloudscraper = None
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -79,15 +76,6 @@ HEADERS = {
 REQUEST_TIMEOUT = 15
 
 
-def _response_text(resp) -> str:
-    """Get response text with correct encoding.
-    requests defaults to ISO-8859-1 when no charset is in Content-Type header,
-    causing mojibake on German sites (Ã¼ instead of ü). Use apparent_encoding
-    (chardet detection) as a better fallback.
-    """
-    if resp.encoding is None or resp.encoding.lower() in ("iso-8859-1", "latin-1"):
-        resp.encoding = resp.apparent_encoding or "utf-8"
-    return resp.text
 
 # Platforms that use public APIs (no HTML scraping)
 ATS_PLATFORMS = {"Greenhouse", "SmartRecruiters", "Ashby"}
@@ -210,57 +198,6 @@ def compute_match_score_from_jd(jd_text: str) -> int:
     return min(100, int((matches / len(TECH_KEYWORDS)) * 100 * 2.5))
 
 
-# ── JSON-LD Extraction ───────────────────────────────────────────────────────
-
-_JSONLD_RE = re.compile(
-    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-    re.DOTALL | re.IGNORECASE,
-)
-
-
-def _extract_jsonld(html: str) -> dict | None:
-    """Extract first JobPosting JSON-LD block from HTML."""
-    for m in _JSONLD_RE.finditer(html):
-        try:
-            data = json.loads(m.group(1).strip())
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if isinstance(data, list):
-            for item in data:
-                if isinstance(item, dict) and item.get("@type") in (
-                    "JobPosting", "https://schema.org/JobPosting"
-                ):
-                    return item
-        elif isinstance(data, dict) and data.get("@type") in (
-            "JobPosting", "https://schema.org/JobPosting"
-        ):
-            return data
-    return None
-
-
-def _extract_description_text(html: str) -> tuple[str, dict | None]:
-    """Extract job description text from HTML for signal extraction.
-
-    Returns (description_text, jsonld_dict_or_None).
-    Tries JSON-LD description first, then falls back to stripping HTML tags.
-    """
-    jsonld = _extract_jsonld(html)
-    if jsonld and jsonld.get("description"):
-        desc = jsonld["description"]
-        # JSON-LD descriptions may contain HTML entities and tags
-        desc = re.sub(r'&lt;', '<', desc)
-        desc = re.sub(r'&gt;', '>', desc)
-        desc = re.sub(r'&amp;', '&', desc)
-        desc = re.sub(r'&nbsp;', ' ', desc)
-        desc = re.sub(r'<[^>]+>', ' ', desc)
-        desc = re.sub(r'&[a-z]+;', ' ', desc)
-        return desc.strip(), jsonld
-    # Fallback: strip all HTML tags from the full page
-    text = re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = re.sub(r'&[a-z]+;', ' ', text)
-    return text.strip(), jsonld
 
 # ── Reposted Detection (LinkedIn only) ───────────────────────────────────────
 
@@ -524,130 +461,32 @@ def _process_result(result: dict, desc_text: str, jsonld: dict | None = None) ->
 # ── LinkedIn Verifier (plain requests + JSON-LD, no auth) ────────────────────
 
 def verify_linkedin(job: dict) -> dict:
-    """Verify a single LinkedIn job. Uses pre-fetched TinyFish description if
-    available, falls back to plain requests + JSON-LD otherwise.
+    """Verify a LinkedIn job using pre-fetched description from step 1.
+
+    Step 1 fetches full JDs via JSON-LD on detail pages. If the description
+    is present, the job is active (page was accessible < 24h ago).
     """
     result = _empty_result()
-    url = job.get("job_url", "")
-    if not url:
-        return result
-
-    # If TinyFish already injected a description, use it directly
-    prefetched = job.get("description", "")
-    if prefetched and len(prefetched) > 50:
-        # Detect LinkedIn auth-wall boilerplate (no real JD content)
-        _BOILERPLATE_MARKERS = ("Similar jobs", "People also viewed", "Referrals increase")
-        _JD_MARKERS = ("requirements", "responsibilities", "qualifications", "experience",
-                       "skills", "You will", "Your role", "What you", "Aufgaben",
-                       "Anforderungen", "Profil", "Voraussetzungen", "Wir suchen",
-                       "Über uns", "Das bringen Sie", "What you'll", "About the role",
-                       "Job description", "About you", "Your mission", "Was Sie")
-        text_lower = prefetched.lower()
-        is_boilerplate = any(m in prefetched for m in _BOILERPLATE_MARKERS)
-        has_jd = any(m.lower() in text_lower for m in _JD_MARKERS)
-        if is_boilerplate and not has_jd:
-            # Auth wall — LinkedIn didn't render the real JD. Leave unverified
-            # so the user can review manually.
-            result["detail_language"] = "AUTH WALL — review manually"
-            return result
-        result["verified_active"] = "True"
-        result = _process_result(result, prefetched)
-        return result
-
-    # Fallback: plain requests + JSON-LD
-    for attempt in range(2):
-        try:
-            resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS,
-                                allow_redirects=True)
-            if resp.status_code == 404:
-                result["verified_active"] = "False"
-                return result
-            if resp.status_code != 200:
-                if attempt == 0:
-                    time.sleep(3)
-                    continue
-                return result
-
-            html = _response_text(resp)
-            jsonld = _extract_jsonld(html)
-
-            if jsonld:
-                result["verified_active"] = "True"
-                desc, _ = _extract_description_text(html)
-                result = _process_result(result, desc, jsonld)
-            else:
-                title = job.get("title", "")
-                if title and title.lower() in html.lower():
-                    result["verified_active"] = "True"
-                elif attempt == 0:
-                    time.sleep(3)
-                    continue
-                else:
-                    pass
-            break
-        except (requests.RequestException, requests.Timeout):
-            if attempt == 0:
-                time.sleep(3)
-                continue
-            pass
-            break
-
-    time.sleep(1)
+    desc = job.get("description", "")
+    if not desc or len(desc) < 50:
+        return result  # no description — can't verify, keep as unknown
+    result["verified_active"] = "True"
+    result = _process_result(result, desc)
     return result
 
 
-
-
-# ── Indeed Playwright Fallback ───────────────────────────────────────────────
-
-INDEED_PW_SCRIPT = Path(__file__).parent / "indeed_playwright_fetch.js"
-
-
-def _indeed_playwright_fetch(urls: list[str]) -> dict[str, str]:
-    """Fetch Indeed JDs via Playwright stealth + mobile URL.
-
-    Indeed blocks TinyFish (target_http_error), plain requests (401/403),
-    and vanilla headless Playwright (Cloudflare). The workaround uses
-    playwright-extra with stealth plugin + mobile /m/viewjob path.
-
-    Returns dict of {url: jd_text} for successfully fetched URLs.
-    """
-    if not urls or not INDEED_PW_SCRIPT.exists():
-        return {}
-    try:
-        proc = subprocess.run(
-            ["node", str(INDEED_PW_SCRIPT), *urls],
-            capture_output=True, text=True, timeout=30 + 15 * len(urls),
-            cwd=str(INDEED_PW_SCRIPT.parent),
-        )
-        if proc.returncode != 0:
-            print(f"  [!] Playwright Indeed fetch failed (exit {proc.returncode}): "
-                  f"{proc.stderr[:200]}")
-            return {}
-        results = json.loads(proc.stdout)
-        return {r["url"]: r["text"] for r in results
-                if r.get("text") and len(r["text"]) > 50}
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as exc:
-        print(f"  [!] Playwright Indeed fetch error: {exc}")
-        return {}
-
-
- # ── Indeed Verifier (plain requests) ─────────────────────────────────────────
+# ── Indeed Verifier ───────────────────────────────────────────────────────────
 
 def verify_indeed(job: dict) -> dict:
-    """Verify an Indeed job using pre-fetched description.
+    """Verify an Indeed job using pre-fetched description from step 1.
 
-    Description comes from the Indeed GraphQL API (already in CSV from step 1),
-    or Playwright stealth fallback (mobile /m/viewjob path) for any missing.
-    Indeed job pages are behind a 401/403 auth wall — plain requests and
-    cloudscraper fail. If no description is available, the job stays unverified.
+    Description comes from the Indeed GraphQL API (already in JSON from step 1).
+    If no description is available, the job stays unverified.
     """
     result = _empty_result()
     desc = job.get("description", "")
     if not desc:
-        # No pre-fetched description — can't verify, keep as unknown
         return result
-    # Job was found by Apify < 24h ago — it's active
     result["verified_active"] = "True"
     result = _process_result(result, desc)
     return result
@@ -656,77 +495,32 @@ def verify_indeed(job: dict) -> dict:
 # ── Xing Verifier ────────────────────────────────────────────────────────────
 
 def verify_xing(job: dict) -> dict:
-    """Verify a Xing job listing. Uses pre-fetched TinyFish description if
-    available, falls back to plain requests otherwise."""
-    result = _empty_result()
-    url = job.get("job_url", "")
-    if not url:
-        return result
+    """Verify a Xing job using pre-fetched description from step 1.
 
-    # If TinyFish already injected a description, use it directly
-    prefetched = job.get("description", "")
-    if prefetched and len(prefetched) > 50:
-        result["verified_active"] = "True"
-        result = _process_result(result, prefetched)
+    Step 1 fetches full JDs via JSON-LD on detail pages.
+    """
+    result = _empty_result()
+    desc = job.get("description", "")
+    if not desc or len(desc) < 50:
         return result
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS,
-                            allow_redirects=True)
-        time.sleep(1.5)
-        if resp.status_code == 404:
-            result["verified_active"] = "False"
-            return result
-        if resp.status_code != 200:
-            return result
-        html = _response_text(resp)
-        jsonld = _extract_jsonld(html)
-        title = job.get("title", "")
-        if jsonld or (title and title.lower() in html.lower()):
-            result["verified_active"] = "True"
-            desc, _ = _extract_description_text(html)
-            result = _process_result(result, desc, jsonld)
-        else:
-            result["verified_active"] = "False"
-    except (requests.RequestException, requests.Timeout):
-        pass
+    result["verified_active"] = "True"
+    result = _process_result(result, desc)
     return result
 
 
 # ── Stepstone Verifier ───────────────────────────────────────────────────────
 
 def verify_stepstone(job: dict) -> dict:
-    """Verify a Stepstone job listing. Uses pre-fetched TinyFish description if
-    available, falls back to plain requests otherwise."""
-    result = _empty_result()
-    url = job.get("job_url", "")
-    if not url:
-        return result
+    """Verify a Stepstone job using pre-fetched description from step 1.
 
-    # If TinyFish already injected a description, use it directly
-    prefetched = job.get("description", "")
-    if prefetched and len(prefetched) > 50:
-        result["verified_active"] = "True"
-        result = _process_result(result, prefetched)
+    Step 1 fetches full JDs via JSON-LD on detail pages.
+    """
+    result = _empty_result()
+    desc = job.get("description", "")
+    if not desc or len(desc) < 50:
         return result
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS,
-                            allow_redirects=True)
-        time.sleep(2.0)
-        if resp.status_code in (404, 410):
-            result["verified_active"] = "False"
-            return result
-        if resp.status_code != 200:
-            return result
-        html = _response_text(resp)
-        lower_html = html.lower()
-        if "nicht mehr verfügbar" in lower_html or "no longer available" in lower_html:
-            result["verified_active"] = "False"
-            return result
-        result["verified_active"] = "True"
-        desc, jsonld = _extract_description_text(html)
-        result = _process_result(result, desc, jsonld)
-    except (requests.RequestException, requests.Timeout):
-        pass
+    result["verified_active"] = "True"
+    result = _process_result(result, desc)
     return result
 
 
@@ -912,9 +706,7 @@ PLATFORM_VERIFIERS = {
     "Arbeitnow": verify_arbeitnow,
 }
 
-# Platforms that use 2-worker parallelism (rate-limit sensitive)
-PARALLEL_PLATFORMS = {"LinkedIn"}
-# ATS platforms: 4 workers
+# ATS platforms: 4 workers for parallel API calls
 ATS_PLATFORMS_SET = {"Greenhouse", "SmartRecruiters", "Ashby"}
 
 
@@ -943,20 +735,9 @@ def verify_platform_batch(platform: str, jobs: list[dict]) -> list[tuple[int, di
                     results.append((idx, future.result()))
                 except Exception:
                     results.append((idx, _empty_result()))
-    elif platform in PARALLEL_PLATFORMS:
-        # LinkedIn fallback: 2 workers (plain requests, rate-limit sensitive)
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            future_to_idx = {
-                executor.submit(verifier, job): i for i, job in enumerate(jobs)
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results.append((idx, future.result()))
-                except Exception:
-                    results.append((idx, _empty_result()))
     else:
-        # Sequential with delay (delay is inside each verifier)
+        # Sequential (LinkedIn/Xing/Stepstone/Indeed are instant — no HTTP,
+        # just read pre-fetched description. Arbeitnow makes 1 API call per job.)
         for i, job in enumerate(jobs):
             try:
                 results.append((i, verifier(job)))
@@ -1408,115 +1189,6 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         except (json.JSONDecodeError, OSError):
             pass
 
-    # Pre-fetch JDs via TinyFish (main thread — tool.* not thread-safe)
-    # TinyFish renders JS-heavy pages (LinkedIn auth-walls, Xing, Stepstone, etc.)
-    # that plain requests can't. Caches to disk so interrupts don't waste money.
-    TINYFISH_PLATFORMS = {"LinkedIn", "Indeed", "Xing", "Stepstone"}
-    tf_jobs = [r for r in rows
-               if r.get("job_board") in TINYFISH_PLATFORMS
-               and not r.get("description")]
-
-    if tf_jobs:
-        if "tinyfish_fetch" not in globals():
-            print(f"[!] WARNING: tinyfish_fetch not available (not running in OMP eval).")
-            print(f"[!] {len(tf_jobs)} jobs will have NO JD text — German/exp/salary")
-            print(f"[!] detection will be inaccurate. Run via eval, not bash.")
-        else:
-            # ── Load disk cache so re-runs skip already-fetched URLs ──
-            cache_path = csv_path.parent / "tinyfish_cache.json"
-            cache: dict[str, str] = {}
-            if cache_path.exists():
-                try:
-                    with open(cache_path, encoding="utf-8") as f:
-                        cache = json.load(f)
-                    print(f"[*] Loaded TinyFish cache: {len(cache)} descriptions")
-                except (json.JSONDecodeError, OSError):
-                    pass
-
-            # Inject cached descriptions
-            cache_hits = 0
-            for row in tf_jobs:
-                url = row.get("job_url", "")
-                if url in cache and cache[url]:
-                    row["description"] = cache[url]
-                    cache_hits += 1
-            if cache_hits:
-                print(f"[*] Cache hits: {cache_hits}/{len(tf_jobs)} (skipping re-fetch)")
-
-            # Only fetch jobs not in cache
-            to_fetch = [r for r in tf_jobs if r.get("job_url") not in cache]
-            if to_fetch:
-                print(f"[*] Pre-fetching {len(to_fetch)} JDs via TinyFish "
-                      f"({', '.join(sorted({r['job_board'] for r in to_fetch}))})...")
-                tf_batch_size = 2  # keep response under truncation limit
-                tf_injected = 0
-                for batch_start in range(0, len(to_fetch), tf_batch_size):
-                    batch = to_fetch[batch_start:batch_start + tf_batch_size]
-                    urls = [j.get("job_url", "") for j in batch if j.get("job_url")]
-                    if not urls:
-                        continue
-                    try:
-                        resp = tinyfish_fetch(urls)
-                        for item in resp.get("results", []):
-                            u = item.get("url", "")
-                            text = item.get("text", "")
-                            if not text:
-                                continue
-                            cache[u] = text  # add to cache
-                            for row in rows:
-                                if row.get("job_url") == u:
-                                    row["description"] = text
-                                    tf_injected += 1
-                                    break
-                    except Exception as exc:
-                        print(f"  [!] TinyFish batch {batch_start // tf_batch_size + 1} failed: {exc}")
-                    # ── Save cache to disk after every batch (survive interrupts) ──
-                    try:
-                        with open(cache_path, "w", encoding="utf-8") as f:
-                            json.dump(cache, f, ensure_ascii=False)
-                    except OSError:
-                        pass
-                    batch_num = batch_start // tf_batch_size + 1
-                    total_batches = (len(to_fetch) + tf_batch_size - 1) // tf_batch_size
-                    print(f"    TinyFish batch {batch_num}/{total_batches} done "
-                          f"({tf_injected} new JDs, {len(cache)} cached)", flush=True)
-                print(f"[*] TinyFish injected {tf_injected} new descriptions "
-                      f"({len(cache)} total in cache)")
-            else:
-                print(f"[*] All {len(tf_jobs)} JDs found in cache — no TinyFish fetch needed")
-
-    # ── Playwright fallback for Indeed (TinyFish can't fetch Indeed) ──────────
-    indeed_missing = [r for r in rows
-                      if r.get("job_board") == "Indeed"
-                      and not r.get("description", "").strip()]
-    if indeed_missing:
-        print(f"\n[*] Playwright Indeed fallback: {len(indeed_missing)} jobs "
-              f"still missing descriptions after TinyFish")
-        indeed_urls = [r.get("job_url", "") for r in indeed_missing
-                       if r.get("job_url")]
-        pw_results = _indeed_playwright_fetch(indeed_urls)
-        pw_injected = 0
-        for url, text in pw_results.items():
-            for row in rows:
-                if row.get("job_url") == url:
-                    row["description"] = text
-                    pw_injected += 1
-                    break
-        # Cache Playwright results alongside TinyFish cache
-        if pw_results:
-            cache_path = csv_path.parent / "tinyfish_cache.json"
-            try:
-                existing_cache = {}
-                if cache_path.exists():
-                    with open(cache_path, encoding="utf-8") as f:
-                        existing_cache = json.load(f)
-                existing_cache.update(pw_results)
-                with open(cache_path, "w", encoding="utf-8") as f:
-                    json.dump(existing_cache, f, ensure_ascii=False)
-            except (json.JSONDecodeError, OSError):
-                pass
-        print(f"[*] Playwright injected {pw_injected} Indeed descriptions "
-              f"({len(indeed_missing) - pw_injected} still missing)")
 
     # Print acquisition stats
     desc_count = sum(1 for r in rows if r.get("description", "").strip())

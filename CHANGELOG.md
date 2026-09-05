@@ -1,3 +1,27 @@
+## [2026-09-05e]
+
+### Removed
+- **TinyFish JD pre-fetch** (~110 lines) — `run_verification()` TinyFish pre-fetch block, cache loading/saving, `tinyfish_fetch` dispatch. Step 1 now fetches full descriptions via JSON-LD, making TinyFish redundant.
+- **Indeed Playwright fallback** (~60 lines) — `_indeed_playwright_fetch()`, `INDEED_PW_SCRIPT`, Playwright fallback block in `run_verification()`. Indeed descriptions come from GraphQL API in step 1.
+- **`indeed_playwright_fetch.js`** (85 lines) — dead file. Playwright stealth + mobile URL workaround for Indeed JD fetching, no longer needed.
+- **Dead helpers in verify_jobs.py** (~80 lines) — `_response_text()`, `_extract_jsonld()`, `_extract_description_text()`, `_JSONLD_RE`. Only used by the removed fallback fetching paths.
+- **`cloudscraper` imports** — removed from both `verify_jobs.py` and `apify_job_search.py`. Not used anywhere; all platforms use plain `requests`.
+- **`subprocess` import** from `verify_jobs.py` — only used by removed Playwright fallback.
+- **`PARALLEL_PLATFORMS`** set and LinkedIn 2-worker parallel branch in `verify_platform_batch()` — LinkedIn verifier no longer makes HTTP requests (reads pre-fetched description), so parallelism is unnecessary.
+- **Total: ~432 lines removed** (verify_jobs.py 1559→1135, + 85 lines JS file deleted).
+
+### Changed
+- **`verify_linkedin/xing/stepstone`** simplified to 8 lines each — read pre-fetched description from step 1, extract signals, no HTTP fallback. Was 30-70 lines each with requests fallback + JSON-LD parsing + auth-wall detection.
+- **`verify_indeed`** docstring updated — removed Playwright/cloudscraper references.
+- **Module docstring** updated — reflects new architecture (descriptions from step 1, 3-sheet output).
+- **SKILL.md, README.md, apify_job_search.md** — removed all TinyFish/Playwright/cloudscraper references. Dependencies: `requests, openpyxl, beautifulsoup4` only. Verify step runs via eval for LLM classification (`completion`), not TinyFish.
+
+### Verification
+- Pipeline: 617 raw → 484 after cross-run dedup. All platforms normal.
+- verify_jobs.py imports clean, no syntax errors.
+- Zero references to TinyFish/Playwright/cloudscraper in .py files (except historical changelog comments).
+
+
 ## [2026-09-05d]
 
 ### Added

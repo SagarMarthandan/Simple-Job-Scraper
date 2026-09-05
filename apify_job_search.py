@@ -43,10 +43,6 @@ import time
 import urllib.request
 import html as html_mod
 import urllib.parse
-try:
-    import cloudscraper
-except ImportError:
-    cloudscraper = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from datetime import datetime, timezone, timedelta

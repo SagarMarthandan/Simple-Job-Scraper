@@ -2,7 +2,7 @@
 name: Jobscraper
 description: >-
   Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, and ATS Direct for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates against yesterday's run, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "arbeitnow", "xing jobs", "stepstone jobs", "job pipeline", "run job search".
-dependencies: python>=3.10, requests, openpyxl, beautifulsoup4, tinyfish-cli
+dependencies: python>=3.10, requests, openpyxl, beautifulsoup4
 ---
 
 # Jobscraper Pipeline
@@ -22,8 +22,8 @@ cd /home/sagar/Skills/Jobscraper && python3 apify_job_search.py
 ### Step 2: Verify (eval — requires OMP runtime for LLM)
 
 The verify step MUST run through `eval` (OMP Python kernel), not `bash`.
-It needs `completion` (OMP-injected) for LLM classification. TinyFish JD
-fetching uses the `tinyfish` CLI via subprocess. Running via bash silently
+It needs `completion` (OMP-injected) for LLM classification of German
+language requirements and experience years. Running via bash silently
 skips LLM classification, producing inaccurate German/experience detection.
 
 **Note:** The Python `completion` prelude function has a recursion bug.
@@ -94,7 +94,7 @@ writeFileSync('/tmp/jd_classifications.json', JSON.stringify(results));
 
 ```python
 # eval cell (language: py)
-import sys, json, subprocess, re, site
+import sys, json, re, site
 from pathlib import Path
 from datetime import datetime
 
@@ -108,19 +108,14 @@ if str(skill_dir) not in sys.path:
 
 # --- Extract JD texts for JS-side LLM classification ---
 csv_path = skill_dir / 'Job Search' / datetime.now().strftime("%Y-%m-%d") / f'Job_Search_{datetime.now().strftime("%b_%d_%Y").replace("_0", "_")}.csv'
-# (load CSV + JSON + TinyFish cache, extract relevant sections, save to /tmp/jd_to_classify.json)
+# (load CSV + JSON, extract relevant sections, save to /tmp/jd_to_classify.json)
 # Run JS eval cell above, then continue below.
 
 # --- Load pre-computed classifications ---
 with open("/tmp/jd_classifications.json") as f:
     classifications = json.load(f)
 
-def tinyfish_fetch(urls):
-    result = subprocess.run(["tinyfish", "fetch", "content", "get", "--format", "markdown"] + urls,
-                            capture_output=True, text=True, timeout=120)
-    return json.loads(result.stdout)
-
-g = {'__file__': str(skill_dir / 'verify_jobs.py'), 'tinyfish_fetch': tinyfish_fetch, 'completion': lambda *a, **k: "stub"}
+g = {'__file__': str(skill_dir / 'verify_jobs.py'), 'completion': lambda *a, **k: "stub"}
 with open(skill_dir / 'verify_jobs.py') as f:
     exec(compile(f.read(), 'verify_jobs.py', 'exec'), g)
 
@@ -137,15 +132,8 @@ g['llm_classify_all'] = patched
 g['run_verification'](csv_path, force=True)
 ```
 
-TinyFish descriptions are cached to `tinyfish_cache.json` in the run
-directory — interrupts and re-runs load the cache and skip already-fetched
-URLs (no wallet re-spend).
-
-Dependencies: `requests`, `openpyxl`, `beautifulsoup4` (for ATS scraper), `tinyfish` CLI (for JD fetching).
-Install: `pip install requests openpyxl beautifulsoup4` and `npm install -g @tiny-fish/cli`
-
-Indeed JD fallback: `playwright`, `playwright-extra`, `puppeteer-extra-plugin-stealth` (Node.js).
-Install: `cd /home/sagar/Skills/Jobscraper && npm install playwright playwright-extra puppeteer-extra-plugin-stealth && npx playwright install chromium`
+Dependencies: `requests`, `openpyxl`, `beautifulsoup4`.
+Install: `pip install requests openpyxl beautifulsoup4`
 
 ## Context
 
@@ -163,7 +151,7 @@ Install: `cd /home/sagar/Skills/Jobscraper && npm install playwright playwright-
 1. **Freshness Window:** Strictly posted within the **last 24 hours**.
 2. **Target Platforms:**
    - **LinkedIn** (free HTML scraping, no Apify, $0)
-   - **Indeed** (Apify — valig/indeed-jobs-scraper, ~$0.04/run)
+   - **Indeed** (free GraphQL API, $0)
    - **Arbeitnow** (free API, no Apify)
    - **Xing** (free HTML scraping via plain `requests`, no Apify)
    - **Stepstone** (free HTML scraping via plain `requests`, no Apify)
@@ -194,8 +182,7 @@ Files written to `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`:
 ### Step 2 Output (verify)
 
 - `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 3 sheets: "To Apply" (live, apply-ready, enriched with German requirement, experience years, salary, remote/hybrid), "Reposted" (LinkedIn reposts for manual review), and "Already Applied" (jobs matching Sagar's Applications folder or Obsidian vault). Hyperlink smoke test runs automatically after export.
-- `tinyfish_cache.json` — cached JD descriptions (survives interrupts, re-runs skip already-fetched URLs)
 
 ## Cost
 
-$0.00/run — all 6 platforms free (no Apify). Indeed uses a public GraphQL API; LinkedIn uses free HTML scraping; Arbeitnow/Xing/Stepstone use free HTML/REST; ATS Direct uses free public JSON APIs. Verify step: TinyFish fetch is free; LLM classification uses `completion(model="smol")` (minimal cost). Cache prevents re-fetching on re-runs.
+$0.00/run — all 6 platforms free (no Apify). Indeed uses a public GraphQL API; LinkedIn uses free HTML scraping; Arbeitnow/Xing/Stepstone use free HTML/REST; ATS Direct uses free public JSON APIs. Job descriptions arrive from step 1 (JSON-LD on detail pages for LinkedIn/Xing/Stepstone, GraphQL/API for Indeed/Arbeitnow/ATS). Verify step only needs LLM classification via `completion(model="smol")` (minimal cost).
