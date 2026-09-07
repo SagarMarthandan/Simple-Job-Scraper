@@ -1,7 +1,7 @@
 ---
 name: Jobscraper
 description: >-
-  Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, and ATS Direct for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates against yesterday's run, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "arbeitnow", "xing jobs", "stepstone jobs", "job pipeline", "run job search".
+  Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, Wellfound, EU Remote Jobs, and ATS Direct for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates against yesterday's run, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "arbeitnow", "xing jobs", "stepstone jobs", "wellfound jobs", "remote jobs", "job pipeline", "run job search".
 dependencies: python>=3.10, requests, openpyxl, beautifulsoup4
 ---
 
@@ -9,7 +9,7 @@ dependencies: python>=3.10, requests, openpyxl, beautifulsoup4
 
 > **Instructions for Oh My Pi (OMP) Session:**
 > When this skill is invoked, execute the automated job search pipeline below.
-> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Xing**, **Stepstone**, and **ATS Direct** (Greenhouse/SmartRecruiters/Ashby) across all target role profiles, applies location-aware working student rules, deduplicates against yesterday's run, and outputs a sortable **CSV + XLSX** with the current execution date/time stamp.
+> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Xing**, **Stepstone**, **Wellfound**, **EU Remote Jobs**, and **ATS Direct** (Greenhouse/SmartRecruiters/Ashby) across all target role profiles, applies location-aware working student rules, deduplicates against yesterday's run, and outputs a sortable **CSV + XLSX** with the current execution date/time stamp.
 
 ## Execution
 
@@ -155,6 +155,8 @@ Install: `pip install requests openpyxl beautifulsoup4`
    - **Arbeitnow** (free API, no Apify)
    - **Xing** (free HTML scraping via plain `requests`, no Apify)
    - **Stepstone** (free HTML scraping via plain `requests`, no Apify)
+   - **Wellfound** (free HTML scraping, SSR role pages + JSON-LD detail pages, $0)
+   - **EU Remote Jobs** (free WordPress REST API, full descriptions, $0)
    - **ATS Direct** (Greenhouse/SmartRecruiters/Ashby public APIs, free)
 3. **Title Relevance Filter:** Universal post-filter `is_relevant_title()` rejects any job whose title doesn't contain at least one data/analytics/AI/SQL/Python keyword.
 4. **Role Types & Location Constraints:**
@@ -183,6 +185,4 @@ Files written to `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`:
 
 - `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 3 sheets: "To Apply" (live, apply-ready, enriched with German requirement, experience years, salary, remote/hybrid), "Reposted" (LinkedIn reposts for manual review), and "Already Applied" (jobs matching Sagar's Applications folder or Obsidian vault). Hyperlink smoke test runs automatically after export.
 
-## Cost
-
-$0.00/run — all 6 platforms free (no Apify). Indeed uses a public GraphQL API; LinkedIn uses free HTML scraping; Arbeitnow/Xing/Stepstone use free HTML/REST; ATS Direct uses free public JSON APIs. Job descriptions arrive from step 1 (JSON-LD on detail pages for LinkedIn/Xing/Stepstone, GraphQL/API for Indeed/Arbeitnow/ATS). Verify step only needs LLM classification via `completion(model="smol")` (minimal cost).
+$0.00/run — all 8 platforms free (no Apify). Indeed uses a public GraphQL API; LinkedIn uses free HTML scraping; Arbeitnow/Xing/Stepstone use free HTML/REST; Wellfound uses SSR role pages + JSON-LD detail pages; EU Remote Jobs uses WordPress REST API; ATS Direct uses free public JSON APIs. Job descriptions arrive from step 1 (JSON-LD on detail pages for LinkedIn/Xing/Stepstone/Wellfound, GraphQL/API for Indeed/Arbeitnow/EU Remote Jobs/ATS). Verify step only needs LLM classification via `completion(model="smol")` (minimal cost).

@@ -10,24 +10,26 @@ graph TD
     A --> D[Xing HTML]
     A --> E[Stepstone HTML]
     A --> G[LinkedIn HTML 5-thread pool]
-    A --> H[Indeed Apify 8-thread pool]
+    A --> H[Indeed GraphQL 5-thread pool]
     A --> I[ATS Direct APIs]
-    B --> J[check_experience_and_location]
-    D --> J
-    E --> J
-    G --> J
-    H --> J
-    I --> J
-    J --> K[Within-run dedup by company::title]
-    K --> L[Cross-run dedup vs yesterday]
-    L --> M[Export CSV + JSON + MD + XLSX]
-    M --> N[verify_jobs.py — TinyFish JD fetch + cache → platform verify → reposted detection → LLM classify → filters → 2-sheet XLSX]
+    A --> J[Wellfound SSR role pages 3-thread pool]
+    A --> K[EU Remote Jobs WordPress REST API]
+    B --> L[check_experience_and_location]
+    D --> L
+    E --> L
+    G --> L
+    H --> L
+    I --> L
+    J --> L
+    K --> L
+    L --> M[Within-run dedup by company::title]
+    M --> N[Cross-run dedup vs yesterday]
+    N --> O[Export CSV + JSON + MD + XLSX]
+    O --> P[verify_jobs.py — platform verify → reposted detection → LLM classify → filters → 3-sheet XLSX]
 
-### Parallelization
+All 8 platform fetchers run simultaneously via `ThreadPoolExecutor(max_workers=8)`. Each fetcher is independent — no shared mutable state, results collected after all complete. LinkedIn internally parallelizes its 10 search roles with `max_workers=5` (limited to avoid 429 rate limiting) + 3s backoff retry. Wellfound parallelizes 6 role slugs with `max_workers=3`.
 
-All 6 platform fetchers run simultaneously via `ThreadPoolExecutor(max_workers=6)`. Each fetcher is independent — no shared mutable state, results collected after all complete. LinkedIn internally parallelizes its 10 search roles with `max_workers=5` (limited to avoid 429 rate limiting) + 3s backoff retry.
-
-Runtime: **~27s** (was 191s sequential — 7x speedup). I/O bound work — Python releases the GIL during HTTP requests, so threads give near-linear speedup.
+Runtime: **~156s** (was 191s sequential — 7x speedup). I/O bound work — Python releases the GIL during HTTP requests, so threads give near-linear speedup. Dominated by JSON-LD description enrichment (LinkedIn ~196 URLs, Xing ~279 URLs).
 
 ## Filter Chain
 
@@ -37,7 +39,7 @@ Every job passes through `check_experience_and_location()` which applies, in ord
 2. **Seniority ceiling** — rejects Senior, Lead, Principal, Staff, Manager, Head, Architect, Director titles and descriptions requiring > 2 years experience.
 3. **Working-student city restriction** — working student roles restricted to Hamburg and Kiel only. Full-time and internships are Germany-wide.
 
-## Freshness Filtering (24h, all 6 platforms)
+## Freshness Filtering (24h, all 8 platforms)
 
 | Platform | Server-side filter | Post-filter | No-date behavior |
 |---|---|---|---|
@@ -46,6 +48,8 @@ Every job passes through `check_experience_and_location()` which applies, in ord
 | Stepstone | `ag=age_1` (24h) | `parse_stepstone_timeago()` vs cutoff | Include (defaults to now) |
 | LinkedIn | `f_TPR=r86400` (24h) | `posted_at` datetime vs cutoff | Include (safety net only) |
 | Indeed | `datePosted='1'` (unreliable) | `datePublished` vs cutoff | Include (false positives > false negatives) |
+| Wellfound | — | `_parse_wellfound_date()` relative date vs cutoff | Include (no date = "Last 24h") |
+| EU Remote Jobs | `after` param (ISO datetime) | `date` field vs cutoff | N/A (API always has timestamp) |
 | ATS: Greenhouse | — | `first_published` vs cutoff | Include (via `_is_fresh`) |
 | ATS: SmartRecruiters | — | `releasedDate` vs cutoff | Include (via `_is_fresh`) |
 | ATS: Ashby | — | `publishedDate` vs cutoff | Include (via `_is_fresh`) |
@@ -148,8 +152,10 @@ Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ 
 | `fetch_xing_jobs()` | `requests` HTML, `data-testid` attrs, no-date jobs included. Delegates parsing to `_parse_xing_card()` |
 | `fetch_stepstone_jobs()` | `requests` HTML, `data-at` SSR attrs, `ag=age_1`. Delegates parsing to `_parse_stepstone_card()` |
 | `fetch_linkedin_jobs_free()` | Free HTML scraping, multi-city (6 locations), 10 roles parallel, 429 retry |
-| `fetch_linkedin_jobs()` | Apify fallback (paid). Delegates parsing to `_parse_linkedin_item()`, `_parse_linkedin_date()` |
-| `fetch_indeed_jobs()` | Apify actor, 10 roles parallel, post-filter on `datePublished` |
+| `fetch_indeed_jobs()` | GraphQL API (`apis.indeed.com/graphql`), 10 roles parallel, `dateOnIndeed` 24h filter, full descriptions |
+| `fetch_wellfound_jobs()` | SSR role pages (`/role/l/{slug}/germany`), 6 slugs, 3 workers. Company from `<img alt>`. JSON-LD enrichment via `_enrich_descriptions()` |
+| `fetch_euremotejobs_jobs()` | WordPress REST API, full descriptions in `content.rendered`, Data/Eng/IT category filter, paginated |
+| `_parse_wellfound_date()` | Converts Wellfound relative dates ("today", "2 days ago", "4 weeks ago") to datetime |
 | `fetch_all_ats()` | Orchestrator for Greenhouse/SmartRecruiters/Ashby |
 | `check_experience_and_location()` | Multi-stage filter: title relevance → seniority → city |
 | `compute_match_score()` | Percentage match against `TECH_KEYWORDS` |

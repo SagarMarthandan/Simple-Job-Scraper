@@ -1,6 +1,6 @@
 # Jobscraper
 
-Automated job search pipeline that fetches fresh postings (< 24 hours old) from **6 platforms** (LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, ATS Direct), filters them for entry-level data/analytics/AI roles in Germany, and exports a sortable CSV/XLSX/JSON/MD report. All platforms run in **parallel** — total runtime ~27s.
+Automated job search pipeline that fetches fresh postings (< 24 hours old) from **8 platforms** (LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, Wellfound, EU Remote Jobs, ATS Direct), filters them for entry-level data/analytics/AI roles in Germany, and exports a sortable CSV/XLSX/JSON/MD report. All platforms run in **parallel** — total runtime ~3min.
 
 ## Quick Start
 
@@ -15,7 +15,7 @@ Output is written to `Job Search/YYYY-MM-DD/`.
 ## Pipeline
 
 ```
-6 platforms in parallel → title relevance → seniority/experience
+8 platforms in parallel → title relevance → seniority/experience
 → working-student city → within-run dedup → cross-run dedup → export
 ```
 
@@ -28,6 +28,8 @@ Output is written to `Job Search/YYYY-MM-DD/`.
 | Arbeitnow | $0.00 | Free REST API |
 | Xing | $0.00 | `requests` HTML, AWS CloudFront (no anti-bot) |
 | Stepstone | $0.00 | `requests` HTML, Akamai (plain requests work) |
+| Wellfound | $0.00 | SSR role pages (`/role/l/{slug}/germany`) + JSON-LD detail pages, 6 role slugs |
+| EU Remote Jobs | $0.00 | WordPress REST API (`/wp-json/wp/v2/job-listings`), full descriptions in response |
 | ATS Direct | $0.00 | Greenhouse/SmartRecruiters/Ashby public JSON APIs, 17 companies |
 | **Total** | **$0.00** | |
 
@@ -112,7 +114,7 @@ Jobscraper/
 ├── ARCHITECTURE.md          # technical details: filter chain, dedup, freshness, verification
 ├── CHANGELOG.md             # version history
 ├── SKILL.md                 # OMP skill definition
-├── apify_job_search.py      # main pipeline (6 fetchers + 2-tier dedup + export)
+├── apify_job_search.py      # main pipeline (8 fetchers + 2-tier dedup + export)
 ├── verify_jobs.py           # post-step: LLM classification, reposted detection, already-applied detection, 3-sheet XLSX + hyperlink smoke test
 ├── ats_scraper.py           # ATS direct scraping (Greenhouse/SmartRecruiters/Ashby)
 ├── dedup_existing_sheets.py # standalone retroactive dedup cleanup

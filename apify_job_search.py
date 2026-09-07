@@ -328,6 +328,10 @@ def _enrich_descriptions(jobs: list[dict], platform: str, max_workers: int = 5) 
             "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://www.stepstone.de/",
         },
+        "Wellfound": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     }
     headers = PLATFORM_HEADERS.get(platform, {})
     if not headers:
@@ -976,6 +980,235 @@ def fetch_indeed_jobs():
                 print(f"[!] Indeed role fetch error: {e}", flush=True)
     return jobs
 
+
+def _parse_wellfound_date(date_str: str, now: datetime) -> datetime | None:
+    """Convert Wellfound relative date string to datetime.
+    Examples: 'today', '2 days ago', '1 week ago', '4 weeks ago', '1 month ago'.
+    Returns None if the string can't be parsed.
+    """
+    s = date_str.strip().lower()
+    if s == "today":
+        return now
+    m = re.match(r"(\d+)\s+(day|week|month)s?\s+ago", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        if unit == "day":
+            return now - timedelta(days=n)
+        elif unit == "week":
+            return now - timedelta(weeks=n)
+        elif unit == "month":
+            return now - timedelta(days=n * 30)
+    return None
+
+
+def fetch_wellfound_jobs():
+    """Fetch jobs from Wellfound (formerly AngelList) via free HTML scraping.
+
+    Wellfound's /role/l/{role}/germany pages render SSR job cards with title,
+    company (from logo alt text), location, and relative posted date.
+    Job detail pages have JSON-LD JobPosting schema with full descriptions.
+    No auth, no Cloudflare on role/detail pages — completely free.
+    """
+    from bs4 import BeautifulSoup
+
+    WELLFOUND_ROLES = [
+        "data-engineer",
+        "analytics-engineer",
+        "data-analyst",
+        "ai-engineer",
+        "machine-learning-engineer",
+        "data-scientist",
+    ]
+    BASE_URL = "https://wellfound.com/role/l"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=FRESHNESS_HOURS)
+
+    def fetch_role(slug):
+        role_jobs = []
+        url = f"{BASE_URL}/{slug}/germany"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                print(f"[!] Wellfound role '{slug}' returned {resp.status_code}", flush=True)
+                return role_jobs
+            soup = BeautifulSoup(resp.text, "html.parser")
+        except Exception as e:
+            print(f"[!] Wellfound error for '{slug}': {e}", flush=True)
+            return role_jobs
+
+        job_links = [a for a in soup.find_all("a", href=lambda h: h and re.match(r"/jobs/\d+-", h))]
+        for link in job_links:
+            title = link.get_text(strip=True)
+            href = link.get("href", "")
+            if not title or not href:
+                continue
+
+            # Walk up to find the card container that includes the company logo
+            container = link
+            company = ""
+            for _ in range(15):
+                container = container.parent
+                if container is None:
+                    break
+                img = container.find("img", alt=lambda a: a and "company logo" in a)
+                if img:
+                    company = img.get("alt", "").replace(" company logo", "").strip()
+                    break
+            if not company:
+                continue
+
+            # Extract card text for location and date
+            card_text = container.get_text(separator=" ", strip=True) if container else ""
+
+            # Parse relative date
+            date_match = re.search(r"(today|\d+\s+(?:day|week|month)s?\s+ago)", card_text, re.IGNORECASE)
+            date_str = date_match.group(1) if date_match else ""
+            posted_dt = _parse_wellfound_date(date_str, now)
+            if posted_dt and posted_dt < cutoff:
+                continue
+
+            # Parse location
+            loc_match = re.search(r"(Remote only|Remote|Germany|Berlin|Munich|Hamburg|Frankfurt|Cologne|Stuttgart|Düsseldorf|Karlsruhe)", card_text)
+            location = loc_match.group(1) if loc_match else "Germany"
+
+            job_url = f"https://wellfound.com{href}"
+            is_valid, role_type_or_reason = check_experience_and_location(title, "", location)
+            if not is_valid:
+                continue
+
+            role_jobs.append({
+                "language": detect_language(title),
+                "job_board": "Wellfound",
+                "role_type": role_type_or_reason,
+                "title": title,
+                "company": company,
+                "location": location,
+                "posted_at": posted_dt.isoformat() if posted_dt else "Last 24h",
+                "exp_required": "<= 2 Years",
+                "match_score": f"{compute_match_score(title)}%",
+                "job_url": job_url,
+                "description": "",
+            })
+
+        print(f"    Wellfound '{slug}': {len(role_jobs)} jobs", flush=True)
+        return role_jobs
+
+    jobs = []
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(fetch_role, slug) for slug in WELLFOUND_ROLES]
+        for future in as_completed(futures):
+            try:
+                jobs.extend(future.result())
+            except Exception as e:
+                print(f"[!] Wellfound role fetch error: {e}", flush=True)
+
+    # Enrich descriptions via JSON-LD on detail pages
+    if jobs:
+        _enrich_descriptions(jobs, "Wellfound", max_workers=3)
+
+    return jobs
+
+
+def fetch_euremotejobs_jobs():
+    """Fetch jobs from EU Remote Jobs via WordPress REST API.
+
+    EU Remote Jobs (euremotejobs.com) is a WordPress + WP Job Manager site
+    with a public REST API at /wp-json/wp/v2/job-listings. Returns full job
+    descriptions in the content field — no detail page fetching needed.
+    Free, no auth, no rate limiting.
+    """
+    from bs4 import BeautifulSoup
+
+    API_URL = "https://euremotejobs.com/wp-json/wp/v2/job-listings"
+    HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+    # Category IDs: Data=24, Engineering=65, IT=393
+    RELEVANT_CATEGORIES = {"job_listing_category-data", "job_listing_category-engineering", "job_listing_category-it"}
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=FRESHNESS_HOURS)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+
+    jobs = []
+    page = 1
+    while True:
+        try:
+            url = f"{API_URL}?per_page=100&_embed&page={page}&after={cutoff_iso}"
+            resp = requests.get(url, headers=HEADERS, timeout=30)
+            if resp.status_code != 200:
+                print(f"[!] EU Remote Jobs API returned {resp.status_code} on page {page}", flush=True)
+                break
+            data = resp.json()
+            if not data:
+                break
+        except Exception as e:
+            print(f"[!] EU Remote Jobs API error: {e}", flush=True)
+            break
+
+        for item in data:
+            # Filter by category (Data, Engineering, IT)
+            classes = item.get("class_list", [])
+            if not any(c in RELEVANT_CATEGORIES for c in classes):
+                continue
+
+            title = item.get("title", {}).get("rendered", "")
+            if not title:
+                continue
+
+            company = item.get("meta", {}).get("_company_name", "Unknown")
+            posted_str = item.get("date", "")
+            try:
+                posted_dt = datetime.fromisoformat(posted_str).replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                posted_dt = None
+            if posted_dt and posted_dt < cutoff:
+                continue
+
+            # Full JD from content field (HTML — strip tags)
+            content_html = item.get("content", {}).get("rendered", "")
+            desc = BeautifulSoup(content_html, "html.parser").get_text(separator=" ", strip=True) if content_html else ""
+
+            # Location from class_list (region taxonomy)
+            region = "Remote"
+            for c in classes:
+                if c.startswith("job_listing_region-"):
+                    region = c.replace("job_listing_region-", "").replace("-", " ").title()
+                    break
+
+            job_url = item.get("link", "")
+
+            is_valid, role_type_or_reason = check_experience_and_location(title, desc, region)
+            if not is_valid:
+                continue
+
+            jobs.append({
+                "language": detect_language(f"{title} {desc}"),
+                "job_board": "EU Remote Jobs",
+                "role_type": role_type_or_reason,
+                "title": title,
+                "company": company,
+                "location": region,
+                "posted_at": posted_dt.isoformat() if posted_dt else "Last 24h",
+                "exp_required": "<= 2 Years",
+                "match_score": f"{compute_match_score(f'{title} {desc}')}%",
+                "job_url": job_url,
+                "description": desc,
+            })
+
+        # Check if there are more pages
+        total_pages = int(resp.headers.get("X-WP-TotalPages", "1"))
+        if page >= total_pages:
+            break
+        page += 1
+
+    print(f"    EU Remote Jobs: {len(jobs)} jobs (Data/Engineering/IT, last 24h)", flush=True)
+    return jobs
+
 def _style_xlsx_header(ws, header_fill, header_font, center):
     """Apply fill, font, and center alignment to the header row."""
     for c in ws[1]:
@@ -1054,8 +1287,10 @@ def main():
     print(f"    LinkedIn: FREE HTML scraping ($0, 10 roles × 6 locations parallel)")
     print(f"    Indeed: GraphQL API ($0, 10 roles parallel, full descriptions)")
     print(f"    Xing/Stepstone: free HTML scraping (parallel)")
+    print(f"    Wellfound: startup jobs via SSR role pages + JSON-LD detail pages")
+    print(f"    EU Remote Jobs: WordPress REST API (full descriptions, no detail fetch)")
     print(f"    ATS Direct: Greenhouse/SmartRecruiters/Ashby (free public APIs)")
-    print(f"    All 6 platforms run in parallel via ThreadPoolExecutor")
+    print(f"    All 8 platforms run in parallel via ThreadPoolExecutor")
 
     from ats_scraper import fetch_all_ats
 
@@ -1064,12 +1299,14 @@ def main():
     # so threads give near-linear speedup. Each fetcher is independent:
     # no shared mutable state, results collected after all complete.
     PLATFORM_FETCHERS = [
-        ("Arbeitnow",    fetch_arbeitnow_jobs),
-        ("Xing",         fetch_xing_jobs),
-        ("Stepstone",    fetch_stepstone_jobs),
-        ("LinkedIn",     fetch_linkedin_jobs_free),
-        ("Indeed",       fetch_indeed_jobs),
-        ("ATS Direct",   fetch_all_ats),
+        ("Arbeitnow",      fetch_arbeitnow_jobs),
+        ("Xing",           fetch_xing_jobs),
+        ("Stepstone",      fetch_stepstone_jobs),
+        ("LinkedIn",       fetch_linkedin_jobs_free),
+        ("Indeed",         fetch_indeed_jobs),
+        ("Wellfound",      fetch_wellfound_jobs),
+        ("EU Remote Jobs", fetch_euremotejobs_jobs),
+        ("ATS Direct",     fetch_all_ats),
     ]
 
     all_jobs = []

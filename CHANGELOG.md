@@ -1,3 +1,26 @@
+## [2026-09-07]
+
+### Added
+- **Wellfound scraper** (`fetch_wellfound_jobs()`) — scrapes Wellfound (formerly AngelList) startup job board via free HTML. SSR role pages at `/role/l/{slug}/germany` render job cards with title, company (from `<img alt="X company logo">`), location, and relative posted date. 6 role slugs: data-engineer, analytics-engineer, data-analyst, ai-engineer, machine-learning-engineer, data-scientist. 3 workers for role page fetching. Job detail pages have JSON-LD JobPosting schema with full descriptions (3-7K chars), enriched via `_enrich_descriptions()` with 3 workers. No Cloudflare on role/detail pages. Low volume (~2 jobs/run — startup board with mostly senior/remote roles). New helper: `_parse_wellfound_date()` for relative date parsing.
+- **EU Remote Jobs scraper** (`fetch_euremotejobs_jobs()`) — scrapes euremotejobs.com via WordPress REST API (`/wp-json/wp/v2/job-listings`). Full job descriptions in `content.rendered` (HTML, stripped via BeautifulSoup) — no detail page fetching needed. Company in `meta._company_name`. Category filtering via `class_list` (Data=24, Engineering=65, IT=393). `after` parameter for 24h freshness. `per_page=100` with pagination via `X-WP-TotalPages` header. 30s timeout (API is slow — 15s times out). ~4 jobs/run. No auth, no rate limiting, no Cloudflare.
+- **Wellfound headers** added to `_enrich_descriptions()` `PLATFORM_HEADERS` dict for JSON-LD description fetching.
+
+### Changed
+- **Pipeline: 6 → 8 platforms** — LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, Wellfound, EU Remote Jobs, ATS Direct.
+- **`main()` banner** — updated to show 8 platforms, Wellfound and EU Remote Jobs descriptions.
+- **`PLATFORM_FETCHERS`** — added `fetch_wellfound_jobs` and `fetch_euremotejobs_jobs` entries.
+- **SKILL.md, README.md, apify_job_search.md, ARCHITECTURE.md** — updated all platform counts, cost tables, freshness tables, function references, pipeline diagrams.
+
+### Investigated (Not Added)
+- **HiringCafe** (hiringcafe.com) — NOT scrapable. Next.js SPA behind Cloudflare Turnstile. Search URL returns 403 with Cloudflare challenge. No JSON-LD, no accessible API. Would need Playwright stealth. Skipped.
+
+### Verification
+- Wellfound: 2 jobs (1 unique ML Engineer at polyaxon, Berlin), 2/2 descriptions fetched via JSON-LD, 0 failed, 1287 chars avg.
+- EU Remote Jobs: 4 jobs (Python Engineer, Backend Engineer, Full-Stack Developer, AI Systems Engineer), full descriptions from API (2761-6794 chars).
+- Full pipeline: 516 jobs across 8 platforms, 156s runtime, $0.00 cost.
+- Per-platform: Arbeitnow 8, Wellfound 2, Indeed 23, EU Remote Jobs 4, ATS Direct 4, Xing 279, Stepstone 0 (timeout), LinkedIn 196.
+
+
 ## [2026-09-05e]
 
 ### Removed

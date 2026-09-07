@@ -2,7 +2,7 @@
 
 > **Instructions for Oh My Pi (OMP) Session:**
 > When this file is uploaded/run in an OMP session, execute the automated job search pipeline below.
-> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Xing**, **Stepstone**, and **ATS Direct** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp into `/home/sagar/Skills/Jobscraper/Job Search/`.
+> It fetches fresh job postings (< 24 hours old) from **LinkedIn**, **Indeed**, **Arbeitnow**, **Xing**, **Stepstone**, **Wellfound**, **EU Remote Jobs**, and **ATS Direct** across all target role profiles, applies location-aware working student rules and internship inclusions, deduplicates them, filters out roles requiring > 2 years of experience, and outputs a sortable **CSV + XLSX** (autofilter dropdowns, clickable links) with the current execution date/time stamp into `/home/sagar/Skills/Jobscraper/Job Search/`.
 
 > **100% Free (2026-09-05):** $0.00/run — all platforms free. Indeed uses a public GraphQL API; LinkedIn uses free HTML scraping. No Apify.
 
@@ -36,6 +36,8 @@
    - **Arbeitnow** (free REST API, $0)
    - **Xing** (free HTML scraping via plain `requests`, $0 — AWS CloudFront, no anti-bot; parses `data-testid` attributes and `<time dateTime>` ISO timestamps; 3 pages per role)
    - **Stepstone** (free HTML scraping via plain `requests`, $0 — Akamai, plain requests work; path-based URLs with `ag=age_1` 24h filter; parses SSR `data-at` attributes; 3 pages per role)
+   - **Wellfound** (free HTML scraping, $0 — SSR role pages `/role/l/{slug}/germany`, company names from `<img alt="X company logo">`, JSON-LD detail pages for full descriptions; 6 role slugs)
+   - **EU Remote Jobs** (free WordPress REST API, $0 — `/wp-json/wp/v2/job-listings`, full descriptions in `content.rendered`, filters by Data/Engineering/IT categories; 30s timeout)
    - **ATS Direct** (free public JSON APIs, $0 — Greenhouse/SmartRecruiters/Ashby, 17 German tech companies)
    - ~~Startup.jobs~~ (DROPPED — 1.1 jobs/run average, negligible yield)
    - ~~Glassdoor~~ (DROPPED — 1.1 jobs/run average, most complex scraper for negligible yield)
@@ -99,17 +101,19 @@ After within-run dedup, `load_previous_run_keys()` loads keys from the **single 
 
 Same-day reruns: today's own earlier CSV is the most recent folder, so a second run on the same day suppresses everything already exported.
 
-## 5. Cost & Platform Details (last updated 2026-09-05)
+## 5. Cost & Platform Details (last updated 2026-09-07)
 
 ### Cost Breakdown (per full pipeline run)
 
 | Platform | Source | Cost/run | Notes |
 |---|---|---|---|
-| LinkedIn | Free HTML scraping | $0.00 | 6 locations × 10 roles, `f_TPR=r86400` 24h filter. 5 workers, 3s backoff on 429. ~237 jobs/run. |
-| Indeed | Free GraphQL API | $0.00 | `apis.indeed.com/graphql` — same endpoint as Indeed iOS app. Hardcoded API key, mobile user-agent, `indeed-co: DE`. `dateOnIndeed` 24h server-side filter. Full descriptions (HTML stripped to text). 5 workers, ~50 jobs/run. |
+| LinkedIn | Free HTML scraping | $0.00 | 6 locations × 10 roles, `f_TPR=r86400` 24h filter. 5 workers, 3s backoff on 429. ~196 jobs/run. |
+| Indeed | Free GraphQL API | $0.00 | `apis.indeed.com/graphql` — same endpoint as Indeed iOS app. Hardcoded API key, mobile user-agent, `indeed-co: DE`. `dateOnIndeed` 24h server-side filter. Full descriptions (HTML stripped to text). 5 workers, ~23 jobs/run. |
 | Arbeitnow | Free REST API | $0.00 | `https://www.arbeitnow.com/api/job-board-api` |
-| Xing | Free HTML scraping | $0.00 | Plain `requests` (AWS CloudFront, no anti-bot). 10 roles × 3 pages. `data-testid` attributes + `<time dateTime>`. ~275 jobs/run. |
+| Xing | Free HTML scraping | $0.00 | Plain `requests` (AWS CloudFront, no anti-bot). 10 roles × 3 pages. `data-testid` attributes + `<time dateTime>`. ~279 jobs/run. |
 | Stepstone | Free HTML scraping | $0.00 | Plain `requests` (Akamai, no anti-bot). 10 roles × 3 pages. Path-based URLs with `ag=age_1` 24h filter. `data-at` attributes. ~45 jobs/run. |
+| Wellfound | Free HTML scraping | $0.00 | SSR role pages `/role/l/{slug}/germany` (6 slugs). Company from `<img alt="X company logo">`. JSON-LD detail pages for full descriptions. 3 workers. ~2 jobs/run (startup board, low volume). |
+| EU Remote Jobs | Free WordPress REST API | $0.00 | `/wp-json/wp/v2/job-listings` with `after` date filter. Full descriptions in `content.rendered`. Filters by Data/Engineering/IT categories. 30s timeout. ~4 jobs/run. |
 | ATS Direct | Free public JSON APIs | $0.00 | Greenhouse/SmartRecruiters/Ashby, 17 German tech companies. ~4 jobs/run. |
 | **Total** | | **$0.00** | **100% free — no Apify** |
 
@@ -137,3 +141,5 @@ The Indeed scraper uses Indeed's public GraphQL API at `apis.indeed.com/graphql`
 - **Xing**: plain `requests`. AWS CloudFront — no anti-bot. `data-testid` attributes + `<time dateTime>` ISO timestamps. Sponsored listings (no dateTime) skipped. ~8% of raw results are <24h fresh.
 - **Stepstone**: plain `requests`. Akamai — plain requests work. Path-based URLs required (`/jobs/{slug}/in-deutschland`) — query-param `?keyword=` returns generic results. `ag=age_1` = last 24h filter.
 - **ATS Direct**: Greenhouse (`boards-api.greenhouse.io/v1/boards/{slug}/jobs`), SmartRecruiters (`api.smartrecruiters.com/v1/companies/{slug}/postings`), Ashby (`jobs.ashbyhq.com/{slug}` with embedded `__appData` JSON). Slug is case-sensitive (e.g. `BoschGroup` not `boschgroup`).
+- **Wellfound**: SSR role pages at `/role/l/{slug}/germany` (6 slugs: data-engineer, analytics-engineer, data-analyst, ai-engineer, machine-learning-engineer, data-scientist). Company names are NOT in text elements — extracted from `<img alt="X company logo">` attributes by walking up the DOM from the job link to find the card container. Relative dates ("today", "2 days ago", "4 weeks ago") parsed via `_parse_wellfound_date()`. Job detail pages have JSON-LD JobPosting schema with full descriptions (3-7K chars), fetched via `_enrich_descriptions()` with 3 workers. No Cloudflare on role/detail pages. Low volume (~2 jobs/run) — startup board with mostly senior/remote roles.
+- **EU Remote Jobs**: WordPress + WP Job Manager REST API at `/wp-json/wp/v2/job-listings`. Full JDs in `content.rendered` (HTML, stripped via BeautifulSoup) — no detail page fetching needed. Company in `meta._company_name`. Category filtering via `class_list` array (`job_listing_category-data`, `job_listing_category-engineering`, `job_listing_category-it`). Region from `class_list` (`job_listing_region-*`). `after` parameter for 24h freshness. `per_page=100` with pagination via `X-WP-TotalPages` header. API is slow — 30s timeout required (15s times out). No auth, no rate limiting, no Cloudflare.
