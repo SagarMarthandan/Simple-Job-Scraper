@@ -16,7 +16,8 @@ Output is written to `Job Search/YYYY-MM-DD/`.
 
 ```
 8 platforms in parallel → title relevance → seniority/experience
-→ working-student city → within-run dedup → cross-run dedup → export
+→ working-student city → within-run dedup → cross-run dedup
+→ staffing-agency filter → export
 ```
 
 ### Platforms
@@ -58,7 +59,7 @@ python3 verify_jobs.py --force            # re-verify all rows
 2. **Reposted detection** — LinkedIn jobs flagged via cross-run history (>7d) + job ID age gap (>14d). No LLM tokens — pure computation.
 3. **LLM classification** — smol model (GLM 5.2 free via OpenRouter) classifies German level + experience years in batches of 10. Reads `row["description"]` directly (already populated from step 1). Prints `X/Y jobs classified`.
 4. **Already-applied detection** — `load_applied_job_keys()` scans `/home/sagar/Applications` (folder names) and Obsidian vault `Applications/` (.md files) for jobs already applied to. Uses `normalize_key(company, title)` for fuzzy matching. Checked first — already-applied jobs go to "Already Applied" sheet regardless of other filters.
-5. **Filter + export** — drops closed, German C1+, exp ≥3y. Segregates reposted and already-applied to separate sheets. Writes 3-sheet XLSX with hyperlink smoke test.
+5. **Filter + export** — drops closed, German C1+, exp ≥3y, and staffing/recruitment agency postings. Segregates reposted and already-applied to separate sheets. Writes 3-sheet XLSX with hyperlink smoke test.
 
 ### Filters Applied
 
@@ -68,6 +69,7 @@ python3 verify_jobs.py --force            # re-verify all rows
 | Reposted LinkedIn | Segregate to "Reposted" sheet |
 | German C1+ required | Drop |
 | Experience ≥3 years | Drop |
+| Staffing/recruitment agency | Drop |
 | German B1/B2 | Keep + flag |
 | German preferred | Keep + flag |
 

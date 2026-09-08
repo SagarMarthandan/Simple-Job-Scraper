@@ -87,6 +87,27 @@ TECH_KEYWORDS = [
     "postgresql", "snowflake",
 ]
 
+# Staffing/Recruitment Agency Blocklist — must match apify_job_search.py
+STAFFING_COMPANIES = re.compile(
+    r"\b("
+    r"instaffo|hays|michael page|randstad|adecco|manpower|"
+    r"kelly services|gi group|brunel|dekra arbeit|hapeko|hesys|"
+    r"prostaff|staffline|timepartner|lhi leasing|"
+    r"gut personalmanagement|office people|silbury|"
+    r"robert walters|russell tobin|experis|"
+    r"talent partner|the green recruitment|quik hire|"
+    r"zero to one|hicalibre|whybrilliant|"
+    r"emagine|g2i|strategie:p|"
+    r"jobgether|jobster|hire feed|findr|hoshii|"
+    r"mamgo|sundayy|twomynds|yes4match|studyflix|"
+    r"trenkwalder|modis|"
+    r"personalberatung|personaldienst|zeitarbeit|"
+    r"personal leasing|personalmanagement|"
+    r"recruitment agency|recruitment company"
+    r")\b",
+    re.IGNORECASE
+)
+
 # LinkedIn job ID growth rate (~530K new IDs/day globally, verified Aug 23-27)
 LINKEDIN_DAILY_ID_GROWTH = 530000
 
@@ -1294,6 +1315,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     already_applied_rows = []
     closed_count = 0
     german_dropped = 0
+    staffing_dropped = 0
     exp_dropped = 0
     reposted_count = 0
     already_applied_count = 0
@@ -1337,6 +1359,10 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
                     continue
             except (ValueError, TypeError):
                 pass
+        # Hard drop: staffing/recruitment agency
+        if STAFFING_COMPANIES.search(row.get("company", "")):
+            staffing_dropped += 1
+            continue
 
         main_rows.append(row)
 
@@ -1371,6 +1397,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     print(f"  Closed/removed:       {closed_count}")
     print(f"  Dropped (German C1+): {german_dropped}")
     print(f"  Dropped (exp >= 3y):  {exp_dropped}")
+    print(f"  Dropped (staffing):   {staffing_dropped}")
     print(f"  Enriched:             {enriched_count}")
     if already_verified:
         print(f"  Already verified:     {already_verified}")

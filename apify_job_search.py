@@ -89,6 +89,29 @@ EXCLUDED_TITLE_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
+# Staffing/Recruitment Agency Blocklist — intermediaries that post jobs on behalf
+# of other employers (Zeitarbeit, Personalvermittlung, job platforms). Matched
+# against the raw company name (case-insensitive, word-boundary).
+STAFFING_COMPANIES = re.compile(
+    r"\b("
+    r"instaffo|hays|michael page|randstad|adecco|manpower|"
+    r"kelly services|gi group|brunel|dekra arbeit|hapeko|hesys|"
+    r"prostaff|staffline|timepartner|lhi leasing|"
+    r"gut personalmanagement|office people|silbury|"
+    r"robert walters|russell tobin|experis|"
+    r"talent partner|the green recruitment|quik hire|"
+    r"zero to one|hicalibre|whybrilliant|"
+    r"emagine|g2i|strategie:p|"
+    r"jobgether|jobster|hire feed|findr|hoshii|"
+    r"mamgo|sundayy|twomynds|yes4match|studyflix|"
+    r"trenkwalder|modis|"
+    r"personalberatung|personaldienst|zeitarbeit|"
+    r"personal leasing|personalmanagement|"
+    r"recruitment agency|recruitment company"
+    r")\b",
+    re.IGNORECASE
+)
+
 
 # Core Tech Stack Keywords for Match Scoring
 TECH_KEYWORDS = ["dbt", "airflow", "spark", "pyspark", "python", "sql", "gcp", "bigquery", "aws", "azure", "databricks", "docker", "kafka", "postgresql", "snowflake"]
@@ -111,6 +134,11 @@ def is_relevant_title(title: str) -> bool:
     'Data Engineer' searches, LinkedIn returns 'Junior Software Engineer', etc.).
     """
     return bool(DOMAIN_TITLE_KEYWORDS.search(title))
+
+def is_staffing_company(company: str) -> bool:
+    """Check if the company is a staffing/recruitment agency or job platform
+    that posts jobs on behalf of other employers (not a direct employer)."""
+    return bool(STAFFING_COMPANIES.search(company or ""))
 
 def detect_language(text: str) -> str:
     """Detect if job description/title is primarily German or English."""
@@ -1361,6 +1389,13 @@ def main():
         cross_run_duplicates = before - len(deduped_jobs)
     else:
         cross_run_duplicates = 0
+
+    # Staffing/recruitment agency filter — remove intermediaries
+    before_staffing = len(deduped_jobs)
+    deduped_jobs = [j for j in deduped_jobs if not is_staffing_company(j["company"])]
+    staffing_filtered = before_staffing - len(deduped_jobs)
+    if staffing_filtered:
+        print(f"Staffing agency filter: removed {staffing_filtered} staffing/recruitment agency job(s)")
 
     print(f"Per-platform: {platform_counts}")
     print(f"Cross-run dedup: compared against yesterday ({len(prev_urls)} jobs), removed {cross_run_duplicates} already-seen job(s)")

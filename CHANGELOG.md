@@ -1,3 +1,17 @@
+## [2026-09-08]
+
+### Added
+- **Staffing/Recruitment Agency Blocklist** — filters out jobs posted by staffing/recruitment agencies, Zeitarbeit, and job platforms that post on behalf of other employers (not direct employers). New `STAFFING_COMPANIES` regex (word-boundary, case-insensitive) in both `apify_job_search.py` and `verify_jobs.py` (must stay in sync — commented in code). Covers: Instaffo, Hays, Michael Page, Randstad, Adecco, Manpower, Kelly Services, GI Group, Brunel, Dekra Arbeit, Hapeko, Hesys, Prostaff, Staffline, TimePartner, LHI Leasing, Gut Personalmanagement, Office People, Silbury, Robert Walters, Russell Tobin, Experis, Talent Partner, The Green Recruitment, Quik Hire, Zero to One, HiCalibre, WhyBrilliant, Emagine, G2i, Strategie:P, Jobgether, Jobster, Hire Feed, Findr, Hoshii, Mamgo, Sundayy, TwoMynds, Yes4Match, Studyflix, Trenkwalder, Modis, plus generic German terms (Personalberatung, Personaldienst, Zeitarbeit, Personal Leasing, Personalmanagement, recruitment agency, recruitment company).
+- **`is_staffing_company()`** helper in `apify_job_search.py` — checks a raw company name against the blocklist.
+
+### Changed
+- **`apify_job_search.py` `main()`** — staffing filter runs after cross-run dedup, before export. Prints `Staffing agency filter: removed N staffing/recruitment agency job(s)` when any are dropped.
+- **`verify_jobs.py` `run_verification()`** — hard drop in the filter loop (staffing postings never reach the To Apply sheet). Summary prints `Dropped (staffing): N`.
+- **README.md** — pipeline diagram, verify pipeline stage, and filters table updated with the staffing filter.
+
+### Verification
+- Staffing filter applied in both pipeline and verify stages — agencies (Hays, Randstad, Instaffo, etc.) matched case-insensitively with word boundaries; generic terms (Zeitarbeit, Personalberatung) catch German intermediaries.
+
 ## [2026-09-07]
 
 ### Added
@@ -193,7 +207,7 @@
 All notable changes to the Jobscraper pipeline are documented here.
 Dates are in ISO 8601 format (`YYYY-MM-DD`).
 
-## [2026-08-28d]
+## [2026-09-07]
 
 ### Changed
 - **TinyFish universal pre-fetch** — extended TinyFish JD pre-fetch from LinkedIn-only to all JD-dependent platforms: LinkedIn, Indeed, Xing, Stepstone, Startup.jobs, Glassdoor. ATS platforms (Greenhouse/SmartRecruiters/Ashby) and Arbeitnow skipped (public APIs, 100% accuracy). Each platform verifier (`verify_xing`, `verify_stepstone`, `verify_startupjobs`, `verify_glassdoor`) now checks for pre-fetched `description` (>50 chars) before making network requests, same pattern as `verify_linkedin`. Falls back to native method (requests/cloudscraper) when no pre-fetched description. Indeed already checked `description` — now TinyFish fills gaps when Apify returns empty. Runtime: ~500 URLs → 250 batches × ~8s = ~33 min. No cost (TinyFish `fetch_content` is free).
