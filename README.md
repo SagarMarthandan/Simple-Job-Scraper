@@ -93,7 +93,7 @@ A hyperlink smoke test runs automatically after export — verifies cell value =
 ### Dependencies
 
 ```bash
-pip install requests openpyxl beautifulsoup4
+pip install requests openpyxl beautifulsoup4 tqdm
 ```
 
 ### Customization

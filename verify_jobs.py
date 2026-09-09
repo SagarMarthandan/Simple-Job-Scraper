@@ -48,6 +48,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+from tqdm import tqdm
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -672,7 +673,7 @@ def verify_platform_batch(platform: str, jobs: list[dict]) -> list[tuple[int, di
             future_to_idx = {
                 executor.submit(verifier, job): i for i, job in enumerate(jobs)
             }
-            for future in as_completed(future_to_idx):
+            for future in tqdm(as_completed(future_to_idx), total=len(future_to_idx), desc=f"{platform} verify"):
                 idx = future_to_idx[future]
                 try:
                     results.append((idx, future.result()))
@@ -883,7 +884,7 @@ def smoke_test_hyperlinks(path: Path, sample_size: int = 10) -> bool:
     http_fail = 0
     if sample:
         print(f"\n[*] HTTP HEAD check on {len(sample)} sample URLs...")
-        for url in sample:
+        for url in tqdm(sample, desc="HTTP check"):
             try:
                 req = requests.head(url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
                                     allow_redirects=True)
@@ -1078,7 +1079,8 @@ def llm_classify_all(rows: list[dict]) -> None:
     print(f"\n[*] LLM batch classification: {len(to_classify)} jobs in batches of {LLM_BATCH_SIZE}...")
 
     # Process in batches
-    for batch_start in range(0, len(to_classify), LLM_BATCH_SIZE):
+    total_batches = (len(to_classify) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
+    for batch_start in tqdm(range(0, len(to_classify), LLM_BATCH_SIZE), total=total_batches, desc="LLM classify"):
         batch = to_classify[batch_start:batch_start + LLM_BATCH_SIZE]
         jd_texts = [jd for _, jd in batch]
 
@@ -1102,7 +1104,6 @@ def llm_classify_all(rows: list[dict]) -> None:
             row["detail_exp_years"] = str(exp) if exp is not None else ""
 
         batch_num = batch_start // LLM_BATCH_SIZE + 1
-        total_batches = (len(to_classify) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
         print(f"  [✓] Batch {batch_num}/{total_batches} done ({len(batch)} jobs)")
 
 
@@ -1202,7 +1203,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
             future = executor.submit(verify_platform_batch, platform, jobs)
             future_to_platform[future] = (platform, group)
 
-        for future in as_completed(future_to_platform):
+        for future in tqdm(as_completed(future_to_platform), total=len(future_to_platform), desc="Verifying"):
             platform, group = future_to_platform[future]
             try:
                 batch_results = future.result()

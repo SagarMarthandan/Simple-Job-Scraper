@@ -47,6 +47,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from tqdm import tqdm
 
 # Paths
 BASE_RESUMES_DIR = Path("/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/base_files")
@@ -359,7 +360,7 @@ def _enrich_descriptions(jobs: list[dict], platform: str, max_workers: int = 5) 
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_fetch_one, pair): pair for pair in to_fetch}
-        for future in as_completed(futures):
+        for future in tqdm(as_completed(futures), total=len(futures), desc=f"{platform} JD fetch"):
             try:
                 idx, desc = future.result()
                 if desc and len(desc) > 50:
@@ -466,7 +467,7 @@ def fetch_xing_jobs():
     seen_urls = set()
     XING_PAGES_PER_ROLE = 3  # 20 results/page × 3 = 60 max per role
 
-    for role in SEARCH_ROLES:
+    for role in tqdm(SEARCH_ROLES, desc="Xing roles"):
         role_fresh = 0
         role_raw = 0
 
@@ -627,7 +628,7 @@ def fetch_stepstone_jobs():
     seen_urls = set()
     STEPSTONE_PAGES_PER_ROLE = 3  # 25 results/page × 3 = 75 max per role
 
-    for role in SEARCH_ROLES:
+    for role in tqdm(SEARCH_ROLES, desc="Stepstone roles"):
         role_fresh = 0
         role_raw = 0
         slug = role.lower().replace(" ", "-")
@@ -829,7 +830,7 @@ def fetch_linkedin_jobs_free():
     all_role_jobs = []
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(_scrape_role, role): role for role in SEARCH_ROLES}
-        for future in as_completed(futures):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="LinkedIn roles"):
             try:
                 all_role_jobs.extend(future.result())
             except Exception as exc:
@@ -975,7 +976,7 @@ def fetch_indeed_jobs():
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = [executor.submit(fetch_role, role) for role in SEARCH_ROLES]
-        for future in as_completed(futures):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Indeed roles"):
             try:
                 jobs.extend(future.result())
             except Exception as e:
@@ -1103,7 +1104,7 @@ def fetch_wellfound_jobs():
     jobs = []
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(fetch_role, slug) for slug in WELLFOUND_ROLES]
-        for future in as_completed(futures):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Wellfound roles"):
             try:
                 jobs.extend(future.result())
             except Exception as e:
@@ -1323,7 +1324,7 @@ def main():
             executor.submit(fetcher): name
             for name, fetcher in PLATFORM_FETCHERS
         }
-        for future in as_completed(future_to_name):
+        for future in tqdm(as_completed(future_to_name), total=len(future_to_name), desc="Platforms"):
             name = future_to_name[future]
             try:
                 jobs = future.result()

@@ -29,6 +29,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from tqdm import tqdm
 
 APPLICATIONS_TRACKER_CSV = Path("/home/sagar/Documents/applications_tracker.csv")
 LLM_INPUT_PATH = "/tmp/already_applied_input.json"
@@ -191,7 +192,7 @@ def prepare_match_input(csv_path: Path) -> int:
     # For each today job, find candidate tracker entries
     candidate_pairs: list[dict] = []
     pair_id = 1
-    for tj_idx, tj in enumerate(today_jobs):
+    for tj_idx, tj in enumerate(tqdm(today_jobs, desc="Already-applied pairs")):
         candidate_tracker_idxs: set[int] = set()
 
         # Token overlap

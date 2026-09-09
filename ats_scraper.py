@@ -30,6 +30,7 @@ from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 log = logging.getLogger("ats_scraper")
 
@@ -443,7 +444,7 @@ def fetch_all_ats() -> list[dict]:
 
     for platform_name, (fetcher, slugs) in _FETCHERS.items():
         platform_jobs = []
-        for slug in slugs:
+        for slug in tqdm(slugs, desc=f"{platform_name} slugs"):
             try:
                 jobs = fetcher(slug)
                 for job in jobs:

@@ -1,3 +1,18 @@
+## [2026-09-09] — tqdm progress bars across all pipeline stages
+
+### Added
+- **tqdm progress bars** — all loops and parallel operations across 4 files now show live progress bars with platform/stage names. 14 progress bars total:
+  - `apify_job_search.py` (7): `_enrich_descriptions()` JD fetch, Xing/Stepstone role loops, LinkedIn/Indeed/Wellfound ThreadPoolExecutor, main() 8-platform ThreadPoolExecutor
+  - `verify_jobs.py` (4): ATS verify ThreadPoolExecutor, LLM batch classification, platform verification ThreadPoolExecutor, HTTP smoke test
+  - `ats_scraper.py` (1): ATS company slug iteration
+  - `applied_check.py` (1): already-applied candidate pair building
+- **tqdm dependency** — `tqdm==4.70.0` installed in `.venv` via `uv pip install`
+
+### Verification
+- All 4 files compile clean (py_compile)
+- All modules import cleanly from `.venv` with tqdm 4.70.0
+- Live pipeline smoke test: progress bars render correctly (Indeed roles 100% 10/10, Platforms 25% 2/8, Greenhouse slugs 20% 2/10)
+
 ## [2026-09-09] — Already-applied detection: LLM-based classification
 
 ### Changed
