@@ -203,4 +203,6 @@ Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ 
 
 | Function | Purpose |
 |---|---|
-| `load_applied_job_keys()` | Reads `/home/sagar/Documents/applications_tracker.csv` (Company + Position columns), builds normalized key set via `normalize_key()` from `apify_job_search.py`. Returns `set[str]` of normalized `company::title` keys |
+| `load_applied_data()` | Reads `/home/sagar/Documents/applications_tracker.csv` (Company + Position + Source URL columns). Returns dict with normalized `company::title` keys, company→titles mapping, and normalized URLs |
+| `is_already_applied()` | Three-tier matching: (1) URL match — exact, catches cross-platform same job, (2) company+title key match — normalized `normalize_key()`, (3) company match + title similarity — Jaccard ≥ 0.6 on normalized title tokens. Skips "Unknown" companies |
+| `load_applied_job_keys()` | Legacy: returns `set[str]` of normalized keys only. Kept for backward compatibility |

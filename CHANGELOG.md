@@ -1,3 +1,16 @@
+## [2026-09-09] — Already-applied detection: three-tier matching
+
+### Changed
+- **Already-applied detection: three-tier matching** — `applied_check.py` now uses three-tier matching instead of key-only: (1) URL match — exact, catches cross-platform same job listing (e.g., same Xing URL with "Unknown" company), (2) company+title key match — existing normalized `normalize_key()` logic, (3) company match + title similarity — Jaccard ≥ 0.6 on normalized title tokens, catches same position with different formatting across platforms (e.g., "Werkstudentin/Werkstudent – Microsoft Data Analytics & AI" vs "Werkstudent Microsoft Data Analytics & AI (DA&AI)"). Skips "Unknown" companies to avoid false positives.
+- **`load_applied_data()`** — new function replacing `load_applied_job_keys()` in `verify_jobs.py`. Returns dict with keys, company→titles mapping, and URLs for three-tier matching.
+- **`is_already_applied()`** — new function encapsulating the three-tier matching logic. Called in `verify_jobs.py` filter loop instead of inline key check.
+- **`verify_jobs.py` filter loop** — replaced inline `_normalize_key` check with `is_already_applied()` call. Removed now-unnecessary `normalize_key` import from filter loop scope.
+
+### Verification
+- Test run against `Job Search/2026-09-09/Job_Search_Sep_9_2026.csv` (551 jobs): 42 already-applied matches (up from 30 with key-only). 9 jobs moved from "To Apply"/"Reposted" to "Already Applied" in existing XLSX. 3 additional matches in CSV were dropped by other filters (German C1+, exp ≥3y) — will be caught before filters on next full run.
+- Hyperlink smoke test: 348 links, 0 mismatches, 10/10 HTTP OK
+- Both files compile clean (applied_check.py, verify_jobs.py)
+
 ## [2026-09-09]
 
 ### Added

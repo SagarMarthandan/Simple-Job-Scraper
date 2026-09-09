@@ -21,23 +21,93 @@ cd /home/sagar/Skills/Jobscraper && python3 apify_job_search.py
 
 ### Step 2: Verify (eval — requires OMP runtime for LLM)
 
-The verify step MUST run through `eval` (OMP Python kernel), not `bash`.
+The verify step MUST run through `eval` (OMP Python/JS kernels), not `bash`.
 It needs `completion` (OMP-injected) for LLM classification of German
 language requirements and experience years. Running via bash silently
 skips LLM classification, producing inaccurate German/experience detection.
 
 **Note:** The Python `completion` prelude function has a recursion bug.
-LLM classification must be done from JS `eval` first, then injected into
-the Python run. Also, the eval kernel may use a `.venv` Python without
-openpyxl — add the user site-packages path.
+LLM classification must be done from JS `eval`, then injected into the
+Python run. The eval kernel may use a `.venv` Python without openpyxl —
+add the user site-packages path.
 
-**Step 2a: LLM classification (JS eval)**
+Three sub-steps, run in order: **2a** (Python: extract JD texts) →
+**2b** (JS: LLM classification) → **2c** (Python: full verification).
+
+**Step 2a: Extract JD texts (Python eval)**
+
+Loads today's CSV + JSON, injects descriptions from JSON into CSV rows,
+extracts relevant sections (German/experience keywords) via
+`_extract_relevant_sections()` from `verify_jobs.py`, and saves the
+extracted texts to `/tmp/jd_to_classify.json` for the JS classification step.
+
+```python
+# eval cell (language: py)
+import sys, json, csv, site
+from pathlib import Path
+from datetime import datetime
+
+# Fix openpyxl path (eval kernel may use .venv without it)
+if site.getusersitepackages() not in sys.path:
+    sys.path.insert(0, site.getusersitepackages())
+
+skill_dir = Path("/home/sagar/Skills/Jobscraper")
+if str(skill_dir) not in sys.path:
+    sys.path.insert(0, str(skill_dir))
+
+# Exec verify_jobs.py to get _extract_relevant_sections
+_g = {'__file__': str(skill_dir / 'verify_jobs.py'), 'completion': lambda *a, **k: "stub"}
+with open(skill_dir / 'verify_jobs.py') as f:
+    exec(compile(f.read(), 'verify_jobs.py', 'exec'), _g)
+_extract_relevant_sections = _g['_extract_relevant_sections']
+
+# Find today's CSV
+csv_path = skill_dir / 'Job Search' / datetime.now().strftime("%Y-%m-%d") / f'Job_Search_{datetime.now().strftime("%b_%d_%Y").replace("_0", "_")}.csv'
+print(f"[*] Loading: {csv_path}")
+
+# Load CSV rows
+with open(csv_path, encoding='utf-8-sig') as f:
+    rows = list(csv.DictReader(f))
+
+# Inject descriptions from sibling JSON (same logic as run_verification)
+json_path = csv_path.with_suffix('.json')
+if json_path.exists():
+    with open(json_path, encoding='utf-8') as f:
+        json_data = json.load(f)
+    url_to_desc = {j.get('job_url', ''): j['description'] for j in json_data
+                   if isinstance(j, dict) and j.get('description')}
+    injected = 0
+    for row in rows:
+        url = row.get('job_url', '')
+        if url in url_to_desc and not row.get('description'):
+            row['description'] = url_to_desc[url]
+            injected += 1
+    if injected:
+        print(f"[*] Injected descriptions from JSON for {injected} job(s)")
+
+# Extract relevant JD sections for LLM classification
+items = []
+for idx, row in enumerate(rows):
+    jd = row.get('description', '')
+    if len(jd) >= 50:
+        items.append({'idx': idx, 'text': _extract_relevant_sections(jd)})
+
+with open('/tmp/jd_to_classify.json', 'w') as f:
+    json.dump(items, f)
+
+print(f"[*] Extracted {len(items)} JD texts for classification (out of {len(rows)} total jobs)")
+```
+
+**Step 2b: LLM classification (JS eval)**
+
+Reads `/tmp/jd_to_classify.json` (created by Step 2a), classifies German
+language requirement and minimum experience years via `completion(model='smol')`
+in batches of 10, and saves results to `/tmp/jd_classifications.json`.
 
 ```javascript
 // eval cell (language: js)
 import { readFileSync, writeFileSync } from 'fs';
 
-// Load JD texts extracted by Python (see Step 2b)
 const items = JSON.parse(readFileSync('/tmp/jd_to_classify.json', 'utf-8'));
 const BATCH = 10;
 const PROMPT = `Classify German language requirement and minimum experience years for each job.
@@ -90,15 +160,20 @@ for (let i = 0; i < items.length; i += BATCH) {
 writeFileSync('/tmp/jd_classifications.json', JSON.stringify(results));
 ```
 
-**Step 2b: Full verification (Python eval)**
+**Step 2c: Full verification (Python eval)**
+
+Loads pre-computed LLM classifications from Step 2b, execs `verify_jobs.py`,
+monkey-patches `llm_classify_all` to inject the pre-computed results (bypassing
+the broken Python `completion` prelude), and runs `run_verification()` which:
+verifies per-platform job liveness, detects LinkedIn reposts, segregates
+staffing agencies and already-applied jobs, and writes the 4-sheet verified XLSX.
 
 ```python
 # eval cell (language: py)
-import sys, json, re, site
+import sys, json, site
 from pathlib import Path
 from datetime import datetime
 
-# Fix openpyxl path (eval kernel may use .venv without it)
 if site.getusersitepackages() not in sys.path:
     sys.path.insert(0, site.getusersitepackages())
 
@@ -106,20 +181,16 @@ skill_dir = Path("/home/sagar/Skills/Jobscraper")
 if str(skill_dir) not in sys.path:
     sys.path.insert(0, str(skill_dir))
 
-# --- Extract JD texts for JS-side LLM classification ---
-csv_path = skill_dir / 'Job Search' / datetime.now().strftime("%Y-%m-%d") / f'Job_Search_{datetime.now().strftime("%b_%d_%Y").replace("_0", "_")}.csv'
-# (load CSV + JSON, extract relevant sections, save to /tmp/jd_to_classify.json)
-# Run JS eval cell above, then continue below.
-
-# --- Load pre-computed classifications ---
+# Load pre-computed classifications from JS (Step 2b)
 with open("/tmp/jd_classifications.json") as f:
     classifications = json.load(f)
 
+# Exec verify_jobs.py fresh (gets all functions + imports staffing_filter, applied_check)
 g = {'__file__': str(skill_dir / 'verify_jobs.py'), 'completion': lambda *a, **k: "stub"}
 with open(skill_dir / 'verify_jobs.py') as f:
     exec(compile(f.read(), 'verify_jobs.py', 'exec'), g)
 
-# Monkey-patch llm_classify_all to use pre-computed results
+# Monkey-patch llm_classify_all to use pre-computed JS results
 def patched(rows):
     for c in classifications:
         if c["idx"] < len(rows):
@@ -129,6 +200,7 @@ def patched(rows):
     print(f"[*] LLM classification: {len(classifications)}/{len(rows)} jobs classified (pre-computed from JS)")
 g['llm_classify_all'] = patched
 
+csv_path = skill_dir / 'Job Search' / datetime.now().strftime("%Y-%m-%d") / f'Job_Search_{datetime.now().strftime("%b_%d_%Y").replace("_0", "_")}.csv'
 g['run_verification'](csv_path, force=True)
 ```
 

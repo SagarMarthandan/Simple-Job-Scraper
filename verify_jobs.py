@@ -363,7 +363,7 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
     return False
 
 # ── Already-Applied Detection (imported from applied_check.py) ────────────────
-from applied_check import load_applied_job_keys
+from applied_check import load_applied_data, is_already_applied
 # ── Per-Platform Verifiers ───────────────────────────────────────────────────
 
 def _empty_result() -> dict:
@@ -1227,15 +1227,9 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     # ── LLM batch classification (German level + experience years) ──
     llm_classify_all(rows)
 
-    # ── Already-applied detection ──
-    print(f"\n[*] Loading already-applied job keys...")
-    applied_keys = load_applied_job_keys()
-
-    import sys as _sys
-    _skill_dir = Path("/home/sagar/Skills/Jobscraper")
-    if str(_skill_dir) not in _sys.path:
-        _sys.path.insert(0, str(_skill_dir))
-    from apify_job_search import normalize_key as _normalize_key
+    # ── Already-applied detection (three-tier: URL, key, company+title) ──
+    print(f"\n[*] Loading already-applied data...")
+    applied_data = load_applied_data()
 
     # ── Apply filters ──
     main_rows = []
@@ -1258,8 +1252,10 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
 
         # Segregate: already applied (highest priority — if you've applied,
         # it goes to "Already Applied" regardless of repost/closed/filter status)
-        job_key = _normalize_key(row.get("company", ""), row.get("title", ""))
-        if job_key and job_key in applied_keys:
+        if is_already_applied(
+            row.get("company", ""), row.get("title", ""),
+            row.get("job_url", ""), applied_data
+        ):
             already_applied_count += 1
             already_applied_rows.append(row)
             continue
