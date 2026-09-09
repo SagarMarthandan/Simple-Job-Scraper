@@ -1,14 +1,19 @@
-## [2026-09-09] — Already-applied detection: three-tier matching
+## [2026-09-09] — Already-applied detection: LLM-based classification
 
 ### Changed
-- **Already-applied detection: three-tier matching** — `applied_check.py` now uses three-tier matching instead of key-only: (1) URL match — exact, catches cross-platform same job listing (e.g., same Xing URL with "Unknown" company), (2) company+title key match — existing normalized `normalize_key()` logic, (3) company match + title similarity — Jaccard ≥ 0.6 on normalized title tokens, catches same position with different formatting across platforms (e.g., "Werkstudentin/Werkstudent – Microsoft Data Analytics & AI" vs "Werkstudent Microsoft Data Analytics & AI (DA&AI)"). Skips "Unknown" companies to avoid false positives.
-- **`load_applied_data()`** — new function replacing `load_applied_job_keys()` in `verify_jobs.py`. Returns dict with keys, company→titles mapping, and URLs for three-tier matching.
-- **`is_already_applied()`** — new function encapsulating the three-tier matching logic. Called in `verify_jobs.py` filter loop instead of inline key check.
-- **`verify_jobs.py` filter loop** — replaced inline `_normalize_key` check with `is_already_applied()` call. Removed now-unnecessary `normalize_key` import from filter loop scope.
+- **Already-applied detection: LLM-based classification** — `applied_check.py` now uses LLM classification (smol model via JS eval) instead of the three-tier algorithm. The algorithm caught 43 matches; the LLM catches 58 (15 more) with zero false negatives. LLM handles semantic matches the algorithm missed: company name prefix/suffix mismatch (durchblicker.at vs durchblicker.at / YOUSURE Tarifvergleich GmbH), legal entity name differences (Kroschke Gruppe vs Christoph Kroschke GmbH), subsidiary vs parent (Allianz variants), German↔English title translation (Praktikum vs Internship), brand rename (Q-FOX vs AI-FOX), title specialization detail (Business-Analyst:in vs Business-Analyst:innen mit Schwerpunkt...).
+- **`prepare_match_input(csv_path)`** — new function. Pre-filters candidate pairs between today's scraped jobs and tracker entries by company token overlap (≥1 shared meaningful token, excluding legal suffixes/stopwords) + exact URL match. Narrows ~550×621 pairs to ~551 candidates. Saves flat array of pair objects to `/tmp/already_applied_input.json` for JS-side LLM classification.
+- **`load_llm_matches()`** — new function. Loads `/tmp/already_applied_matches.json` (LLM-classified matches from JS eval). Returns `{"urls": set, "keys": set}` for O(1) lookup, or None if file doesn't exist (fallback to deterministic match).
+- **`is_already_applied()`** — rewritten. Checks LLM match sets (URLs + keys) first. Falls back to deterministic URL+key match when `llm_matches` is None (standalone execution without LLM). Removed three-tier algorithm (`_title_similarity`, Jaccard, `TITLE_SIMILARITY_THRESHOLD`).
+- **`load_applied_data()`** — now also returns `"entries"` key (raw list of `{company, title, url}` dicts) for LLM input prep.
+- **`verify_jobs.py` filter loop** — loads `llm_matches = load_llm_matches()` after `applied_data`, passes as 5th arg to `is_already_applied()`. Prints which mode is active (LLM vs fallback).
+- **SKILL.md** — Step 2a now also calls `prepare_match_input()`. Step 2b now also classifies already-applied pairs via LLM (after German/exp classification). Step 2c unchanged (verify_jobs.py auto-loads LLM matches).
+
+### Removed
+- **Three-tier matching algorithm** — `_title_similarity()` (Jaccard token similarity), `TITLE_SIMILARITY_THRESHOLD` constant. Replaced by LLM classification.
 
 ### Verification
-- Test run against `Job Search/2026-09-09/Job_Search_Sep_9_2026.csv` (551 jobs): 42 already-applied matches (up from 30 with key-only). 9 jobs moved from "To Apply"/"Reposted" to "Already Applied" in existing XLSX. 3 additional matches in CSV were dropped by other filters (German C1+, exp ≥3y) — will be caught before filters on next full run.
-- Hyperlink smoke test: 348 links, 0 mismatches, 10/10 HTTP OK
+- Experiment (2026-09-09): Algorithm 43 matches, LLM 58 unique matches, LLM catches 15 more, misses 0. 15 LLM-only matches fall into patterns: company name variants, legal entity differences, German↔English title translation, brand rename, title specialization detail.
 - Both files compile clean (applied_check.py, verify_jobs.py)
 
 ## [2026-09-09]

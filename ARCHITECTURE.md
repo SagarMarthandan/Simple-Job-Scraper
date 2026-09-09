@@ -203,6 +203,8 @@ Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ 
 
 | Function | Purpose |
 |---|---|
-| `load_applied_data()` | Reads `/home/sagar/Documents/applications_tracker.csv` (Company + Position + Source URL columns). Returns dict with normalized `company::title` keys, company→titles mapping, and normalized URLs |
-| `is_already_applied()` | Three-tier matching: (1) URL match — exact, catches cross-platform same job, (2) company+title key match — normalized `normalize_key()`, (3) company match + title similarity — Jaccard ≥ 0.6 on normalized title tokens. Skips "Unknown" companies |
+| `load_applied_data()` | Reads `/home/sagar/Documents/applications_tracker.csv` (Company + Position + Source URL columns). Returns dict with normalized `company::title` keys, company→titles mapping, normalized URLs, and raw entries list for LLM input prep |
+| `prepare_match_input(csv_path)` | Pre-filters candidate pairs between today's scraped jobs and tracker entries by company token overlap (≥1 shared meaningful token, excluding legal suffixes/stopwords) + exact URL match. Saves flat array of pair objects to `/tmp/already_applied_input.json` for JS-side LLM classification |
+| `load_llm_matches()` | Loads `/tmp/already_applied_matches.json` (LLM-classified matches from JS eval). Returns `{"urls": set, "keys": set}` for O(1) lookup, or None if file doesn't exist (fallback to deterministic match) |
+| `is_already_applied()` | Checks LLM match sets (URLs + keys) first. Falls back to deterministic URL+key match when `llm_matches` is None (standalone execution without LLM) |
 | `load_applied_job_keys()` | Legacy: returns `set[str]` of normalized keys only. Kept for backward compatibility |

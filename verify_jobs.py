@@ -363,7 +363,7 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
     return False
 
 # ── Already-Applied Detection (imported from applied_check.py) ────────────────
-from applied_check import load_applied_data, is_already_applied
+from applied_check import load_applied_data, is_already_applied, load_llm_matches
 # ── Per-Platform Verifiers ───────────────────────────────────────────────────
 
 def _empty_result() -> dict:
@@ -1227,9 +1227,14 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     # ── LLM batch classification (German level + experience years) ──
     llm_classify_all(rows)
 
-    # ── Already-applied detection (three-tier: URL, key, company+title) ──
+    # ── Already-applied detection (LLM-based, fallback to URL+key) ──
     print(f"\n[*] Loading already-applied data...")
     applied_data = load_applied_data()
+    llm_matches = load_llm_matches()
+    if llm_matches is not None:
+        print(f"[*] Using LLM-classified already-applied matches")
+    else:
+        print(f"[*] LLM matches not found — falling back to deterministic URL+key match")
 
     # ── Apply filters ──
     main_rows = []
@@ -1254,7 +1259,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         # it goes to "Already Applied" regardless of repost/closed/filter status)
         if is_already_applied(
             row.get("company", ""), row.get("title", ""),
-            row.get("job_url", ""), applied_data
+            row.get("job_url", ""), applied_data, llm_matches
         ):
             already_applied_count += 1
             already_applied_rows.append(row)

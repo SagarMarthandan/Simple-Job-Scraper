@@ -34,12 +34,15 @@ add the user site-packages path.
 Three sub-steps, run in order: **2a** (Python: extract JD texts) →
 **2b** (JS: LLM classification) → **2c** (Python: full verification).
 
-**Step 2a: Extract JD texts (Python eval)**
+**Step 2a: Extract JD texts + prepare already-applied input (Python eval)**
 
 Loads today's CSV + JSON, injects descriptions from JSON into CSV rows,
 extracts relevant sections (German/experience keywords) via
 `_extract_relevant_sections()` from `verify_jobs.py`, and saves the
 extracted texts to `/tmp/jd_to_classify.json` for the JS classification step.
+Also calls `prepare_match_input()` from `applied_check.py` to pre-filter
+candidate pairs between today's scraped jobs and the applications tracker
+CSV, saving to `/tmp/already_applied_input.json` for JS-side LLM matching.
 
 ```python
 # eval cell (language: py)
@@ -96,6 +99,11 @@ with open('/tmp/jd_to_classify.json', 'w') as f:
     json.dump(items, f)
 
 print(f"[*] Extracted {len(items)} JD texts for classification (out of {len(rows)} total jobs)")
+
+# ── Prepare already-applied candidate pairs for LLM matching ──
+from applied_check import prepare_match_input
+n_pairs = prepare_match_input(str(csv_path))
+print(f"[*] Prepared {n_pairs} already-applied candidate pairs for LLM matching")
 ```
 
 **Step 2b: LLM classification (JS eval)**
@@ -103,6 +111,9 @@ print(f"[*] Extracted {len(items)} JD texts for classification (out of {len(rows
 Reads `/tmp/jd_to_classify.json` (created by Step 2a), classifies German
 language requirement and minimum experience years via `completion(model='smol')`
 in batches of 10, and saves results to `/tmp/jd_classifications.json`.
+Also reads `/tmp/already_applied_input.json` (candidate pairs from Step 2a),
+classifies each pair as match/no-match via `completion(model='smol')` in batches
+of 10, and saves matched scraped jobs to `/tmp/already_applied_matches.json`.
 
 ```javascript
 // eval cell (language: js)
@@ -158,6 +169,65 @@ for (let i = 0; i < items.length; i += BATCH) {
     }
 }
 writeFileSync('/tmp/jd_classifications.json', JSON.stringify(results));
+// ── Already-applied LLM classification ──
+// Reads candidate pairs from Step 2a, classifies each as match/no-match
+const aaInput = JSON.parse(readFileSync('/tmp/already_applied_input.json', 'utf-8'));
+const AA_BATCH = 10;
+const AA_PROMPT = `You are matching job postings to determine if a scraped job was already applied to.
+
+For each pair, compare the SCRAPED job with the TRACKER entry.
+Consider it a MATCH if:
+- Same company (ignore legal suffixes like GmbH/AG/Inc, location qualifiers, brand vs legal entity name)
+- Same or equivalent position (ignore seniority prefixes, gender markers like :in/:in, formatting differences, German↔English translation like Praktikum↔Internship)
+- Same URL (even if one side has tracking parameters)
+
+Consider it NOT A MATCH if:
+- Different position at the same company (e.g. "Data Engineer" vs "Analytics Engineer" at the same company)
+- Different company that happens to share a word (e.g. "Data GmbH" vs "Data Solutions AG")
+- "Unknown" company on Xing (different jobs at "Unknown" are NOT the same job)
+
+Examples of MATCHES:
+- "durchblicker.at" / "Junior Data Analyst" ↔ "durchblicker.at / YOUSURE Tarifvergleich GmbH" / "Junior Data Analyst (m/w/d)" → MATCH (same company, same role)
+- "Accenture" / "Data Engineer" ↔ "Accenture Dienstleistungen GmbH" / "Data Engineer (m/w/d)" → MATCH (legal entity name differs)
+- "Allianz" / "Data Analyst" ↔ "Allianz Beratungs-AG" / "Data Analyst (m/w/d)" → MATCH (subsidiary vs parent)
+
+Examples of NON-MATCHES:
+- "Octopus Energy" / "Analytics Engineer" ↔ "Octopus Energy Germany GmbH" / "Data Engineer" → NOT A MATCH (different position)
+- "Unknown" / "Data Engineer" ↔ "Unknown" / "Software Developer" → NOT A MATCH (different positions at unknown company)
+
+Pairs:
+{pairs}
+
+Reply with a JSON array. One element per pair:
+[{{"id": 1, "match": true, "reason": "same company and role"}}, {{"id": 2, "match": false, "reason": "different position"}}]`;
+
+const aaResults = [];
+for (let i = 0; i < aaInput.length; i += AA_BATCH) {
+    const batch = aaInput.slice(i, i + AA_BATCH);
+    const pairsText = batch.map(p => `Pair ${p.id}:\n  SCRAPED: company="${p.scraped_company}", title="${p.scraped_title}", url="${p.scraped_url}"\n  TRACKER: company="${p.tracker_company}", title="${p.tracker_title}", url="${p.tracker_url}"`).join('\n\n');
+    const prompt = AA_PROMPT.replace('{pairs}', pairsText);
+    for (let attempt = 0; attempt <= 3; attempt++) {
+        try {
+            const h = await completion(prompt, 'smol');
+            const raw = await h.wait();
+            const json = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+            const parsed = JSON.parse(json);
+            for (const r of parsed) {
+                if (r.match === true && batch.find(p => p.id === r.id)) {
+                    const pair = batch.find(p => p.id === r.id);
+                    aaResults.push({ company: pair.scraped_company, title: pair.scraped_title, url: pair.scraped_url });
+                }
+            }
+            break;
+        } catch (e) {
+            if (attempt < 3 && String(e).includes('429')) {
+                await new Promise(r => setTimeout(r, (attempt+1) * 6000));
+            } else { break; }
+        }
+    }
+}
+writeFileSync('/tmp/already_applied_matches.json', JSON.stringify(aaResults));
+console.log(`Already-applied: ${aaResults.length} matches from ${aaInput.length} candidate pairs`);
 ```
 
 **Step 2c: Full verification (Python eval)**
@@ -166,7 +236,9 @@ Loads pre-computed LLM classifications from Step 2b, execs `verify_jobs.py`,
 monkey-patches `llm_classify_all` to inject the pre-computed results (bypassing
 the broken Python `completion` prelude), and runs `run_verification()` which:
 verifies per-platform job liveness, detects LinkedIn reposts, segregates
-staffing agencies and already-applied jobs, and writes the 4-sheet verified XLSX.
+staffing agencies and already-applied jobs (using LLM-classified matches from
+`/tmp/already_applied_matches.json` with fallback to deterministic URL+key match),
+and writes the 4-sheet verified XLSX.
 
 ```python
 # eval cell (language: py)
