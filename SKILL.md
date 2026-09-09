@@ -2,7 +2,7 @@
 name: Jobscraper
 description: >-
   Use when the user wants to run the automated job search pipeline. Fetches fresh job postings (< 24 hours old) from LinkedIn, Indeed, Arbeitnow, Xing, Stepstone, Wellfound, EU Remote Jobs, and ATS Direct for data/AI/analytics roles in Germany, filters by experience (<= 2 years), location (working student: Hamburg & Kiel only), and title relevance (must contain data/analytics/AI/SQL/Python keywords), deduplicates against yesterday's run, and exports to CSV/XLSX/JSON/MD. Trigger on keywords like "job search", "job scraper", "find jobs", "scrape jobs", "job postings", "fresh jobs", "data jobs germany", "linkedin jobs", "indeed jobs", "arbeitnow", "xing jobs", "stepstone jobs", "wellfound jobs", "remote jobs", "job pipeline", "run job search".
-dependencies: python>=3.10, requests, openpyxl, beautifulsoup4
+dependencies: python>=3.10, requests, openpyxl, beautifulsoup4, tqdm
 ---
 
 # Jobscraper Pipeline
@@ -276,8 +276,8 @@ csv_path = skill_dir / 'Job Search' / datetime.now().strftime("%Y-%m-%d") / f'Jo
 g['run_verification'](csv_path, force=True)
 ```
 
-Dependencies: `requests`, `openpyxl`, `beautifulsoup4`.
-Install: `pip install requests openpyxl beautifulsoup4`
+Dependencies: `requests`, `openpyxl`, `beautifulsoup4`, `tqdm`.
+Install: `pip install requests openpyxl beautifulsoup4 tqdm`
 
 ## Context
 

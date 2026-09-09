@@ -1,3 +1,9 @@
+## [2026-09-09] — docs: add tqdm to dependency listings
+
+### Fixed
+- **SKILL.md** — `tqdm` added to frontmatter `dependencies` and inline `pip install` line. Was missing after tqdm was added as a runtime dependency earlier today.
+- **README.md** — `tqdm` added to Quick Start `pip install` line (line 9). The Dependencies section (line 96) already had it — Quick Start was inconsistent.
+
 ## [2026-09-09] — tqdm progress bars across all pipeline stages
 
 ### Added

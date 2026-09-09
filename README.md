@@ -6,7 +6,7 @@ Automated job search pipeline that fetches fresh postings (< 24 hours old) from 
 
 ```bash
 cd /home/sagar/Skills/Jobscraper
-pip install requests openpyxl beautifulsoup4
+pip install requests openpyxl beautifulsoup4 tqdm
 python3 apify_job_search.py
 ```
 
