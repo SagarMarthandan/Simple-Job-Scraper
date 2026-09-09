@@ -87,26 +87,9 @@ TECH_KEYWORDS = [
     "postgresql", "snowflake",
 ]
 
-# Staffing/Recruitment Agency Blocklist — must match apify_job_search.py
-STAFFING_COMPANIES = re.compile(
-    r"\b("
-    r"instaffo|hays|michael page|randstad|adecco|manpower|"
-    r"kelly services|gi group|brunel|dekra arbeit|hapeko|hesys|"
-    r"prostaff|staffline|timepartner|lhi leasing|"
-    r"gut personalmanagement|office people|silbury|"
-    r"robert walters|russell tobin|experis|"
-    r"talent partner|the green recruitment|quik hire|"
-    r"zero to one|hicalibre|whybrilliant|"
-    r"emagine|g2i|strategie:p|"
-    r"jobgether|jobster|hire feed|findr|hoshii|"
-    r"mamgo|sundayy|twomynds|yes4match|studyflix|"
-    r"trenkwalder|modis|"
-    r"personalberatung|personaldienst|zeitarbeit|"
-    r"personal leasing|personalmanagement|"
-    r"recruitment agency|recruitment company"
-    r")\b",
-    re.IGNORECASE
-)
+# Staffing/Recruitment Agency Blocklist — imported from staffing_filter.py
+# (single source of truth shared with apify_job_search.py)
+from staffing_filter import STAFFING_COMPANIES
 
 # LinkedIn job ID growth rate (~530K new IDs/day globally, verified Aug 23-27)
 LINKEDIN_DAILY_ID_GROWTH = 530000
@@ -379,69 +362,8 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
 
     return False
 
-# ── Already-Applied Detection (Applications folder + Obsidian vault) ─────────
-
-APPLICATIONS_DIR = Path("/home/sagar/Applications")
-OBSIDIAN_APPLICATIONS_DIR = Path("/home/sagar/Documents/Obsidian Vault/Job Search/Applications")
-
-
-def _parse_application_name(name: str, separator: str) -> tuple[str, str]:
-    """Parse company and title from an application folder/file name.
-
-    Strips .md extension and trailing (YYYY-MM-DD) date, then splits on
-    the first occurrence of *separator*.
-    """
-    name = name.removesuffix(".md")
-    name = re.sub(r"\s*\(\d{4}-\d{2}-\d{2}\)\s*$", "", name)
-    if separator not in name:
-        return "", ""
-    company, title = name.split(separator, 1)
-    return company.strip(), title.strip()
-
-
-def load_applied_job_keys() -> set[str]:
-    """Build a set of normalize_key(company, title) for every job already
-    applied to, scanning both local sources:
-
-    1. /home/sagar/Applications/  — folder names use ' — ' (em dash) separator
-    2. Obsidian vault Applications/ — .md file names use ' - ' (hyphen) separator
-
-    Returns a set of normalized keys; empty set if neither source exists.
-    """
-    import sys
-    skill_dir = Path("/home/sagar/Skills/Jobscraper")
-    if str(skill_dir) not in sys.path:
-        sys.path.insert(0, str(skill_dir))
-    from apify_job_search import normalize_key
-
-    keys: set[str] = set()
-    apps_count = 0
-    obsidian_count = 0
-
-    # 1. Applications folder — leaf directories with em dash in name
-    if APPLICATIONS_DIR.exists():
-        for app_dir in APPLICATIONS_DIR.rglob("*"):
-            if app_dir.is_dir() and " — " in app_dir.name:
-                company, title = _parse_application_name(app_dir.name, " — ")
-                if company and title:
-                    key = normalize_key(company, title)
-                    if key:
-                        keys.add(key)
-                        apps_count += 1
-
-    # 2. Obsidian vault — .md files with hyphen separator
-    if OBSIDIAN_APPLICATIONS_DIR.exists():
-        for md_file in OBSIDIAN_APPLICATIONS_DIR.glob("*.md"):
-            company, title = _parse_application_name(md_file.name, " - ")
-            if company and title:
-                key = normalize_key(company, title)
-                if key:
-                    keys.add(key)
-                    obsidian_count += 1
-
-    print(f"[*] Already-applied detection: {apps_count} Applications folders, "
-          f"{obsidian_count} Obsidian files → {len(keys)} unique keys")
-    return keys
+# ── Already-Applied Detection (imported from applied_check.py) ────────────────
+from applied_check import load_applied_job_keys
 # ── Per-Platform Verifiers ───────────────────────────────────────────────────
 
 def _empty_result() -> dict:
@@ -805,8 +727,10 @@ def load_csv(path: Path) -> list[dict]:
 
 def save_xlsx(path: Path, main_rows: list[dict],
               reposted_rows: list[dict] | None = None,
+              staffing_rows: list[dict] | None = None,
               already_applied_rows: list[dict] | None = None) -> None:
-    """Write verified XLSX with up to 3 sheets: 'To Apply', 'Reposted', 'Already Applied'.
+    """Write verified XLSX with up to 4 sheets: 'To Apply', 'Reposted',
+    'Staffing Companies', 'Already Applied'.
 
     Same formatting as pipeline's convert_csv_to_xlsx: frozen header,
     autofilter, clickable URL hyperlinks, numeric match_score.
@@ -824,12 +748,12 @@ def save_xlsx(path: Path, main_rows: list[dict],
                 writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(reposted_rows)
-        if already_applied_rows:
-            csv_applied = path.parent / f"{path.stem}_already_applied.csv"
-            with open(csv_applied, "w", newline="", encoding="utf-8-sig") as f:
+        if staffing_rows:
+            csv_staffing = path.parent / f"{path.stem}_staffing.csv"
+            with open(csv_staffing, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
                 writer.writeheader()
-                writer.writerows(already_applied_rows)
+                writer.writerows(staffing_rows)
         print(f"[✓] CSV exported to: {csv_main}")
         return
 
@@ -887,8 +811,12 @@ def save_xlsx(path: Path, main_rows: list[dict],
     if reposted_rows:
         ws_repost = wb.create_sheet("Reposted")
         _write_sheet(ws_repost, reposted_rows, "Reposted")
+    # Sheet 3: Staffing Companies
+    if staffing_rows:
+        ws_staffing = wb.create_sheet("Staffing Companies")
+        _write_sheet(ws_staffing, staffing_rows, "Staffing Companies")
 
-    # Sheet 3: Already Applied
+    # Sheet 4: Already Applied
     if already_applied_rows:
         ws_applied = wb.create_sheet("Already Applied")
         _write_sheet(ws_applied, already_applied_rows, "Already Applied")
@@ -1312,10 +1240,11 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     # ── Apply filters ──
     main_rows = []
     reposted_rows = []
+    staffing_rows = []
     already_applied_rows = []
     closed_count = 0
     german_dropped = 0
-    staffing_dropped = 0
+    staffing_count = 0
     exp_dropped = 0
     reposted_count = 0
     already_applied_count = 0
@@ -1359,9 +1288,11 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
                     continue
             except (ValueError, TypeError):
                 pass
-        # Hard drop: staffing/recruitment agency
+        # Segregate: staffing/recruitment agency (goes to separate sheet
+        # so you can still see genuine recruiter calls)
         if STAFFING_COMPANIES.search(row.get("company", "")):
-            staffing_dropped += 1
+            staffing_count += 1
+            staffing_rows.append(row)
             continue
 
         main_rows.append(row)
@@ -1379,7 +1310,7 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         stem = stem[:-len("_deduped")]
     out_path = csv_path.parent / f"{stem}_verified.xlsx"
 
-    save_xlsx(out_path, main_rows, reposted_rows, already_applied_rows)
+    save_xlsx(out_path, main_rows, reposted_rows, staffing_rows, already_applied_rows)
 
     # ── Hyperlink smoke test ──
     print(f"\n[*] Running hyperlink smoke test on {out_path.name}...")
@@ -1393,11 +1324,11 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     print(f"  Input:                {len(rows)} jobs")
     print(f"  To Apply:             {len(main_rows)}")
     print(f"  Reposted:             {reposted_count}")
+    print(f"  Staffing:             {staffing_count}")
     print(f"  Already Applied:      {already_applied_count}")
     print(f"  Closed/removed:       {closed_count}")
     print(f"  Dropped (German C1+): {german_dropped}")
     print(f"  Dropped (exp >= 3y):  {exp_dropped}")
-    print(f"  Dropped (staffing):   {staffing_dropped}")
     print(f"  Enriched:             {enriched_count}")
     if already_verified:
         print(f"  Already verified:     {already_verified}")

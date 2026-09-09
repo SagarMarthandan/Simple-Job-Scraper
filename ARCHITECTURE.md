@@ -25,7 +25,7 @@ graph TD
     L --> M[Within-run dedup by company::title]
     M --> N[Cross-run dedup vs yesterday]
     N --> O[Export CSV + JSON + MD + XLSX]
-    O --> P[verify_jobs.py — platform verify → reposted detection → LLM classify → filters → 3-sheet XLSX]
+    O --> P[verify_jobs.py — platform verify → reposted detection → LLM classify → already-applied → filters → 4-sheet XLSX]
 
 All 8 platform fetchers run simultaneously via `ThreadPoolExecutor(max_workers=8)`. Each fetcher is independent — no shared mutable state, results collected after all complete. LinkedIn internally parallelizes its 10 search roles with `max_workers=5` (limited to avoid 429 rate limiting) + 3s backoff retry. Wellfound parallelizes 6 role slugs with `max_workers=3`.
 
@@ -108,12 +108,14 @@ URLs normalized (trailing slash + query params stripped) before comparison. `dat
 
 ### Verified XLSX Output
 
-`Job_Search_<date>_verified.xlsx` — 2-sheet Excel workbook:
+`Job_Search_<date>_verified.xlsx` — 4-sheet Excel workbook:
 
 | Sheet | Content |
 |---|---|
-| **Job Search** | Jobs that passed all filters (active, German ≤B2, exp <3y, not reposted) |
+| **To Apply** | Jobs that passed all filters (active, German ≤B2, exp <3y, not staffing) |
 | **Reposted** | LinkedIn jobs flagged as reposted (for manual review — not dropped) |
+| **Staffing Companies** | Staffing/recruitment agency postings (segregated, not dropped — genuine recruiter outreach may be visible) |
+| **Already Applied** | Jobs matching `applications_tracker.csv` |
 
 | Column | Values |
 |---|---|
@@ -125,7 +127,7 @@ URLs normalized (trailing slash + query params stripped) before comparison. `dat
 | `detail_remote` | `remote` / `hybrid` / `onsite` / empty |
 | `match_score` | Recalculated from JD text (0-100%) |
 
-Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ required"` OR `detail_exp_years >= 3`. Reposted jobs are segregated to the Reposted sheet (not dropped).
+Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ required"` OR `detail_exp_years >= 3`. Reposted, staffing, and already-applied jobs are segregated to their respective sheets (not dropped).
 
 ## Target Role Profiles
 
@@ -176,10 +178,10 @@ Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ 
 
 | Function | Purpose |
 |---|---|
-| `run_verification()` | Main entry: load CSV, TinyFish pre-fetch + cache, verify per-platform, reposted detection, LLM classify, filter, write 2-sheet XLSX. Prints description acquisition + classification coverage stats |
-| `verify_linkedin()` | Uses pre-fetched TinyFish description or falls back to `requests` + JSON-LD. Auth-wall detection for boilerplate-only responses |
-| `verify_indeed()` | Uses Apify JSON description or TinyFish pre-fetch |
-| `verify_xing()` / `verify_stepstone()` | Pre-fetched description or native requests fallback |
+| `run_verification()` | Main entry: load CSV, verify per-platform, reposted detection, LLM classify, already-applied detection, staffing segregation, filter, write 4-sheet XLSX. Prints description acquisition + classification coverage stats |
+| `verify_linkedin()` | Reads pre-fetched description from step 1 JSON-LD. Auth-wall detection for boilerplate-only responses |
+| `verify_indeed()` | Uses GraphQL API description from step 1 |
+| `verify_xing()` / `verify_stepstone()` | Reads pre-fetched description from step 1 JSON-LD |
 | `verify_greenhouse()` / `verify_smartrecruiters()` / `verify_ashby()` | ATS API verification — 404/empty = closed. Ashby delegates to `_find_ashby_posting()`, `_extract_ashby_desc()` |
 | `verify_arbeitnow()` | Free API verification |
 | `detect_reposted()` | Cross-run history (>7d) + job ID age gap (>14d), with job ID override and carryover exception. Pure computation — no LLM tokens |
@@ -189,4 +191,16 @@ Rows are dropped if `verified_active = False` OR `detail_language = "German C1+ 
 | `extract_salary()` | Salary from JSON-LD `baseSalary` or body text regex. Delegates to `_extract_salary_jsonld()`, `_detect_salary_period()` |
 | `extract_remote()` | Remote/hybrid/onsite detection from JD text |
 | `compute_match_score_from_jd()` | Recalculates match score from full JD text |
-| `save_xlsx()` | 2-sheet XLSX export (Job Search + Reposted) |
+| `save_xlsx()` | 4-sheet XLSX export (To Apply + Reposted + Staffing Companies + Already Applied) |
+
+### Staffing Filter (`staffing_filter.py`)
+
+| Function | Purpose |
+|---|---|
+| `is_staffing_company()` | Checks a raw company name against `STAFFING_COMPANIES` regex (word-boundary, case-insensitive). Single source of truth — imported by both `apify_job_search.py` and `verify_jobs.py` |
+
+### Already-Applied Detection (`applied_check.py`)
+
+| Function | Purpose |
+|---|---|
+| `load_applied_job_keys()` | Reads `/home/sagar/Documents/applications_tracker.csv` (Company + Position columns), builds normalized key set via `normalize_key()` from `apify_job_search.py`. Returns `set[str]` of normalized `company::title` keys |

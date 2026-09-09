@@ -1,3 +1,28 @@
+## [2026-09-09]
+
+### Added
+- **`staffing_filter.py`** — new module, single source of truth for `STAFFING_COMPANIES` regex + `is_staffing_company()`. Imported by both `apify_job_search.py` and `verify_jobs.py` — no more duplication across files.
+- **`applied_check.py`** — new module for already-applied detection. Reads `/home/sagar/Documents/applications_tracker.csv` (Company + Position columns), builds normalized key set via `normalize_key()`. 620 CSV rows → 576 unique keys. Replaces old Obsidian vault + `/home/sagar/Applications/` folder scanning.
+- **"Staffing Companies" sheet** — staffing/recruitment agency postings are now segregated into a 4th XLSX sheet instead of being dropped. Genuine recruiter outreach remains visible for review.
+- 15+ missing staffing/consulting companies added to blocklist: ALTEN, Akkodis, Alldus, Amadeus Fire, DIS AG, Grafton, Net2Source, Next Ventures, Robert Half, SThree, Allgeier IT, expertum, UMATR, juucy, PensExpert, Digital Waffle, Reply, Deloitte, EY, KPMG, BCG, CGI, adesso, GFT, Synpulse, Serco, Avanade.
+
+### Changed
+- **Staffing filter moved from step 1 to step 2** — `apify_job_search.py` no longer filters staffing companies. They flow through to `verify_jobs.py` for segregation into the "Staffing Companies" sheet. Ensures staffing jobs appear in the verified XLSX for review.
+- **Already-applied detection: CSV-only** — `load_applied_job_keys()` in `applied_check.py` reads `applications_tracker.csv` as the sole source. Obsidian vault and `/home/sagar/Applications/` folder scanning removed.
+- **`save_xlsx()`** — now accepts `staffing_rows` parameter, writes 4-sheet XLSX (To Apply → Reposted → Staffing Companies → Already Applied). CSV fallback also exports staffing CSV.
+- **`run_verification()` filter loop** — staffing companies changed from hard drop (`staffing_dropped += 1; continue`) to segregate (`staffing_rows.append(row); continue`). Summary prints `Staffing: N` instead of `Dropped (staffing): N`.
+- **README.md, ARCHITECTURE.md, SKILL.md** — updated pipeline diagram, filters table, verified XLSX output section, project structure, and function references for 4-sheet output, staffing segregation, CSV-based already-applied detection, and new modules.
+
+### Removed
+- **Duplicated `STAFFING_COMPANIES` regex and `is_staffing_company()`** from `apify_job_search.py` — now lives only in `staffing_filter.py`.
+- **Old already-applied detection code** from `verify_jobs.py` (~60 lines) — Obsidian vault scanning, `/home/sagar/Applications/` folder scanning, `_parse_application_name()` helper. Replaced by `applied_check.py` import.
+
+### Verification
+- Test run against `Job Search/2026-09-08/Job_Search_Sep_8_2026.csv` (315 jobs): 230 To Apply, 43 Reposted, 25 Staffing Companies, 17 Already Applied. 315 = 230+43+25+17 ✓
+- 25 staffing companies correctly segregated (Serco, ALTEN, KPMG, adesso, Allgeier IT, PensExpert, Live Reply, Akkodis, DIS AG, etc.)
+- Hyperlink smoke test: 315 links, 0 mismatches, 9/10 HTTP OK
+- All 4 files compile clean (verify_jobs.py, staffing_filter.py, applied_check.py, apify_job_search.py)
+
 ## [2026-09-08]
 
 ### Added

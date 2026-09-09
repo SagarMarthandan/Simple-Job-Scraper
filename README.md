@@ -17,7 +17,7 @@ Output is written to `Job Search/YYYY-MM-DD/`.
 ```
 8 platforms in parallel → title relevance → seniority/experience
 → working-student city → within-run dedup → cross-run dedup
-→ staffing-agency filter → export
+→ export
 ```
 
 ### Platforms
@@ -58,8 +58,8 @@ python3 verify_jobs.py --force            # re-verify all rows
 1. **Platform verification** — each platform verifier checks if the listing is still active (404/410 = closed). Uses descriptions from step 1 (JSON-LD on detail pages for LinkedIn/Xing/Stepstone, GraphQL/API for Indeed/Arbeitnow/ATS) for salary/remote extraction. Runs in parallel (1 thread per platform).
 2. **Reposted detection** — LinkedIn jobs flagged via cross-run history (>7d) + job ID age gap (>14d). No LLM tokens — pure computation.
 3. **LLM classification** — smol model (GLM 5.2 free via OpenRouter) classifies German level + experience years in batches of 10. Reads `row["description"]` directly (already populated from step 1). Prints `X/Y jobs classified`.
-4. **Already-applied detection** — `load_applied_job_keys()` scans `/home/sagar/Applications` (folder names) and Obsidian vault `Applications/` (.md files) for jobs already applied to. Uses `normalize_key(company, title)` for fuzzy matching. Checked first — already-applied jobs go to "Already Applied" sheet regardless of other filters.
-5. **Filter + export** — drops closed, German C1+, exp ≥3y, and staffing/recruitment agency postings. Segregates reposted and already-applied to separate sheets. Writes 3-sheet XLSX with hyperlink smoke test.
+4. **Already-applied detection** — `load_applied_job_keys()` reads `/home/sagar/Documents/applications_tracker.csv` (Company + Position columns) for jobs already applied to. Uses `normalize_key(company, title)` for fuzzy matching. Checked first — already-applied jobs go to "Already Applied" sheet regardless of other filters.
+5. **Filter + export** — drops closed, German C1+, exp ≥3y. Segregates staffing/recruitment agency postings to a "Staffing Companies" sheet (not dropped — genuine recruiter outreach may be visible). Segregates reposted and already-applied to separate sheets. Writes 4-sheet XLSX with hyperlink smoke test.
 
 ### Filters Applied
 
@@ -69,7 +69,7 @@ python3 verify_jobs.py --force            # re-verify all rows
 | Reposted LinkedIn | Segregate to "Reposted" sheet |
 | German C1+ required | Drop |
 | Experience ≥3 years | Drop |
-| Staffing/recruitment agency | Drop |
+| Staffing/recruitment agency | Segregate to "Staffing Companies" sheet |
 | German B1/B2 | Keep + flag |
 | German preferred | Keep + flag |
 
@@ -81,11 +81,11 @@ The verify step MUST run inside the OMP eval sandbox — it needs `completion` (
 
 No regex fallback: if LLM is unavailable, jobs get `none`/empty defaults (visible in output).
 
-Output: `Job_Search_<date>_verified.xlsx` — 3-sheet workbook:
+Output: `Job_Search_<date>_verified.xlsx` — 4-sheet workbook:
 - **To Apply** — live, apply-ready jobs enriched with German requirement, experience years, salary, remote/hybrid
 - **Reposted** — LinkedIn reposts for manual review
-- **Already Applied** — jobs matching Applications folder or Obsidian vault
-
+- **Staffing Companies** — staffing/recruitment agency postings (segregated, not dropped — genuine recruiter outreach may be visible)
+- **Already Applied** — jobs matching `applications_tracker.csv`
 A hyperlink smoke test runs automatically after export — verifies cell value == hyperlink target for all rows, plus HTTP HEAD on a random sample.
 
 ## Configuration
@@ -117,7 +117,9 @@ Jobscraper/
 ├── CHANGELOG.md             # version history
 ├── SKILL.md                 # OMP skill definition
 ├── apify_job_search.py      # main pipeline (8 fetchers + 2-tier dedup + export)
-├── verify_jobs.py           # post-step: LLM classification, reposted detection, already-applied detection, 3-sheet XLSX + hyperlink smoke test
+├── verify_jobs.py           # post-step: LLM classification, reposted detection, already-applied detection, 4-sheet XLSX + hyperlink smoke test
+├── staffing_filter.py       # staffing/recruitment agency blocklist regex + is_staffing_company()
+├── applied_check.py         # already-applied detection via applications_tracker.csv
 ├── ats_scraper.py           # ATS direct scraping (Greenhouse/SmartRecruiters/Ashby)
 ├── dedup_existing_sheets.py # standalone retroactive dedup cleanup
 ├── apify_job_search.md      # platform-specific gotchas, cost analysis, Indeed GraphQL API docs

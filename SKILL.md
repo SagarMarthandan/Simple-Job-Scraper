@@ -183,6 +183,6 @@ Files written to `/home/sagar/Skills/Jobscraper/Job Search/YYYY-MM-DD/`:
 
 ### Step 2 Output (verify)
 
-- `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 3 sheets: "To Apply" (live, apply-ready, enriched with German requirement, experience years, salary, remote/hybrid), "Reposted" (LinkedIn reposts for manual review), and "Already Applied" (jobs matching Sagar's Applications folder or Obsidian vault). Hyperlink smoke test runs automatically after export.
+- `Job_Search_<Month>_<Day>_<Year>_verified.xlsx` — 4 sheets: "To Apply" (live, apply-ready, enriched with German requirement, experience years, salary, remote/hybrid), "Reposted" (LinkedIn reposts for manual review), "Staffing Companies" (staffing/recruitment agency postings — segregated, not dropped), and "Already Applied" (jobs matching `applications_tracker.csv`). Hyperlink smoke test runs automatically after export.
 
 $0.00/run — all 8 platforms free (no Apify). Indeed uses a public GraphQL API; LinkedIn uses free HTML scraping; Arbeitnow/Xing/Stepstone use free HTML/REST; Wellfound uses SSR role pages + JSON-LD detail pages; EU Remote Jobs uses WordPress REST API; ATS Direct uses free public JSON APIs. Job descriptions arrive from step 1 (JSON-LD on detail pages for LinkedIn/Xing/Stepstone/Wellfound, GraphQL/API for Indeed/Arbeitnow/EU Remote Jobs/ATS). Verify step only needs LLM classification via `completion(model="smol")` (minimal cost).
