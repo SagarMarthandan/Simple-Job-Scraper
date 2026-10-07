@@ -1,3 +1,23 @@
+## [2026-10-07] — Germany-only eligibility, typed JD review, and exact URL history
+
+### Changed
+- **Typed JD judgment** — `verify_jobs.py` now injects OMP `judge_batch` and asynchronously judges each eligible row's full final description with independent German and experience choices. Missing/insufficient descriptions and failed/invalid judgments route to `Needs Review`; no permissive defaults or excerpt parser remain.
+- **Germany-only location policy** — added shared `location_policy.py` for scraper, ATS, and verification boundaries. Unknown/foreign/remote-region-only locations are excluded; Working Student jobs require Hamburg or Kiel. Removed fabricated Germany fallbacks and use structured country evidence where available.
+- **Cross-run repeats** — added shared `job_identity.py` for exact stable URL identity across every earlier dated export. Same-day reruns preserve eligible existing rows, historical exact URLs are excluded from To Apply, generic case-sensitive paths/query IDs remain distinct, and unreadable history fails visibly. No title/company matching is used for cross-date dedup.
+- **Verification output** — added `Needs Review` and `Previously Seen` routing; country/working-student/history filters run before verification and sheet segregation.
+- **Execution documentation** — updated README, SKILL, architecture, cross-run notes, and the historical verification plan for the eval-native judge and all-history URL policy.
+
+### Added
+- **Deterministic regressions** — `tests/test_regressions.py` covers German location evidence/foreign qualifiers, stable and case-sensitive URL identities, dated history boundaries/read errors, invalid typed answers, and missing/failed JD judgments with stale verdict clearing.
+
+### Verification
+- OMP TypeSafe Jev production-classifier smoke caught a late required C1+/five-years judgment, accepted a required experience range of 1–3 and optional German/experience judgments, and routed a missing JD to Needs Review.
+- Verified the actual 476-row daily export in an isolated directory: excluded 54 locations, routed 156 historical Germany-eligible URLs to Previously Seen, and yielded 92 To Apply, 50 Reposted, 1 Staffing, 11 Already Applied, and 8 Needs Review. It dropped 72 C1+ and 32 experience-over-2-years jobs.
+- Checked 318 exported hyperlinks: zero target mismatches; HTTP HEAD passed 9/10, with one Indeed 401.
+- Passed all 13 regression tests with `python3 -m unittest discover -s tests -v`.
+- Ran the live scraper in an isolated directory: exported 265 jobs with zero foreign locations and zero historical URL repeats. TypeSafe Jev verification yielded 97 To Apply, 45 Reposted, 10 Already Applied, and 6 Needs Review.
+- Live source limitations: Stepstone returned Brotli decoding errors, EU Remote Jobs returned HTTP 401, and two of ten sampled verification links returned Indeed HTTP 401. These source/access failures remain outside this change.
+
 ## [2026-09-09] — docs: add tqdm to dependency listings
 
 ### Fixed

@@ -90,16 +90,26 @@ When executed, the script automatically creates `/home/sagar/Skills/Jobscraper/J
 
 ### Cross-Run Deduplication
 
-Each run writes to its own dated subfolder (`Job Search/YYYY-MM-DD/`). Consecutive daily runs with 24h freshness windows overlap when run times drift — a job posted at 14:00 on Aug 20 appears in both the Aug 20 run (if run at 16:00) and the Aug 21 run (if run at 10:00, since 20h < 24h). Without cross-run dedup, 31.5% of jobs were duplicates across consecutive sheets.
+`load_seen_job_urls()` scans every dated export folder earlier than the current
+run date. It excludes current/future folders, uses exact stable posting URL
+identity only, and fails visibly if a dated history export is unreadable.
+Historical output files are read-only and are never rewritten.
 
-After within-run dedup, `load_previous_run_keys()` loads keys from the **single most recent previous run** (e.g. Friday vs Thursday, or vs Wednesday if Thursday was skipped) and removes jobs already seen:
+| Identity | Normalization |
+|---|---|
+| LinkedIn | Canonical numeric job ID from the posting path or job-ID query |
+| Indeed | Canonical `jk` value on a legitimate Indeed domain |
+| Other sites | Lowercase scheme/host, preserve case-sensitive path and unknown query values, sort remaining query pairs, remove recognized tracking keys/prefixes |
 
-| Key | Method | Rationale |
-|---|---|---|
-| **URL key** | `normalize_job_url()` — strips LinkedIn tracking params (position/pageNum/refId/trackingId); preserves Indeed `jk=` and Glassdoor `jl=` IDs | URLs are unique — if the same URL appeared in the previous run, it's the same job |
-| **Title key** | `normalize_key(company, title)` — same fuzzy key used for within-run dedup | Catches LinkedIn re-lists (new URL per run, same job) and cross-platform duplicates (same job on LinkedIn vs Indeed) |
+No company/title fuzzy matching is used across dates. Within-run
+company/title dedup remains separate. On same-day reruns, the current dated
+export is loaded and preserved only after Germany/working-student eligibility
+and the all-prior-history check; freshly scraped URL duplicates are skipped.
 
-Same-day reruns: today's own earlier CSV is the most recent folder, so a second run on the same day suppresses everything already exported.
+Verification uses the same normalizer and history loader before platform
+requests. Foreign/unknown rows are excluded first; German rows with exact URLs
+from earlier dated exports do not receive platform or JD work and may be routed
+to **Previously Seen** when verifying a legacy input.
 
 ## 5. Cost & Platform Details (last updated 2026-09-07)
 

@@ -1,54 +1,36 @@
 #!/usr/bin/env python3
-"""
-verify_jobs.py v2 — Job Verification Post-Step
-================================================
+"""Verify scraped jobs and fail closed when typed JD judgment is incomplete.
 
-Standalone script that runs AFTER the Jobscraper pipeline exports its CSV.
-Step 1 (apify_job_search.py) already fetches full job descriptions via JSON-LD
-on detail pages (LinkedIn, Xing, Stepstone) or platform APIs (Indeed GraphQL,
-Arbeitnow, ATS). This script loads descriptions from the sibling JSON file and:
-  1. Checks if ATS/Arbeitnow listings are still active (API 404 = closed)
-  2. Applies three hard drop filters:
-     - German level > B2 (C1/C2/fließend/Muttersprache/verhandlungssicher) → DROP
-     - Experience ≥ 3 years (from JD body text) → DROP
-     - Closed/inactive (ATS API 404) → DROP
-  3. Applies one segregation filter:
-     - Reposted LinkedIn jobs (cross-run history >7 days or job ID age >14 days)
-       → moved to "Reposted" sheet (NOT dropped)
-  4. Recalculates match score from actual JD text
-  5. Enriches with: detail_language, detail_exp_years, detail_salary, detail_remote
+Full descriptions are loaded from the sibling JSON and may be enriched by the
+platform verifiers. German and experience judgments run on those final row
+descriptions through the OMP eval ``judge_batch`` API.
 
-Output: Job_Search_<date>_verified.xlsx with 3 sheets:
-  - "To Apply": applicable jobs (passed all filters)
-  - "Reposted": LinkedIn reposts for manual review
-  - "Already Applied": jobs matching Applications folder or Obsidian vault
+Usage in an OMP Python eval cell:
+    import verify_jobs
+    verify_jobs.judge_batch = judge_batch
+    await verify_jobs.run_verification(Path("Job Search/YYYY-MM-DD/Job_Search_*.csv"), force=True)
 
-Usage:
-  # Run inside eval sandbox (LLM classification available):
-  import verify_jobs; verify_jobs.completion = completion
-  verify_jobs.run_verification(Path("Job Search/YYYY-MM-DD/Job_Search_*.csv"), force=True)
-
-  # Or standalone (no LLM — German/exp classification skipped):
-  python3 verify_jobs.py                  # auto-finds most recent CSV
-  python3 verify_jobs.py --csv path.csv   # specify input
-  python3 verify_jobs.py --force          # re-verify all (ignore prior results)
-
-Note: German level + experience classification uses LLM (smol model, batch of 10
-JDs per call) via completion(). Requires OMP eval runtime — no regex fallback.
+The command-line entry point cannot provide ``judge_batch`` and exits with an
+explicit instruction to use OMP eval; there is no permissive standalone path.
 """
 import argparse
+import asyncio
 from collections import Counter
 import csv
 import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 from tqdm import tqdm
+
+from job_identity import extract_linkedin_job_id, load_seen_job_urls, normalize_job_url
+from location_policy import is_germany_location, is_hamburg_or_kiel
+
 
 try:
     from openpyxl import Workbook, load_workbook
@@ -228,7 +210,7 @@ def _load_urls_from_csv(csv_path: Path) -> set[str]:
     try:
         with open(csv_path, newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
-                url = _normalize_url(row.get("job_url", ""))
+                url = normalize_job_url(row.get("job_url", ""))
                 if url:
                     urls.add(url)
     except Exception:
@@ -299,48 +281,18 @@ def _load_repost_data(job_search_dir: Path, today_str: str) -> tuple[set, set]:
     return old_title_keys, recent_urls
 
 
-def _normalize_url(url: str) -> str:
-    """Normalize URL for cross-run comparison: strip query params + trailing slash."""
-    url = url or ""
-    # Drop query string first (LinkedIn tracking params like ?refId=... change per run)
-    if "?" in url:
-        url = url.split("?", 1)[0]
-    # Then strip trailing slash
-    url = url.rstrip("/")
-    return url
-
-
-def _extract_linkedin_job_id(url: str) -> int:
-    """Extract numeric job ID from LinkedIn URL. Returns 0 if not found."""
-    m = re.search(r'-(\d+)$', url or "")
-    return int(m.group(1)) if m else 0
-
 
 def detect_reposted(job: dict, today_str: str, old_title_keys: set,
                     today_max_linkedin_id: int, recent_urls: set | None = None) -> bool:
-    """Check if a LinkedIn job is likely reposted.
-
-    Two signals:
-    1. Cross-run history: company::title appeared in a run >7 days ago
-    2. Job ID age gap: job ID suggests >14 days old (based on ~530K IDs/day)
-
-    Job ID override: if the job ID is fresh (<14 days old), signal 1 is
-    suppressed — a fresh ID means it's a new posting, not a repost,
-    even if the same company+title appeared in an old run.
-
-    Carryover exception: if the job URL appeared in the most recent previous
-    run, skip signal 1 (cross-run title match) — it's likely a 24h window
-    overlap, not a repost. But signal 2 (job ID age gap) is NOT suppressed —
-    a 277-day-old job ID is a repost regardless of carryover.
-    """
+    """Flag LinkedIn reposts by old company/title history or job-ID age."""
     if job.get("job_board") != "LinkedIn":
         return False
 
-    url = _normalize_url(job.get("job_url", ""))
+    raw_url = job.get("job_url", "")
+    url = normalize_job_url(raw_url)
     is_carryover = bool(recent_urls and url in recent_urls)
 
-    # Check job ID age first — fresh ID overrides title match
-    job_id = _extract_linkedin_job_id(url)
+    job_id = extract_linkedin_job_id(raw_url)
     is_fresh = False
     if job_id and today_max_linkedin_id:
         age_days = (today_max_linkedin_id - job_id) / LINKEDIN_DAILY_ID_GROWTH
@@ -348,19 +300,15 @@ def detect_reposted(job: dict, today_str: str, old_title_keys: set,
         if age_days > REPOST_JOB_ID_AGE_DAYS:
             return True
 
-    # Signal 1: cross-run history (suppressed by carryover OR fresh job ID)
     if not is_carryover and not is_fresh:
         import sys
-        from pathlib import Path as _P
-        skill_dir = _P("/home/sagar/Skills/Jobscraper")
+        skill_dir = Path("/home/sagar/Skills/Jobscraper")
         if str(skill_dir) not in sys.path:
             sys.path.insert(0, str(skill_dir))
         from apify_job_search import normalize_key
 
         key = normalize_key(job.get("company", ""), job.get("title", ""))
-        if key and key in old_title_keys:
-            return True
-
+        return bool(key and key in old_title_keys)
     return False
 
 # ── Already-Applied Detection (imported from applied_check.py) ────────────────
@@ -391,14 +339,12 @@ def _extract_signals(text: str, jsonld: dict | None = None) -> dict:
 
 
 def _process_result(result: dict, desc_text: str, jsonld: dict | None = None) -> dict:
-    """Fill in salary + remote + recalculated match score from JD text.
-
-    German language and experience are classified later by llm_classify_all,
-    which reads row["description"] directly — no hidden transport field.
-    """
+    """Fill enrichment signals and retain a fetched full description."""
     signals = _extract_signals(desc_text, jsonld)
     result.update(signals)
     result["match_score"] = f"{compute_match_score_from_jd(desc_text)}%"
+    if isinstance(desc_text, str) and len(desc_text.strip()) >= MINIMUM_DESCRIPTION_LENGTH:
+        result["description"] = desc_text
     return result
 
 
@@ -699,9 +645,8 @@ INPUT_FIELDS = [
 ]
 OUTPUT_FIELDS = INPUT_FIELDS + [
     "verified_active", "detail_language", "detail_exp_years",
-    "detail_salary", "detail_remote", "detail_reposted",
+    "detail_salary", "detail_remote", "detail_reposted", "detail_review_status",
 ]
-
 
 def find_latest_csv() -> Path | None:
     """Find the most recent Job_Search_*.csv under the Job Search directory."""
@@ -729,12 +674,12 @@ def load_csv(path: Path) -> list[dict]:
 def save_xlsx(path: Path, main_rows: list[dict],
               reposted_rows: list[dict] | None = None,
               staffing_rows: list[dict] | None = None,
-              already_applied_rows: list[dict] | None = None) -> None:
-    """Write verified XLSX with up to 4 sheets: 'To Apply', 'Reposted',
-    'Staffing Companies', 'Already Applied'.
+              already_applied_rows: list[dict] | None = None,
+              review_rows: list[dict] | None = None,
+              previously_seen_rows: list[dict] | None = None) -> None:
+    """Write verification sheets for apply-ready, segregated, and review rows.
 
-    Same formatting as pipeline's convert_csv_to_xlsx: frozen header,
-    autofilter, clickable URL hyperlinks, numeric match_score.
+    All sheets share the same fields and clickable URL formatting.
     """
     if not HAS_OPENPYXL:
         print("[!] openpyxl not installed — falling back to CSV")
@@ -755,6 +700,18 @@ def save_xlsx(path: Path, main_rows: list[dict],
                 writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
                 writer.writeheader()
                 writer.writerows(staffing_rows)
+        if review_rows:
+            csv_review = path.parent / f"{path.stem}_needs_review.csv"
+            with open(csv_review, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(review_rows)
+        if previously_seen_rows:
+            csv_seen = path.parent / f"{path.stem}_previously_seen.csv"
+            with open(csv_seen, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(previously_seen_rows)
         print(f"[✓] CSV exported to: {csv_main}")
         return
 
@@ -821,6 +778,12 @@ def save_xlsx(path: Path, main_rows: list[dict],
     if already_applied_rows:
         ws_applied = wb.create_sheet("Already Applied")
         _write_sheet(ws_applied, already_applied_rows, "Already Applied")
+    if review_rows:
+        ws_review = wb.create_sheet("Needs Review")
+        _write_sheet(ws_review, review_rows, "Needs Review")
+    if previously_seen_rows:
+        ws_seen = wb.create_sheet("Previously Seen")
+        _write_sheet(ws_seen, previously_seen_rows, "Previously Seen")
 
     wb.save(path)
     print(f"[✓] XLSX exported to: {path}")
@@ -873,6 +836,8 @@ def smoke_test_hyperlinks(path: Path, sample_size: int = 10) -> bool:
     random.seed(42)  # deterministic sample
     all_urls: list[str] = []
     for sn in wb.sheetnames:
+        if sn == "Previously Seen":
+            continue
         ws = wb[sn]
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             val = str(row[OUTPUT_FIELDS.index("job_url")].value or "")
@@ -908,226 +873,210 @@ def smoke_test_hyperlinks(path: Path, sample_size: int = 10) -> bool:
         print("[!] Hyperlink mismatches detected — review above")
     return all_ok
 
-# ── LLM Batch Classification (German + Experience) ──────────────────────────
+MINIMUM_DESCRIPTION_LENGTH = 50
 
-LLM_BATCH_SIZE = 10
+_GERMAN_LABELS = {
+    "c1_plus_required": "German C1+ required",
+    "b1_b2_ok": "German B1/B2 OK",
+    "preferred": "German preferred",
+    "none": "",
+}
+_EXPERIENCE_LABELS = {
+    "no_requirement_or_optional": "",
+    "minimum_0_years": "0",
+    "minimum_1_year": "1",
+    "minimum_2_years": "2",
+    "minimum_over_2_years": ">2",
+}
 
-_LLM_CLASSIFY_PROMPT = """Classify German language requirement and minimum experience years for each job.
+JD_JUDGMENT_QUESTIONS = {
+    "german": {
+        "type": "choice",
+        "instructions": (
+            "Classify the job description's German-language requirement. Judge "
+            "whether the level is mandatory or merely preferred, not just mentioned. "
+            "C1, C2, fluent/fließend, native/Muttersprache, or verhandlungssicher "
+            "is C1+ only when required; required standalone 'sehr gute "
+            "Deutschkenntnisse' is also C1+. 'Sehr gute Deutsch- und "
+            "Englischkenntnisse' together is B1/B2 unless an explicit C1+ level is "
+            "stated. B1/B2 requirements are allowed. Preferred/nice-to-have German "
+            "is not a required C1+ condition."
+        ),
+        "criteria": {
+            "c1_plus_required": "Required C1/C2, fluent, native, verhandlungssicher, or standalone sehr gute German.",
+            "b1_b2_ok": "Required B1/B2 or the conjunctive sehr gute German-and-English convention; no required C1+.",
+            "preferred": "German is explicitly desired, preferred, advantageous, or optional, including preferred C1+.",
+            "none": "No German requirement or preference is stated.",
+        },
+    },
+    "experience": {
+        "type": "choice",
+        "instructions": (
+            "Classify minimum required professional experience using the full "
+            "description. Use the LOWER bound of a required range: 0-2 years "
+            "means minimum 0 and is eligible; 1-3 means minimum 1 and is eligible; "
+            "3-5 means minimum over 2 and is not. Distinguish required qualifications "
+            "from preferred, optional, nice-to-have, or advantageous experience; "
+            "optional 5 years does not disqualify. Required 'several years' or German "
+            "'mehrjährige Erfahrung' means over 2. Do not infer years from "
+            "senior-sounding language. If no minimum is stated (for example, "
+            "'up to 2 years'), choose no requirement."
+        ),
+        "criteria": {
+            "no_requirement_or_optional": "No required minimum, or years are only optional/preferred/desired.",
+            "minimum_0_years": "A required range explicitly has a lower bound of 0.",
+            "minimum_1_year": "The required lower bound is exactly 1 year.",
+            "minimum_2_years": "The required lower bound is exactly 2 years.",
+            "minimum_over_2_years": "The required lower bound exceeds 2 years, including required several/mehrjährige years.",
+        },
+    },
+}
 
-German level (pick one):
-- C1+ = C1, C2, fluent/fließend, native/Muttersprache, verhandlungssicher, "sehr gute Deutschkenntnisse" standalone, "mind. C1", "mindestens C1"
-- B1/B2 = B1 or B2 only, "gute Deutschkenntnisse" without "sehr"
-- preferred = nice-to-have/wünschenswert/von Vorteil/idealerweise
-- none = no German mentioned, English-only
 
-Notes: "Sehr gute Deutsch- und Englischkenntnisse" = B1/B2. "Sehr gute Deutschkenntnisse" standalone = C1+.
-
-Experience years (minimum required):
-- "mehrere Jahre" = 3, "mehrjährige" = 3, "einige Jahre" = 2, "1-3 Jahre" = 1
-- empty = no requirement mentioned
-
-Jobs:
-{jobs}
-
-Reply with EXACTLY {count} lines. Format: <job_number>|<german_level>|<exp_years_or_empty>
-Example:
-1|C1+|3
-2|none|
-3|preferred|2"""
-
-# Keywords for extracting relevant JD sections (German + experience)
-_RELEVANT_KEYWORDS = re.compile(
-    r'(?:[Dd]eutsch|[Gg]erman|[Ss]prach(?:e|en|kenntnis|kenntnisse)|'
-    r'[Ll]anguage|[Ff]ließend|[Mm]uttersprach|'
-    r'[Vv]erhandlungssicher|[Bb]usiness\s+fluent|'
-    r'[Nn]iveau|[Ll]evel\s+[ABC]|B[12]|C[12]|'
-    r'[Ee]rfahrung|[Yy]ears?[Jj]ahre|[Bb]erufserfahrung|'
-    r'[Jj]ahre\s+[Bb]eruf|mind\.\s*\d|mindestens\s*\d|'
-    r'at\s+least\s+\d|\d+\+?\s+years?)',
-    re.IGNORECASE
-)
+def _choice_answer(answer: object, allowed: dict[str, str], question: str) -> str:
+    if not isinstance(answer, dict):
+        raise ValueError(f"missing typed {question} answer")
+    choice = answer.get("choice")
+    if choice not in allowed:
+        raise ValueError(f"invalid typed {question} choice")
+    return choice
 
 
-def _extract_relevant_sections(jd_text: str, context_chars: int = 200) -> str:
-    """Extract sentences/sections containing German or experience keywords.
+def apply_judgment_answers(row: dict, answers: dict) -> None:
+    """Apply validated typed answers while preserving only exact year buckets."""
+    german = _choice_answer(answers.get("german"), _GERMAN_LABELS, "German")
+    experience = _choice_answer(answers.get("experience"), _EXPERIENCE_LABELS, "experience")
+    row["detail_language"] = _GERMAN_LABELS[german]
+    row["detail_exp_years"] = _EXPERIENCE_LABELS[experience]
+    row["detail_review_status"] = "Reviewed"
 
-    Requirements often appear past char 2000 in JDs. Instead of truncating,
-    extract only the relevant sections to keep the LLM prompt focused.
-    Falls back to first 2000 chars if no keywords found.
+
+async def llm_classify_all(rows: list[dict]) -> None:
+    """Judge full final JD descriptions in one bounded OMP batch.
+
+    Missing descriptions and per-item/API failures are marked for review and
+    never treated as a successful no-requirement answer.
     """
-    if len(jd_text) <= 2000:
-        return jd_text
-
-    # Split into sentences (rough split on . ! ? followed by space/capital)
-    sentences = re.split(r'(?<=[.!?])\s+', jd_text)
-    relevant = []
-    for sent in sentences:
-        if _RELEVANT_KEYWORDS.search(sent):
-            relevant.append(sent.strip())
-
-    if relevant:
-        return " ".join(relevant)[:3000]  # Cap at 3000 to keep prompt manageable
-
-    # No keywords found — return first 2000 chars (job may have no requirements)
-    return jd_text[:2000]
-
-
-# Parse "N|level|years" lines from LLM plain-text output
-_LLM_LINE_RE = re.compile(
-    r'^(\d+)\s*\|\s*(C1\+|B1/B2|preferred|none)\s*\|\s*(\d*)\s*$',
-    re.IGNORECASE,
-)
-
-
-def _parse_llm_response(text: str, jd_texts: list[str]) -> list[dict] | None:
-    """Parse "N|level|years" lines from LLM output into result dicts.
-
-    Fills gaps with defaults. Returns None if no lines parsed at all.
-    """
-    parsed = {}
-    for line in text.splitlines():
-        m = _LLM_LINE_RE.match(line.strip())
-        if m:
-            job_num = int(m.group(1))
-            german = m.group(2)
-            exp_str = m.group(3).strip()
-            exp = int(exp_str) if exp_str else None
-            parsed[job_num] = {"german": german, "exp_years": exp}
-
-    if not parsed:
-        return None
-
-    results = []
-    missing = 0
-    for i in range(1, len(jd_texts) + 1):
-        if i in parsed:
-            results.append(parsed[i])
-        else:
-            missing += 1
-            results.append({"german": "none", "exp_years": None})
-
-    if missing:
-        print(f"  [!] LLM: {len(parsed)}/{len(jd_texts)} parsed, {missing} using defaults")
-
-    return results
-
-
-def llm_classify_batch(jd_texts: list[str]) -> list[dict]:
-    """Classify German level + experience years for a batch of JD texts via LLM.
-
-    Returns list of {"german": str, "exp_years": int|None} per job.
-    Returns "none"/None defaults if LLM is unavailable or fails.
-    """
-    if not jd_texts:
-        return []
-
-    if "completion" not in globals():
-        print("  [!] LLM not available — skipping classification")
-        return [{"german": "none", "exp_years": None} for _ in jd_texts]
-
-    extracted = [_extract_relevant_sections(t) for t in jd_texts]
-    jobs_block = "\n\n".join(
-        f"{i+1}: {text}" for i, text in enumerate(extracted)
-    )
-    prompt = _LLM_CLASSIFY_PROMPT.format(jobs=jobs_block, count=len(jd_texts))
-
-    import time
-    max_retries = 3
-    for attempt in range(max_retries + 1):
-        try:
-            raw = completion(prompt=prompt, model="smol")
-            if isinstance(raw, dict):
-                text = raw.get("value") or raw.get("text") or str(raw)
-            else:
-                text = str(raw)
-
-            results = _parse_llm_response(text, jd_texts)
-            if results is not None:
-                return results
-            print(f"  [!] LLM: 0/{len(jd_texts)} parsed — using defaults")
-            break  # parse failure — no point retrying
-        except Exception as e:
-            if attempt < max_retries and "429" in str(e):
-                wait = (attempt + 1) * 6  # 6s, 12s, 18s
-                print(f"  [!] 429 rate-limited, retry {attempt+1}/{max_retries} in {wait}s...")
-                time.sleep(wait)
-                continue
-            print(f"  [!] LLM classification failed: {e} — using defaults")
-            break
-
-    return [{"german": "none", "exp_years": None} for _ in jd_texts]
-
-def llm_classify_all(rows: list[dict]) -> None:
-    """Batch-classify German + exp for all rows with JD text.
-
-    Mutates rows in-place: sets detail_language and detail_exp_years.
-    """
-    # Collect rows that have JD text and need classification
-    to_classify = []
-    for i, row in enumerate(rows):
-        jd = row.get("description", "")
-        if len(jd) < 50:
+    if not rows:
+        return
+    for row in rows:
+        row["detail_language"] = ""
+        row["detail_exp_years"] = ""
+    states: dict[str, dict[str, str]] = {}
+    for index, row in enumerate(rows):
+        description = row.get("description", "")
+        if not isinstance(description, str) or len(description.strip()) < MINIMUM_DESCRIPTION_LENGTH:
+            row["detail_language"] = ""
+            row["detail_exp_years"] = ""
+            row["detail_review_status"] = "Needs review: full job description unavailable"
             continue
-        to_classify.append((i, jd))
+        row["detail_review_status"] = ""
+        states[str(index)] = {"description": description}
 
-    if not to_classify:
-        print(f"[*] LLM classification: 0/{len(rows)} jobs classified (no description)")
+    if not states:
+        print(f"[*] Typed JD judgment: 0/{len(rows)} descriptions available; all need review")
         return
 
-    print(f"[*] LLM classification: {len(to_classify)}/{len(rows)} jobs classified ({len(rows)-len(to_classify)} skipped — no description)")
+    judge_batch_api = globals().get("judge_batch")
+    if not callable(judge_batch_api):
+        raise RuntimeError(
+            "OMP judge_batch is required for JD verification; inject it and await "
+            "run_verification() from an OMP Python eval cell."
+        )
 
-    print(f"\n[*] LLM batch classification: {len(to_classify)} jobs in batches of {LLM_BATCH_SIZE}...")
+    batch = None
+    batch_error = None
+    results = {}
+    failures = {}
+    try:
+        batch = judge_batch_api(
+            states,
+            JD_JUDGMENT_QUESTIONS,
+            concurrency=16,
+            intent="Jobscraper German and experience review",
+        )
+        while batch.status()["done"] < batch.status()["total"]:
+            await batch.drain(timeout=10)
+        results = batch.results()
+        failures = batch.failed()
+    except Exception as exc:
+        batch_error = exc
+    finally:
+        if batch is not None:
+            batch.close()
 
-    # Process in batches
-    total_batches = (len(to_classify) + LLM_BATCH_SIZE - 1) // LLM_BATCH_SIZE
-    for batch_start in tqdm(range(0, len(to_classify), LLM_BATCH_SIZE), total=total_batches, desc="LLM classify"):
-        batch = to_classify[batch_start:batch_start + LLM_BATCH_SIZE]
-        jd_texts = [jd for _, jd in batch]
+    for key in states:
+        row = rows[int(key)]
+        if batch_error is not None:
+            row["detail_review_status"] = "Needs review: typed judgment batch failed"
+            continue
+        if key in failures:
+            row["detail_review_status"] = "Needs review: typed judgment failed"
+            continue
+        answers = results.get(key)
+        if not isinstance(answers, dict):
+            row["detail_review_status"] = "Needs review: typed judgment returned no result"
+            continue
+        try:
+            apply_judgment_answers(row, answers)
+        except (TypeError, ValueError):
+            row["detail_review_status"] = "Needs review: invalid typed judgment"
 
-        results = llm_classify_batch(jd_texts)
-
-        for (row_idx, _), classification in zip(batch, results):
-            row = rows[row_idx]
-            german = classification.get("german", "none")
-            exp = classification.get("exp_years")
-
-            # Map LLM classification to output format
-            if german == "C1+":
-                row["detail_language"] = "German C1+ required"
-            elif german == "B1/B2":
-                row["detail_language"] = "German B1/B2 OK"
-            elif german == "preferred":
-                row["detail_language"] = "German preferred"
-            else:
-                row["detail_language"] = ""
-
-            row["detail_exp_years"] = str(exp) if exp is not None else ""
-
-        batch_num = batch_start // LLM_BATCH_SIZE + 1
-        print(f"  [✓] Batch {batch_num}/{total_batches} done ({len(batch)} jobs)")
-
+    reviewed = sum(row.get("detail_review_status") == "Reviewed" for row in rows)
+    needs_review = len(rows) - reviewed
+    print(f"[*] Typed JD judgment: {reviewed}/{len(rows)} reviewed, {needs_review} need review")
 
 # ── Main Orchestration ───────────────────────────────────────────────────────
 
-def run_verification(csv_path: Path, force: bool = False) -> None:
-    """Main entry: load CSV, verify per-platform, apply filters, write XLSX."""
+def _run_date_from_path(csv_path: Path) -> date:
+    try:
+        return date.fromisoformat(csv_path.parent.name)
+    except ValueError:
+        return datetime.now().date()
+
+
+async def run_verification(csv_path: Path, force: bool = False) -> None:
+    """Verify and classify only Germany-eligible, previously unseen job rows."""
     rows = load_csv(csv_path)
+    input_count = len(rows)
     if not rows:
         print(f"[!] No rows found in {csv_path}")
         return
 
-
-    # Load sibling JSON for pre-fetched descriptions (Indeed, Arbeitnow, Stepstone)
-    # Indeed job pages are behind 401/403 — use Apify-provided description instead
+    run_date = _run_date_from_path(csv_path)
+    today_str = run_date.isoformat()
+    previously_seen_urls = load_seen_job_urls(JOB_SEARCH_DIR, run_date)
+    previously_seen_rows = []
+    location_dropped = 0
+    candidates = []
+    for row in rows:
+        location = row.get("location", "")
+        if (not is_germany_location(location)
+                or (row.get("role_type") == "Working Student"
+                    and not is_hamburg_or_kiel(location))):
+            location_dropped += 1
+            continue
+        identity = normalize_job_url(row.get("job_url", ""))
+        if identity and identity in previously_seen_urls:
+            row["detail_review_status"] = "Previously seen: exact posting URL in an earlier export"
+            previously_seen_rows.append(row)
+            continue
+        candidates.append(row)
+    rows = candidates
+    # Inject source descriptions before platform verification; verifiers can
+    # replace snippets with longer descriptions acquired from their APIs.
     json_path = csv_path.with_suffix(".json")
     if json_path.exists():
         try:
-            with open(json_path, encoding="utf-8") as f:
-                json_data = json.load(f)
-            url_to_desc = {}
-            for j in json_data:
-                if isinstance(j, dict) and j.get("description"):
-                    url_to_desc[j.get("job_url", "")] = j["description"]
+            with json_path.open(encoding="utf-8") as stream:
+                json_data = json.load(stream)
+            if not isinstance(json_data, list):
+                raise ValueError("expected a JSON array")
+            url_to_desc = {
+                job.get("job_url", ""): job["description"]
+                for job in json_data
+                if isinstance(job, dict) and job.get("description")
+            }
             injected = 0
             for row in rows:
                 url = row.get("job_url", "")
@@ -1136,128 +1085,132 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
                     injected += 1
             if injected:
                 print(f"[*] Injected descriptions from JSON for {injected} job(s)")
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError, UnicodeError, ValueError) as exc:
+            print(f"[!] Could not load sibling descriptions from {json_path}: {exc}")
 
-
-    # Print acquisition stats
-    desc_count = sum(1 for r in rows if r.get("description", "").strip())
-    print(f"\n[*] Description acquisition: {desc_count}/{len(rows)} jobs acquired descriptions")
-    if desc_count < len(rows):
-        missing = [r for r in rows if not r.get("description", "").strip()]
-        missing_platforms = Counter(r.get("job_board", "Unknown") for r in missing)
-        print(f"    {len(missing)} missing by platform:")
-        for p, c in missing_platforms.most_common():
-            print(f"      {p}: {c}")
-    # Idempotency: skip rows already verified unless --force
+    # Re-verify missing descriptions even when an earlier pass marked the row
+    # active; verification may acquire the JD needed for a safe judgment.
     to_verify: list[tuple[int, dict]] = []
     already_verified = 0
-    for i, row in enumerate(rows):
+    for index, row in enumerate(rows):
         existing = row.get("verified_active", "")
-        if existing and not force:
+        description = row.get("description", "")
+        has_sufficient_description = (
+            isinstance(description, str)
+            and len(description.strip()) >= MINIMUM_DESCRIPTION_LENGTH
+        )
+        if existing and not force and has_sufficient_description:
             already_verified += 1
         else:
-            to_verify.append((i, row))
+            to_verify.append((index, row))
 
     if already_verified:
         print(f"[*] {already_verified} row(s) already verified — skipping (use --force to re-verify)")
 
-    # Group jobs to verify by platform
     platform_groups: dict[str, list[tuple[int, dict]]] = {}
-    for i, row in to_verify:
+    for index, row in to_verify:
         platform = row.get("job_board", "Unknown")
-        platform_groups.setdefault(platform, []).append((i, row))
+        platform_groups.setdefault(platform, []).append((index, row))
 
-    if not platform_groups:
-        print("[*] Nothing to verify — all rows already checked.")
-        return
-
-    # Print per-platform counts
     for platform in sorted(platform_groups):
-        count = len(platform_groups[platform])
-        print(f"    {platform}: {count} URL(s)")
+        print(f"    {platform}: {len(platform_groups[platform])} URL(s)")
 
-    # ── Reposted detection setup (LinkedIn only) ──
-    today_str = datetime.now().strftime("%Y-%m-%d")
     print(f"\n[*] Loading cross-run history for reposted detection...")
     old_title_keys, recent_urls = _load_repost_data(JOB_SEARCH_DIR, today_str)
     print(f"    Loaded {len(old_title_keys)} title keys from runs >{REPOST_CROSS_RUN_DAYS} days ago")
     print(f"    Loaded {len(recent_urls)} URLs from most recent previous run (carryover detection)")
+    print(f"    Loaded {len(previously_seen_urls)} exact URL identities from all earlier exports")
 
-    # Find today's max LinkedIn job ID for age-gap estimation
-    today_max_linkedin_id = 0
-    for _, row in to_verify:
-        if row.get("job_board") == "LinkedIn":
-            jid = _extract_linkedin_job_id(row.get("job_url", ""))
-            if jid > today_max_linkedin_id:
-                today_max_linkedin_id = jid
+    today_max_linkedin_id = max(
+        (
+            extract_linkedin_job_id(row.get("job_url", ""))
+            for row in rows
+            if row.get("job_board") == "LinkedIn"
+        ),
+        default=0,
+    )
     if today_max_linkedin_id:
-        print(f"    Today's max LinkedIn job ID: {today_max_linkedin_id}")
-    # ── Run all platform batches in parallel ──
+        print(f"    Current export max LinkedIn job ID: {today_max_linkedin_id}")
+
     all_results: dict[int, dict] = {}
-
-    with ThreadPoolExecutor(max_workers=len(platform_groups)) as executor:
-        future_to_platform = {}
-        for platform, group in platform_groups.items():
-            jobs = [row for _, row in group]
-            future = executor.submit(verify_platform_batch, platform, jobs)
-            future_to_platform[future] = (platform, group)
-
-        for future in tqdm(as_completed(future_to_platform), total=len(future_to_platform), desc="Verifying"):
-            platform, group = future_to_platform[future]
-            try:
-                batch_results = future.result()
-                for local_idx, result in batch_results:
-                    orig_idx = group[local_idx][0]
-                    all_results[orig_idx] = result
-                print(f"  [✓] {platform}: done ({len(batch_results)} verified)")
-            except Exception as exc:
-                print(f"  [!] {platform}: batch failed ({exc})")
-                for orig_idx, _ in group:
-                    all_results[orig_idx] = _empty_result()
-
-    # ── Merge results ──
-    for i, row in enumerate(rows):
-        result = all_results.get(i)
-        if result:
-            row.update(result)
-        # Reposted detection (LinkedIn only, uses CSV data — no page fetch needed)
-        is_repost = detect_reposted(row, today_str, old_title_keys, today_max_linkedin_id, recent_urls)
-        row["detail_reposted"] = "True" if is_repost else ("False" if row.get("job_board") == "LinkedIn" else "")
-
-    # ── LLM batch classification (German level + experience years) ──
-    llm_classify_all(rows)
-
-    # ── Already-applied detection (LLM-based, fallback to URL+key) ──
-    print(f"\n[*] Loading already-applied data...")
-    applied_data = load_applied_data()
-    llm_matches = load_llm_matches()
-    if llm_matches is not None:
-        print(f"[*] Using LLM-classified already-applied matches")
+    if platform_groups:
+        with ThreadPoolExecutor(max_workers=len(platform_groups)) as executor:
+            future_to_platform = {
+                executor.submit(
+                    verify_platform_batch,
+                    platform,
+                    [row for _, row in group],
+                ): (platform, group)
+                for platform, group in platform_groups.items()
+            }
+            for future in tqdm(
+                as_completed(future_to_platform),
+                total=len(future_to_platform),
+                desc="Verifying",
+            ):
+                platform, group = future_to_platform[future]
+                try:
+                    batch_results = future.result()
+                    for local_index, result in batch_results:
+                        original_index = group[local_index][0]
+                        all_results[original_index] = result
+                    print(f"  [✓] {platform}: done ({len(batch_results)} verified)")
+                except Exception as exc:
+                    print(f"  [!] {platform}: batch failed ({exc})")
+                    for original_index, _ in group:
+                        all_results[original_index] = _empty_result()
     else:
-        print(f"[*] LLM matches not found — falling back to deterministic URL+key match")
+        print("[*] No platform refresh required; running final JD review on existing rows.")
 
-    # ── Apply filters ──
+    # Merge platform results before judgment so the judge sees the final,
+    # longest description acquired for each actual row.
+    for index, row in enumerate(rows):
+        result = all_results.get(index)
+        if result:
+            prior_description = row.get("description", "")
+            result_description = result.get("description", "")
+            row.update(result)
+            if (isinstance(prior_description, str)
+                    and len(prior_description) > len(result_description or "")):
+                row["description"] = prior_description
+        is_repost = detect_reposted(
+            row, today_str, old_title_keys, today_max_linkedin_id, recent_urls
+        )
+        row["detail_reposted"] = (
+            "True" if is_repost else ("False" if row.get("job_board") == "LinkedIn" else "")
+        )
+
+    await llm_classify_all(rows)
+
+    print(f"\n[*] Loading already-applied data...")
+    if rows:
+        applied_data = load_applied_data()
+        llm_matches = load_llm_matches()
+        if llm_matches is not None:
+            print("[*] Using LLM-classified already-applied matches")
+        else:
+            print("[*] LLM matches not found — falling back to deterministic URL+key match")
+    else:
+        applied_data = {}
+        llm_matches = None
     main_rows = []
     reposted_rows = []
     staffing_rows = []
     already_applied_rows = []
-    closed_count = 0
-    german_dropped = 0
-    staffing_count = 0
-    exp_dropped = 0
-    reposted_count = 0
-    already_applied_count = 0
-    enriched_count = 0
+    review_rows = []
+    closed_count = german_dropped = staffing_count = exp_dropped = 0
+    reposted_count = already_applied_count = enriched_count = 0
 
     for row in rows:
+        if str(row.get("detail_review_status", "")).startswith("Needs review:"):
+            review_rows.append(row)
+            continue
+
         active = row.get("verified_active", "")
         lang = row.get("detail_language", "")
         exp_str = row.get("detail_exp_years", "")
         is_repost = row.get("detail_reposted", "") == "True"
 
-        # Segregate: already applied (highest priority — if you've applied,
-        # it goes to "Already Applied" regardless of repost/closed/filter status)
         if is_already_applied(
             row.get("company", ""), row.get("title", ""),
             row.get("job_url", ""), applied_data, llm_matches
@@ -1266,45 +1219,39 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
             already_applied_rows.append(row)
             continue
 
-        # Segregate: reposted (goes to separate sheet regardless of
-        # German/exp filters, for manual review)
         if is_repost:
             reposted_count += 1
             reposted_rows.append(row)
             continue
 
-        # Hard drop: closed
         if active == "False":
             closed_count += 1
             continue
-        # Hard drop: German C1+ required
         if lang == "German C1+ required":
             german_dropped += 1
             continue
-        # Hard drop: experience >= 3 years
+        if exp_str == ">2":
+            exp_dropped += 1
+            continue
         if exp_str:
             try:
-                exp_years = int(exp_str)
-                if exp_years >= 3:
+                if int(exp_str) > 2:
                     exp_dropped += 1
                     continue
             except (ValueError, TypeError):
-                pass
-        # Segregate: staffing/recruitment agency (goes to separate sheet
-        # so you can still see genuine recruiter calls)
+                review_rows.append(row)
+                continue
+
         if STAFFING_COMPANIES.search(row.get("company", "")):
             staffing_count += 1
             staffing_rows.append(row)
             continue
 
         main_rows.append(row)
-
-        # Count enriched
         if (row.get("detail_exp_years") or row.get("detail_salary")
                 or row.get("detail_remote") or lang in ("German preferred", "German B1/B2 OK")):
             enriched_count += 1
 
-    # ── Write output ──
     stem = csv_path.stem
     if stem.endswith("_verified"):
         stem = stem[:-len("_verified")]
@@ -1312,25 +1259,33 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
         stem = stem[:-len("_deduped")]
     out_path = csv_path.parent / f"{stem}_verified.xlsx"
 
-    save_xlsx(out_path, main_rows, reposted_rows, staffing_rows, already_applied_rows)
-
-    # ── Hyperlink smoke test ──
+    save_xlsx(
+        out_path,
+        main_rows,
+        reposted_rows,
+        staffing_rows,
+        already_applied_rows,
+        review_rows,
+        previously_seen_rows,
+    )
     print(f"\n[*] Running hyperlink smoke test on {out_path.name}...")
     smoke_test_hyperlinks(out_path)
 
-    # ── Summary ──
     print()
     print("=" * 60)
     print("  Verification Summary")
     print("=" * 60)
-    print(f"  Input:                {len(rows)} jobs")
+    print(f"  Input:                {input_count} jobs")
     print(f"  To Apply:             {len(main_rows)}")
     print(f"  Reposted:             {reposted_count}")
     print(f"  Staffing:             {staffing_count}")
     print(f"  Already Applied:      {already_applied_count}")
+    print(f"  Previously Seen:      {len(previously_seen_rows)}")
+    print(f"  Needs Review:         {len(review_rows)}")
+    print(f"  Excluded by location: {location_dropped}")
     print(f"  Closed/removed:       {closed_count}")
     print(f"  Dropped (German C1+): {german_dropped}")
-    print(f"  Dropped (exp >= 3y):  {exp_dropped}")
+    print(f"  Dropped (exp > 2y):   {exp_dropped}")
     print(f"  Enriched:             {enriched_count}")
     if already_verified:
         print(f"  Already verified:     {already_verified}")
@@ -1338,11 +1293,9 @@ def run_verification(csv_path: Path, force: bool = False) -> None:
     print("=" * 60)
 
 
-def main():
+async def main():
     parser = argparse.ArgumentParser(
-        description="Verify job listings: check if active, extract German language "
-                    "requirement, experience years, salary, remote status, and "
-                    "recalculate match scores from JD text."
+        description="Verify jobs via OMP typed JD judgment and platform checks."
     )
     parser.add_argument(
         "--csv", type=str, default=None,
@@ -1365,8 +1318,11 @@ def main():
             print(f"[!] No Job_Search_*.csv found under {JOB_SEARCH_DIR}")
             return
 
-    run_verification(csv_path, force=args.force)
+    await run_verification(csv_path, force=args.force)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except RuntimeError as exc:
+        raise SystemExit(str(exc))

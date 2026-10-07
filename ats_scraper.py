@@ -31,6 +31,7 @@ from urllib.parse import quote_plus
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+from location_policy import is_germany_location, is_hamburg_or_kiel
 
 log = logging.getLogger("ats_scraper")
 
@@ -52,10 +53,6 @@ EXCLUDED_TITLE_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
-EXCLUDED_EXP_PATTERNS = [
-    re.compile(r"\b([3-9]|\d{2,})\+?\s*(?:years?|jahre?|j\.?)\b", re.IGNORECASE),
-    re.compile(r"\b(?:at least|minimum|min\.?|mindestens)\s*([3-9]|\d{2,})\s*(?:years?|jahre?)\b", re.IGNORECASE),
-]
 
 # Title relevance — same as pipeline
 DOMAIN_TITLE_KEYWORDS = re.compile(
@@ -69,29 +66,6 @@ DOMAIN_TITLE_KEYWORDS = re.compile(
 TECH_KEYWORDS = ["dbt", "airflow", "spark", "pyspark", "python", "sql", "gcp", "bigquery",
                  "aws", "azure", "databricks", "docker", "kafka", "postgresql", "snowflake"]
 
-NON_GERMANY_COUNTRIES = (
-    "austria", "österreich", "switzerland", "schweiz", "suisse",
-    "netherlands", "niederlande", "holland",
-    "france", "frankreich",
-    "united kingdom", "england", "scotland", "wales",
-    "ireland", "irland",
-    "poland", "polen",
-    "czech", "tschech",
-    "spain", "spanien", "españa",
-    "italy", "italien", "italia",
-    "portugal",
-    "belgium", "belgien",
-    "sweden", "schweden",
-    "norway", "norwegen",
-    "denmark", "dänemark",
-    "finland", "finnland",
-    "united states", "usa",
-    "canada", "india", "indien",
-    "luxembourg", "luxemburg",
-    "liechtenstein",
-    "romania", "rumänien",
-    "hungary", "ungarn",
-)
 
 # ── Curated German company slugs ───────────────────────────────────────────────
 # Companies with offices in Germany that hire data/analytics/AI roles.
@@ -152,28 +126,19 @@ def _classify_role_type(title: str, description: str) -> str:
 
 
 def _check_experience_and_location(title: str, description: str, location: str) -> tuple[bool, str]:
-    """Returns (is_valid, role_type_or_reason). Same logic as pipeline."""
+    """Apply shared title, seniority, and conservative Germany location filters."""
     if not _is_relevant_title(title):
         return False, "Title not relevant to data/analytics/AI"
 
     if EXCLUDED_TITLE_PATTERNS.search(title):
         return False, "Seniority title excluded"
 
-    for pattern in EXCLUDED_EXP_PATTERNS:
-        if pattern.search(description):
-            return False, "Requires >2 years experience"
-
     role_type = _classify_role_type(title, description)
-    loc_clean = location.lower()
+    if not is_germany_location(location):
+        return False, f"Location outside or unknown for Germany ({location})"
 
-    if "germany" not in loc_clean and "deutschland" not in loc_clean:
-        for country in NON_GERMANY_COUNTRIES:
-            if country in loc_clean:
-                return False, f"Location outside Germany ({location})"
-
-    if role_type == "Working Student":
-        if not ("hamburg" in loc_clean or "kiel" in loc_clean):
-            return False, f"Working student outside Hamburg/Kiel ({location})"
+    if role_type == "Working Student" and not is_hamburg_or_kiel(location):
+        return False, f"Working student outside Hamburg/Kiel ({location})"
 
     return True, role_type
 
@@ -233,7 +198,7 @@ def _make_job_dict(title: str, company: str, location: str, posted_at: str,
         "exp_required": "<= 2 Years",
         "match_score": f"{_compute_match_score(f'{title} {description}')}%",
         "job_url": url,
-        "description": description[:500],
+        "description": description,
     }
 
 
@@ -258,7 +223,7 @@ def fetch_greenhouse(slug: str) -> list[dict]:
     for job in data.get("jobs", []):
         title = job.get("title", "")
         loc_data = job.get("location", {})
-        loc = loc_data.get("name", "Germany") if isinstance(loc_data, dict) else str(loc_data or "Germany")
+        loc = loc_data.get("name", "") if isinstance(loc_data, dict) else str(loc_data or "")
 
         # Use first_published for freshness (posting date), not updated_at
         posted_raw = job.get("first_published", "") or job.get("updated_at", "")
@@ -309,14 +274,17 @@ def fetch_smartrecruiters(slug: str) -> list[dict]:
             title = posting.get("title", "")
             loc_data = posting.get("location", {})
             if isinstance(loc_data, dict):
-                loc = loc_data.get("city", "")
+                city = loc_data.get("city", "")
                 country = loc_data.get("country", "")
-                if country and isinstance(country, dict):
-                    loc = f"{loc}, {country.get('label', '')}"
-                elif country:
-                    loc = f"{loc}, {country}"
+                if isinstance(country, dict):
+                    country_name = country.get("label", "")
+                    country_code = country.get("code", "")
+                    country_value = country_name or country_code
+                else:
+                    country_value = str(country or "")
+                loc = ", ".join(filter(None, [city, country_value]))
             else:
-                loc = str(loc_data) or "Germany"
+                loc = str(loc_data or "")
 
             posted_raw = posting.get("releasedDate", "") or posting.get("createdDate", "")
             posted_dt = _parse_date_flexible(posted_raw)
@@ -405,7 +373,7 @@ def fetch_ashby(slug: str) -> list[dict]:
     jobs = []
     for posting in job_postings:
         title = posting.get("title", "")
-        loc = posting.get("locationName", "Germany") or "Germany"
+        loc = posting.get("locationName", "") or ""
         posted_raw = posting.get("publishedDate", "") or posting.get("createdAt", "")
         posted_dt = _parse_date_flexible(posted_raw)
         if not _is_fresh(posted_dt, cutoff):

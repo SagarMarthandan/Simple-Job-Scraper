@@ -11,22 +11,22 @@ Usage:
     python3 dedup_existing_sheets.py --dry-run    # report only, no changes
     python3 dedup_existing_sheets.py --from 2026-08-15  # only clean sheets from this date onward
 
-Strategy (same as the integrated dedup):
-  - URL key: normalize_job_url() across ALL older runs — exact identity, never expires
-  - Title key: normalize_key(company, title) from the SINGLE most recent older run only
-    — catches LinkedIn re-lists (new URL per run) and cross-platform dups
+Strategy:
+  - Exact URL identity via the shared normalize_job_url() across all older exports.
+  - No title/company matching; a different posting at the same company stays new.
 
-For each dated folder (processed oldest→newest), jobs already seen by any OLDER run
-are removed from the CSV, JSON, XLSX, and MD files.
+For each dated folder (processed oldest→newest), exact historical URL repeats are
+removed from CSV, JSON, XLSX, and MD files.
 """
 
 import argparse
 import csv
 import json
 import re
-import sys
 from pathlib import Path
 from datetime import datetime
+
+from job_identity import normalize_job_url
 
 JOB_SEARCH_DIR = Path("/home/sagar/Skills/Jobscraper/Job Search")
 
@@ -34,29 +34,11 @@ FIELDNAMES = ["language", "job_board", "role_type", "title", "company", "locatio
               "posted_at", "exp_required", "match_score", "job_url"]
 
 
-def normalize_key(company: str, title: str) -> str:
-    """Generate deduplication key (same as pipeline)."""
-    company = company or ""
-    title = title or ""
-    clean_company = re.sub(r"\b(gmbh|ag|inc|ltd|co|kg|se|corp|llc)\b", "", company, flags=re.IGNORECASE)
-    clean_company = re.sub(r"[^\w\s]", "", clean_company).strip().lower()
-    clean_title = re.sub(r"[^\w\s]", "", title).strip().lower()
-    return f"{clean_company}::{clean_title}"
-
-
-def normalize_job_url(url: str) -> str:
-    """Normalize job URL (same as pipeline). LinkedIn: drop tracking params."""
-    url = (url or "").strip()
-    if not url:
-        return ""
-    if "linkedin.com" in url:
-        url = url.split("?", 1)[0]
-    return url.rstrip("/").lower()
-
-
 def load_run_csv(csv_path: Path) -> list[dict]:
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
+
+
 
 
 def rewrite_csv(csv_path: Path, jobs: list[dict]) -> None:
@@ -171,43 +153,30 @@ def main():
     if args.dry_run:
         print("[DRY RUN — no files will be modified]\n")
 
-    # Accumulate keys from older runs as we process newest
+    # Accumulate exact URL identities from older runs as folders progress.
     url_keys = set()
     total_removed = 0
     total_kept = 0
 
-    for i, folder in enumerate(run_folders):
-        csv_files = sorted(folder.glob("Job_Search_*.csv"))
-        if not csv_files:
-            continue
-
-        # Title keys from the single most recent OLDER run (i-1)
-        title_keys = set()
-        if i > 0:
-            older_csvs = sorted(run_folders[i - 1].glob("Job_Search_*.csv"))
-            if older_csvs:
-                for r in load_run_csv(older_csvs[0]):
-                    title_keys.add(normalize_key(r.get("company", ""), r.get("title", "")))
-
+    for folder in run_folders:
+        csv_files = sorted(
+            path for path in folder.glob("Job_Search_*.csv")
+            if not path.stem.endswith(("_verified", "_reposted", "_staffing", "_already_applied"))
+        )
         for csv_path in csv_files:
             jobs = load_run_csv(csv_path)
             original_count = len(jobs)
 
             kept = []
             removed = 0
-            for j in jobs:
-                url = normalize_job_url(j.get("job_url", ""))
-                tk = normalize_key(j.get("company", ""), j.get("title", ""))
+            for job in jobs:
+                url = normalize_job_url(job.get("job_url", ""))
                 if url and url in url_keys:
                     removed += 1
                     continue
-                if tk in title_keys:
-                    removed += 1
-                    continue
-                kept.append(j)
+                kept.append(job)
                 if url:
                     url_keys.add(url)
-
             total_removed += removed
             total_kept += len(kept)
 

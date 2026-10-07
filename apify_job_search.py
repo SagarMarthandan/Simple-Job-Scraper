@@ -48,6 +48,8 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from tqdm import tqdm
+from job_identity import load_seen_job_urls, normalize_job_url
+from location_policy import is_germany_location, is_hamburg_or_kiel
 
 # Paths
 BASE_RESUMES_DIR = Path("/home/sagar/Documents/YAML-CV/skills/okf-cv/okf/base_files")
@@ -137,22 +139,19 @@ def classify_role_type(title: str, description: str) -> str:
         return "Full-Time / Entry-Level"
 
 def check_experience_and_location(title: str, description: str, location: str) -> tuple[bool, str]:
-    """Validates role against seniority ceiling and location constraints.
-    Returns (is_valid, role_type_or_reason)
-    """
+    """Validate title, seniority, Germany eligibility, and working-student cities."""
     if not is_relevant_title(title):
         return False, "Title not relevant to data/analytics/AI"
 
     if EXCLUDED_TITLE_PATTERNS.search(title):
         return False, "Seniority title excluded"
 
-    role_type = classify_role_type(title, description)
-    loc_clean = location.lower()
+    if not is_germany_location(location):
+        return False, f"Location outside or unknown for Germany ({location})"
 
-    # Working Student — strictly restricted to Hamburg & Kiel
-    if role_type == "Working Student":
-        if not ("hamburg" in loc_clean or "kiel" in loc_clean):
-            return False, f"Working student outside Hamburg/Kiel ({location})"
+    role_type = classify_role_type(title, description)
+    if role_type == "Working Student" and not is_hamburg_or_kiel(location):
+        return False, f"Working student outside Hamburg/Kiel ({location})"
 
     return True, role_type
 
@@ -191,35 +190,35 @@ def normalize_key(company: str, title: str) -> str:
     seniority/gender markers, and REF codes for cross-platform matching)."""
     return f"{_norm_company(company)}::{_norm_title(title)}"
 
+def load_current_run_jobs(now: datetime) -> list[dict]:
+    """Load the current dated export so same-day reruns preserve its results."""
+    date_folder = JOB_SEARCH_DIR / now.strftime("%Y-%m-%d")
+    date_str = now.strftime("%b_%d_%Y").replace("_0", "_")
+    csv_path = date_folder / f"Job_Search_{date_str}.csv"
+    json_path = date_folder / f"Job_Search_{date_str}.json"
 
-def normalize_job_url(url: str) -> str:
-    """Normalize a job URL into a stable cross-run identity key.
-
-    LinkedIn URLs carry per-run tracking params (position/pageNum/refId/trackingId)
-    while the job ID lives in the path — drop the query string there.
-    Indeed (?jk=) carries its job ID in the query — keep it.
-    """
-    url = (url or "").strip()
-    if not url:
-        return ""
-    if "linkedin.com" in url:
-        url = url.split("?", 1)[0]
-    return url.rstrip("/").lower()
-
-def load_previous_run_urls(now: datetime) -> set:
-    """Load job URLs from yesterday's CSV folder for cross-run dedup."""
-    yesterday = JOB_SEARCH_DIR / (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    urls = set()
-    for csv_file in yesterday.glob("Job_Search_*.csv"):
+    if json_path.exists():
         try:
-            with open(csv_file, newline="", encoding="utf-8-sig") as f:
-                for row in csv.DictReader(f):
-                    url = normalize_job_url(row.get("job_url", ""))
-                    if url:
-                        urls.add(url)
-        except Exception:
-            continue
-    return urls
+            with json_path.open(encoding="utf-8") as stream:
+                rows = json.load(stream)
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                raise ValueError("expected an array of job objects")
+            return rows
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"Cannot preserve current-date export {json_path}: {exc}") from exc
+
+    if csv_path.exists():
+        try:
+            with csv_path.open(newline="", encoding="utf-8-sig") as stream:
+                reader = csv.DictReader(stream)
+                if not reader.fieldnames or "job_url" not in reader.fieldnames:
+                    raise ValueError("missing job_url column")
+                return list(reader)
+        except (OSError, UnicodeError, csv.Error, ValueError) as exc:
+            raise RuntimeError(f"Cannot preserve current-date export {csv_path}: {exc}") from exc
+    return []
+
+
 
 def fetch_arbeitnow_jobs():
     """Fetch jobs from Arbeitnow API across all search roles."""
@@ -239,7 +238,7 @@ def fetch_arbeitnow_jobs():
 
                 title = item.get("title", "")
                 desc = item.get("description", "")
-                loc = item.get("location", "Germany")
+                loc = item.get("location", "") or ""
 
 
                 is_valid, role_type_or_reason = check_experience_and_location(title, desc, loc)
@@ -420,7 +419,7 @@ def _parse_xing_card(card, cutoff, seen_urls):
         r'multi-location-display-styles__Container[^>]*>.*?data-xds="BodyCopy">([^<]+)<b',
         card, re.DOTALL
     )
-    location = html_mod.unescape(loc_m.group(1).strip()) if loc_m else "Germany"
+    location = html_mod.unescape(loc_m.group(1).strip()) if loc_m else ""
 
     # Apply existing filters (title relevance, seniority, experience, location)
     desc = ""  # no description from listing page
@@ -564,7 +563,7 @@ def _parse_stepstone_card(card, cutoff, now):
         r'data-at="job-item-location"[^>]*>.*?data-genesis-element="TEXT"[^>]*>([^<]+)<',
         card, re.DOTALL
     )
-    location = html_mod.unescape(loc_m.group(1).strip()) if loc_m else "Germany"
+    location = html_mod.unescape(loc_m.group(1).strip()) if loc_m else ""
 
     # Date — inside <time> tag within job-item-timeago
     time_m = re.search(
@@ -935,8 +934,11 @@ def fetch_indeed_jobs():
             title = j.get("title", "")
             emp = j.get("employer") or {}
             loc_obj = j.get("location") or {}
+            country_code = loc_obj.get("countryCode", "")
             loc = loc_obj.get("formatted", {}).get("long") if loc_obj.get("formatted") else None
-            loc = loc or ", ".join(filter(None, [loc_obj.get("city"), loc_obj.get("countryName")])) or "Germany"
+            loc = loc or ", ".join(filter(None, [loc_obj.get("city"), loc_obj.get("countryName")]))
+            if country_code:
+                loc = f"{loc}, {country_code}" if loc else country_code
 
             # Strip HTML from description
             desc_html = (j.get("description") or {}).get("html", "")
@@ -1077,7 +1079,7 @@ def fetch_wellfound_jobs():
 
             # Parse location
             loc_match = re.search(r"(Remote only|Remote|Germany|Berlin|Munich|Hamburg|Frankfurt|Cologne|Stuttgart|Düsseldorf|Karlsruhe)", card_text)
-            location = loc_match.group(1) if loc_match else "Germany"
+            location = loc_match.group(1) if loc_match else ""
 
             job_url = f"https://wellfound.com{href}"
             is_valid, role_type_or_reason = check_experience_and_location(title, "", location)
@@ -1355,22 +1357,69 @@ def main():
         seen_keys.add(key)
         deduped_jobs.append(job)
 
-    # Cross-run deduplication: drop jobs already in yesterday's export
+    # Cross-run dedup: exact stable URLs from every earlier dated export.
     now = datetime.now()
-    prev_urls = load_previous_run_urls(now)
-    if prev_urls:
-        before = len(deduped_jobs)
-        deduped_jobs = [j for j in deduped_jobs if normalize_job_url(j["job_url"]) not in prev_urls]
-        cross_run_duplicates = before - len(deduped_jobs)
-    else:
-        cross_run_duplicates = 0
+    prev_urls = load_seen_job_urls(JOB_SEARCH_DIR, now.date())
+    current_jobs = load_current_run_jobs(now)
+    current_location_dropped = 0
+    current_historical_duplicates = 0
+    eligible_current_jobs = []
+    for job in current_jobs:
+        location = job.get("location", "")
+        if (not is_germany_location(location)
+                or (job.get("role_type") == "Working Student"
+                    and not is_hamburg_or_kiel(location))):
+            current_location_dropped += 1
+            continue
+        url = normalize_job_url(job.get("job_url", ""))
+        if url and url in prev_urls:
+            current_historical_duplicates += 1
+            continue
+        eligible_current_jobs.append(job)
+    current_jobs = eligible_current_jobs
+    current_urls = {
+        normalize_job_url(job.get("job_url", ""))
+        for job in current_jobs
+        if normalize_job_url(job.get("job_url", ""))
+    }
 
-# Staffing agency filtering moved to step 2 (verify_jobs.py) — staffing
-# companies are now segregated into a "Staffing Companies" sheet instead
-# of being dropped entirely.
+    historical_duplicates = 0
+    same_day_duplicates = 0
+    location_dropped = 0
+    new_jobs = []
+    for job in deduped_jobs:
+        location = job.get("location", "")
+        if (not is_germany_location(location)
+                or (job.get("role_type") == "Working Student"
+                    and not is_hamburg_or_kiel(location))):
+            location_dropped += 1
+            continue
+        url = normalize_job_url(job.get("job_url", ""))
+        if url and url in prev_urls:
+            historical_duplicates += 1
+            continue
+        if url and url in current_urls:
+            same_day_duplicates += 1
+            continue
+        if url:
+            current_urls.add(url)
+        new_jobs.append(job)
 
-    print(f"Per-platform: {platform_counts}")
-    print(f"Cross-run dedup: compared against yesterday ({len(prev_urls)} jobs), removed {cross_run_duplicates} already-seen job(s)")
+    # Keep today's already-exported eligible rows before writing the rerun.
+    deduped_jobs = current_jobs + new_jobs
+    print(
+        f"Cross-run dedup: loaded {len(prev_urls)} exact URL identities from "
+        f"earlier dated exports; removed {historical_duplicates} new and "
+        f"{current_historical_duplicates} existing historical repeats."
+    )
+    print(
+        f"Same-day rerun: preserved {len(current_jobs)} existing eligible jobs; "
+        f"skipped {same_day_duplicates} newly fetched URL duplicates."
+    )
+    print(
+        f"Germany-only location filter: removed {location_dropped} new and "
+        f"{current_location_dropped} existing rows."
+    )
     print(f"Cost: $0.00 (all platforms free — no Apify)")
 
     # Format Date String: e.g. Aug_4_2026

@@ -1,6 +1,6 @@
 # Jobscraper: Full Pipeline + JD Verification Plan (v2)
 
-> **Status:** Ready for implementation. Workstream 1 already shipped; Workstream 2 is a full rewrite.
+> **Status:** Historical implementation plan. Current cross-run URL and verification behavior is described in `apify_job_search.md` and `ARCHITECTURE.md`; this document records the earlier design.
 > **Date:** 2026-08-27 (revised)
 > **Budget:** ~25–30 min total (scrape + dedup + verify every job URL + enrich + export)
 > **Context:** v1 skipped LinkedIn verification (185 jobs = 44% of output). A job requiring "Deutsch auf muttersprachlichem Level (mind. C1)" sailed through unfiltered. v2 verifies **every** job — including LinkedIn via plain requests + JSON-LD (no auth needed) — and applies three hard drop filters (German level > B2, experience ≥ 3 years, closed/inactive) plus one segregation filter (reposted LinkedIn jobs → separate sheet). Match score is recalculated from actual JD text.
@@ -297,7 +297,7 @@ Threshold: `age_days > 14` → flag as reposted. This catches jobs that weren't 
 
 **Scope:** LinkedIn only. Xing/Stepstone/ATS don't have a repost mechanism — if a job is closed and relisted, it gets a new URL (caught by cross-run dedup) or shows as a fresh posting with a genuine new date.
 
-**Cross-run dedup relationship:** The existing `load_previous_run_keys()` only checks the most recent previous run. This filter scans ALL historical runs, catching reposts that survived cross-run dedup because the gap was >1 run. The two mechanisms are complementary: cross-run dedup removes same-day and consecutive-run dups; this filter catches long-gap reposts and segregates them.
+**Cross-run dedup relationship:** Runtime now scans every earlier dated export and suppresses exact stable URL identities before platform verification. The immediate-prior URL/title matcher described earlier in this plan is historical; runtime cross-run suppression does not match company/title. Existing LinkedIn repost routing applies only to rows that survive exact-URL suppression and cannot return an exact historical URL to To Apply.
 
 ### Match Score Recalculation
 
